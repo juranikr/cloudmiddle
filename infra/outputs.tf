@@ -16,7 +16,20 @@ output "ecr_repository_url" {
 
 output "alb_dns_name" {
   value       = aws_lb.api.dns_name
-  description = "API 접속 호스트 (임시 HTTP). 예: http://<dns>/api/health"
+  description = "ALB DNS (CloudFront origin 전용, 직접 접속 비권장)"
+}
+
+output "app_url" {
+  value       = "https://${aws_cloudfront_distribution.app.domain_name}"
+  description = "HTTPS 앱 URL (CloudFront)"
+}
+
+output "cloudfront_domain_name" {
+  value = aws_cloudfront_distribution.app.domain_name
+}
+
+output "cloudfront_distribution_id" {
+  value = aws_cloudfront_distribution.app.id
 }
 
 output "ecs_cluster_name" {

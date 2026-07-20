@@ -8,7 +8,7 @@ github_repo = "tourmiddle"
 api_desired_count = 1
 db_instance_class = "db.t4g.micro"
 
-# 프론트 배포 URL이 정해지면 넣으세요. 예: https://d111111abcdef8.cloudfront.net
+# 같은 오리진(CloudFront) 사용 시 * 로 충분. 커스텀 도메인 쓰면 해당 URL
 cors_origins = "*"
 
 # 비우면 자동 생성

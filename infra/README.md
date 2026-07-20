@@ -25,7 +25,7 @@
 
 | # | 항목 | 설명 |
 |---|------|------|
-| 8 | **도메인** | 예: `api.example.com` — ACM 인증서 + HTTPS. 없어도 ALB DNS로 HTTP 테스트 가능 |
+| 8 | **도메인** | 없어도 CloudFront 기본 도메인으로 **HTTPS** 가능. 커스텀 도메인은 ACM+Route53 추가 |
 | 9 | **예산 알람** | AWS Billing → Budget $20/$50 알림 |
 | 10 | **에이전트용 자격증명** | 로컬: AWS CLI 프로필 / CI: OIDC(테라폼이 역할 생성) |
 

@@ -3,20 +3,13 @@ resource "aws_security_group" "alb" {
   description = "ALB ingress"
   vpc_id      = aws_vpc.main.id
 
+  # CloudFront → ALB (HTTP origin). 인터넷 직접속은 막고 HTTPS는 CloudFront에서 처리
   ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "HTTP from CloudFront only"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
   }
 
   egress {
