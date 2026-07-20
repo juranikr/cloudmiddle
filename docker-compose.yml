@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: jinan-map-db
+    environment:
+      POSTGRES_USER: jinan
+      POSTGRES_PASSWORD: jinan_secret
+      POSTGRES_DB: jinan_travel
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jinan -d jinan_travel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jinan-map-api
+    environment:
+      DATABASE_URL: postgresql+psycopg2://jinan:jinan_secret@db:5432/jinan_travel
+      JWT_SECRET: change-me-in-production-jinan-travel-2026
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
