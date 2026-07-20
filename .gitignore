@@ -21,3 +21,9 @@ frontend/.env.local
 pgdata/
 *.log
 .DS_Store
+
+# Terraform local artifacts
+infra/outputs.json
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/.terraform/

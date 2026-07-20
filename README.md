@@ -3,6 +3,8 @@
 지난(济南) 중심의 공유 여행 마커 웹앱입니다.  
 FastAPI + React(Vite) + SQLite(기본) / PostgreSQL(선택) + Leaflet/OSM.
 
+AWS 배포(Terraform): [`infra/README.md`](infra/README.md) — **먼저 준비할 체크리스트**부터 보세요.
+
 ## Docker 없이 로컬 실행 (권장)
 
 현재처럼 Docker Desktop이 안 되는 Windows에서는 **SQLite**로 바로 돌리면 됩니다.  

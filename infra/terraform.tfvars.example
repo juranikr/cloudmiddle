@@ -1,0 +1,15 @@
+project_name = "tourmiddle"
+environment  = "dev"
+aws_region   = "ap-northeast-2"
+
+github_org  = "juranikr"
+github_repo = "tourmiddle"
+
+api_desired_count = 1
+db_instance_class = "db.t4g.micro"
+
+# 프론트 배포 URL이 정해지면 넣으세요. 예: https://d111111abcdef8.cloudfront.net
+cors_origins = "*"
+
+# 비우면 자동 생성
+# jwt_secret = "change-me"

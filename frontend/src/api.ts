@@ -7,12 +7,10 @@ export interface GeocodeHit {
   type: string;
 }
 
-/** 개발: Vite 프록시(/api) 사용 → 폰에서도 PC LAN IP:5173만으로 API 호출 가능 */
+/** 개발: Vite 프록시(/api). 배포: 같은 오리진(ALB)의 /api */
 function getApiBase(): string {
   if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL.replace(/\/$/, "");
-  if (import.meta.env.DEV) return "";
-  const { protocol, hostname } = window.location;
-  return `${protocol}//${hostname}:8000`;
+  return "";
 }
 
 const API_URL = getApiBase();
