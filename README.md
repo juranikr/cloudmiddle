@@ -3,7 +3,11 @@
 지난(济南) 중심의 공유 여행 마커 웹앱입니다.  
 FastAPI + React(Vite) + SQLite(기본) / PostgreSQL(선택) + Leaflet/OSM.
 
-AWS 배포(Terraform): [`infra/README.md`](infra/README.md) — **먼저 준비할 체크리스트**부터 보세요.
+**다른 PC/Cursor에서 이어서 개발:** 무조건 [`DEV_HISTORY.md`](DEV_HISTORY.md)를 먼저 읽으세요.  
+(에이전트 규칙: `.cursor/rules/dev-history.mdc` — 매 작업 후 히스토리 갱신·GitHub push)
+
+- 운영 HTTPS: https://d232kzujcg4ufp.cloudfront.net  
+- AWS 배포(Terraform): [`infra/README.md`](infra/README.md)
 
 ## Docker 없이 로컬 실행 (권장)
 
