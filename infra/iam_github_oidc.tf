@@ -30,13 +30,14 @@ data "aws_iam_policy_document" "github_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
+    # GitHub org에 OIDC sub 커스텀(org/repo ID 포함)이 켜져 있을 수 있음:
+    #   repo:ORG@ORG_ID/REPO@REPO_ID:ref:refs/heads/main
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
-        "repo:${local.github_repo_full}:ref:refs/heads/main",
-        "repo:${local.github_repo_full}:environment:dev",
-        "repo:${local.github_repo_full}:environment:prod",
+        "repo:${local.github_repo_full}:*",
+        "repo:${var.github_org}@*/${var.github_repo}@*:*",
       ]
     }
   }
