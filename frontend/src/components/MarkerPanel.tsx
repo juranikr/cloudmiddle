@@ -252,14 +252,15 @@ export default function MarkerPanel({
             <h3 className="panel__title">{marker.title}</h3>
             <button
               type="button"
-              className={tn btn--ghost panel__fav }
+              className={"btn btn--ghost panel__fav" + (marker.is_favorite ? " is-on" : "")}
               onClick={() => void toggleFavorite()}
               aria-label={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
               title={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
             >
-              {marker.is_favorite ? "★" : "☆"}
+              {marker.is_favorite ? "\u2605" : "\u2606"}
             </button>
           </div>
+
           <p className="panel__meta">
             {(marker.contributor_names?.length
               ? marker.contributor_names.join(" · ")
