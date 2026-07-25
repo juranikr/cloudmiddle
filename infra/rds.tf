@@ -1,10 +1,10 @@
 resource "aws_db_subnet_group" "main" {
-  name = "${local.name_prefix}-db-subnets"
-  # public 포함(인터넷 접속) + 기존 private 유지(인스턴스가 쓰는 서브넷 제거 불가)
-  subnet_ids = concat(aws_subnet.public[*].id, aws_subnet.private[*].id)
+  name = "${local.name_prefix}-db-public"
+  # 외부 PC 접속용 public subnet (비밀번호로 인증)
+  subnet_ids = aws_subnet.public[*].id
 
   tags = {
-    Name = "${local.name_prefix}-db-subnets"
+    Name = "${local.name_prefix}-db-public"
   }
 }
 
