@@ -646,6 +646,18 @@ textarea {
   margin: 0;
   line-height: 1.55;
   white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.text-link {
+  color: var(--teal-deep);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+
+.text-link:hover {
+  color: var(--teal);
 }
 
 .panel__actions {

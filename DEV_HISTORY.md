@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-21 (KST)
+최종 갱신: 2026-07-25 (KST)
 
 ---
 
@@ -47,6 +47,7 @@
 - 주소 검색: 백엔드 `/api/geocode` → Nominatim
 - 위치: HTTPS/localhost에서 GPS; HTTP LAN(아이폰)은 지도 중심 **가상 위치**
 - 지도 뷰: center/zoom·locate 플래그 `localStorage` 유지
+- 마커 설명: `http(s)://`·`www.` URL 자동 링크 (보기 모드, 새 탭)
 - 인증: JWT. 시드 계정 `alice@test.com` / `bob@test.com` / `carol@test.com` / 비밀번호 `test1234`
 
 ---
@@ -136,6 +137,10 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-25 — 설명 URL 링크화
+- 마커/구역 설명 보기에서 URL을 클릭 가능한 링크로 표시 (`frontend/src/linkify.tsx`)
+- 고덕/바이두: 웹 스크랩 비추천, 공식 API는 Key 발급 되면 검색 보조로 가능(미연동)
 
 ### 2026-07-21 — HTTPS + 히스토리 문서화
 - CloudFront 배포, ALB SG를 CloudFront only로 제한

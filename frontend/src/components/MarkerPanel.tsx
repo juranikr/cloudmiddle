@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { CATEGORY_LIST, CATEGORY_META } from "../categories";
+import { linkifyText } from "../linkify";
 import type { LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
 
 interface Props {
@@ -133,7 +134,9 @@ export default function MarkerPanel({
               ? ` · 꼭짓점 ${marker.polygon?.length ?? 0}개`
               : ` · ${marker.lat.toFixed(5)}, ${marker.lng.toFixed(5)}`}
           </p>
-          <p className="panel__desc">{marker.description || "설명 없음"}</p>
+          <p className="panel__desc">
+            {marker.description ? linkifyText(marker.description) : "설명 없음"}
+          </p>
           {canEdit ? (
             <div className="panel__actions">
               <button type="button" className="btn btn--ghost" onClick={onStartEdit}>
@@ -174,7 +177,7 @@ export default function MarkerPanel({
               onChange={(e) => setDescription(e.target.value)}
               maxLength={2000}
               rows={4}
-              placeholder="가는 팁, 영업시간, 결제 방법 등"
+              placeholder="가는 팁, 영업시간, URL(https://…) 등"
             />
           </label>
           {error ? <p className="panel__error">{error}</p> : null}
