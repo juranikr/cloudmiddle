@@ -106,7 +106,7 @@ def import_share(
 ) -> ShareImportResultOut:
     _ = current_user
     try:
-        result = import_share_text(body.text)
+        result = import_share_text(body.text, preferred_source=body.source)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
