@@ -20,8 +20,12 @@ def ensure_schema() -> None:
             if "merged_into_id" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN merged_into_id INTEGER"))
             if "is_agent_suggested" not in cols:
+                # Postgres는 boolean 기본값에 FALSE 필요 (0은 integer로 거부됨)
+                default = "FALSE" if engine.dialect.name == "postgresql" else "0"
                 conn.execute(
-                    text("ALTER TABLE markers ADD COLUMN is_agent_suggested BOOLEAN DEFAULT 0 NOT NULL")
+                    text(
+                        f"ALTER TABLE markers ADD COLUMN is_agent_suggested BOOLEAN DEFAULT {default} NOT NULL"
+                    )
                 )
 
         # 기여자 백필: 기존 markers.user_id → place_contributors
