@@ -250,17 +250,15 @@ export default function MarkerPanel({
           </span>
           <div className="panel__title-row">
             <h3 className="panel__title">{marker.title}</h3>
-            {mode !== "create" ? (
-              <button
-                type="button"
-                className={`btn btn--ghost panel__fav ${marker.is_favorite ? "is-on" : ""}`}
-                onClick={() => void toggleFavorite()}
-                aria-label={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
-                title={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
-              >
-                {marker.is_favorite ? "★" : "☆"}
-              </button>
-            ) : null}
+            <button
+              type="button"
+              className={tn btn--ghost panel__fav }
+              onClick={() => void toggleFavorite()}
+              aria-label={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
+              title={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
+            >
+              {marker.is_favorite ? "★" : "☆"}
+            </button>
           </div>
           <p className="panel__meta">
             {(marker.contributor_names?.length
