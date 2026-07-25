@@ -4,14 +4,14 @@ import type { MarkerCategory } from "./types";
 
 const iconCache = new Map<string, L.DivIcon>();
 
-export function getCategoryIcon(category: MarkerCategory, mine: boolean): L.DivIcon {
-  const key = `${category}-${mine ? "me" : "other"}`;
+export function getCategoryIcon(category: MarkerCategory): L.DivIcon {
+  const key = category;
   const cached = iconCache.get(key);
   if (cached) return cached;
 
   const color = CATEGORY_META[category].color;
-  const ring = mine ? "#f8fafc" : "rgba(255,255,255,0.85)";
-  const border = mine ? color : "rgba(15,23,42,0.15)";
+  const ring = "rgba(255,255,255,0.9)";
+  const border = "rgba(15,23,42,0.12)";
 
   const icon = L.divIcon({
     className: "jinan-pin",

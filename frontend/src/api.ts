@@ -65,16 +65,49 @@ export async function fetchMe(token: string): Promise<User> {
 
 export async function fetchMarkers(
   token: string,
-  opts: { mine?: boolean; category?: string | null },
+  opts: { category?: string | null },
 ): Promise<MarkerItem[]> {
   const params = new URLSearchParams();
-  if (opts.mine) params.set("mine", "true");
   if (opts.category) params.set("category", opts.category);
   const qs = params.toString();
   const res = await request(`/api/markers${qs ? `?${qs}` : ""}`, {
     headers: authHeaders(token),
   });
   return handle<MarkerItem[]>(res);
+}
+
+export async function uploadPlaceImage(
+  token: string,
+  placeId: number,
+  file: File,
+): Promise<MarkerItem> {
+  const presignRes = await request(`/api/markers/${placeId}/images/presign`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({
+      filename: file.name,
+      content_type: file.type || "image/jpeg",
+    }),
+  });
+  const presign = await handle<{
+    image_id: number;
+    upload_url: string;
+    public_url: string;
+  }>(presignRes);
+
+  const put = await fetch(presign.upload_url, {
+    method: "PUT",
+    headers: { "Content-Type": file.type || "image/jpeg" },
+    body: file,
+  });
+  if (!put.ok) {
+    throw new Error("이미지 업로드에 실패했습니다 (S3)");
+  }
+
+  const detail = await request(`/api/markers/${placeId}`, {
+    headers: authHeaders(token),
+  });
+  return handle<MarkerItem>(detail);
 }
 
 export async function createMarker(token: string, body: MarkerPayload): Promise<MarkerItem> {

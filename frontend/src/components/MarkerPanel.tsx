@@ -1,8 +1,10 @@
 import { useEffect, useState, type FormEvent } from "react";
+import * as api from "../api";
 import type { ShareImportResult } from "../api";
 import { CATEGORY_LIST, CATEGORY_META } from "../categories";
 import { linkifyText } from "../linkify";
 import type { LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
+import ImageSlideshow from "./ImageSlideshow";
 import ShareImport from "./ShareImport";
 
 export interface CreateDefaults {
@@ -25,6 +27,7 @@ interface Props {
   onUpdate: (id: number, payload: Partial<MarkerPayload>) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
   onStartEdit: () => void;
+  onMarkerRefresh?: (marker: MarkerItem) => void;
 }
 
 export default function MarkerPanel({
@@ -41,6 +44,7 @@ export default function MarkerPanel({
   onUpdate,
   onDelete,
   onStartEdit,
+  onMarkerRefresh,
 }: Props) {
   const [category, setCategory] = useState<MarkerCategory>("tourist");
   const [title, setTitle] = useState("");
@@ -144,16 +148,31 @@ export default function MarkerPanel({
 
       {mode === "view" && marker ? (
         <div className="panel__body">
+          <ImageSlideshow
+            images={marker.images ?? []}
+            canUpload={canEdit && !!token}
+            onUpload={
+              token
+                ? async (file) => {
+                    const updated = await api.uploadPlaceImage(token, marker.id, file);
+                    onMarkerRefresh?.(updated);
+                  }
+                : undefined
+            }
+          />
           <span
             className="panel__badge"
             style={{ background: CATEGORY_META[marker.category].color }}
           >
             {CATEGORY_META[marker.category].label}
             {marker.shape === "polygon" ? " · 구역" : ""}
+            {marker.is_agent_suggested ? " · 추천" : ""}
           </span>
           <h3 className="panel__title">{marker.title}</h3>
           <p className="panel__meta">
-            {marker.author_name}
+            {(marker.contributor_names?.length
+              ? marker.contributor_names.join(" · ")
+              : marker.author_name) || "공유"}
             {marker.shape === "polygon"
               ? ` · 꼭짓점 ${marker.polygon?.length ?? 0}개`
               : ` · ${marker.lat.toFixed(5)}, ${marker.lng.toFixed(5)}`}
@@ -161,6 +180,12 @@ export default function MarkerPanel({
           <p className="panel__desc">
             {marker.description ? linkifyText(marker.description) : "설명 없음"}
           </p>
+          {marker.agent_context ? (
+            <div className="panel__context">
+              <strong>정리 메모</strong>
+              <p>{linkifyText(marker.agent_context)}</p>
+            </div>
+          ) : null}
           {canEdit ? (
             <div className="panel__actions">
               <button type="button" className="btn btn--ghost" onClick={onStartEdit}>

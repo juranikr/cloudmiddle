@@ -32,6 +32,14 @@ output "cloudfront_distribution_id" {
   value = aws_cloudfront_distribution.app.id
 }
 
+output "images_bucket" {
+  value = aws_s3_bucket.images.bucket
+}
+
+output "images_cdn_url" {
+  value = "https://${aws_cloudfront_distribution.images.domain_name}"
+}
+
 output "ecs_cluster_name" {
   value = aws_ecs_cluster.main.name
 }

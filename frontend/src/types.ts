@@ -22,17 +22,29 @@ export interface User {
   created_at: string;
 }
 
+export interface PlaceImage {
+  id: number;
+  url: string;
+  sort_order: number;
+  group_key: string | null;
+  content_type: string;
+}
+
 export interface MarkerItem {
   id: number;
-  user_id: number;
+  user_id: number | null;
   author_name: string;
+  contributor_names: string[];
   category: MarkerCategory;
   shape: MarkerShape;
   title: string;
   description: string;
+  agent_context: string;
   lat: number;
   lng: number;
   polygon: LatLng[] | null;
+  images: PlaceImage[];
+  is_agent_suggested: boolean;
   created_at: string;
   updated_at: string;
 }

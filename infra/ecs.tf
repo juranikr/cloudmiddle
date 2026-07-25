@@ -100,6 +100,18 @@ resource "aws_ecs_task_definition" "api" {
         {
           name  = "CORS_ORIGINS"
           value = var.cors_origins
+        },
+        {
+          name  = "AWS_REGION"
+          value = var.aws_region
+        },
+        {
+          name  = "S3_BUCKET"
+          value = aws_s3_bucket.images.bucket
+        },
+        {
+          name  = "S3_PUBLIC_BASE_URL"
+          value = "https://${aws_cloudfront_distribution.images.domain_name}"
         }
       ]
       secrets = [
@@ -122,6 +134,14 @@ resource "aws_ecs_task_definition" "api" {
         {
           name      = "SEED_PASSWORD_TEST"
           valueFrom = "${aws_secretsmanager_secret.app.arn}:SEED_PASSWORD_TEST::"
+        },
+        {
+          name      = "GROQ_API_KEY"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_API_KEY::"
+        },
+        {
+          name      = "GROQ_MODEL"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_MODEL::"
         }
       ]
       logConfiguration = {

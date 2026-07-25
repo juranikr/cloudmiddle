@@ -8,3 +8,6 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.20
+boto3==1.35.99
+groq==0.18.0
+duckduckgo-search==7.5.5

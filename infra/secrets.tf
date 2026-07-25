@@ -15,4 +15,9 @@ resource "aws_secretsmanager_secret_version" "app" {
     JWT_SECRET   = local.jwt_secret_effective
     DB_PASSWORD  = random_password.db_password.result
   })
+
+  # SEED_PASSWORD_*, GROQ_* 등은 CLI로 추가·유지. terraform apply가 덮어쓰지 않음.
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
 }

@@ -103,7 +103,6 @@ function centroid(points: LatLng[]): LatLng {
 export default function MapPage() {
   const { token, user, logout } = useAuth();
   const [markers, setMarkers] = useState<MarkerItem[]>([]);
-  const [mineOnly, setMineOnly] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState<MarkerCategory | null>(null);
   const [toolMode, setToolMode] = useState<ToolMode>("pin");
   const [panelMode, setPanelMode] = useState<PanelMode>(null);
@@ -132,7 +131,6 @@ export default function MapPage() {
     setError("");
     try {
       const data = await api.fetchMarkers(token, {
-        mine: mineOnly,
         category: categoryFilter,
       });
       setMarkers(data);
@@ -141,7 +139,7 @@ export default function MapPage() {
     } finally {
       setLoading(false);
     }
-  }, [token, mineOnly, categoryFilter]);
+  }, [token, categoryFilter]);
 
   useEffect(() => {
     void loadMarkers();
@@ -352,22 +350,6 @@ export default function MapPage() {
           <span>{user?.display_name}</span>
         </div>
         <div className="topbar__filters">
-          <div className="seg">
-            <button
-              type="button"
-              className={!mineOnly ? "is-active" : ""}
-              onClick={() => setMineOnly(false)}
-            >
-              전체
-            </button>
-            <button
-              type="button"
-              className={mineOnly ? "is-active" : ""}
-              onClick={() => setMineOnly(true)}
-            >
-              내 마커
-            </button>
-          </div>
           <button type="button" className="topbar__logout" onClick={logout}>
             로그아웃
           </button>
@@ -507,7 +489,7 @@ export default function MapPage() {
               <Marker
                 key={m.id}
                 position={[m.lat, m.lng]}
-                icon={getCategoryIcon(m.category, m.user_id === user?.id)}
+                icon={getCategoryIcon(m.category)}
                 eventHandlers={{ click: () => openView(m) }}
               />
             ),
@@ -559,12 +541,16 @@ export default function MapPage() {
           marker={selected}
           createDefaults={createDefaults}
           token={token}
-          canEdit={!!selected && selected.user_id === user?.id}
+          canEdit={!!selected && !!user}
           onClose={closePanel}
           onCreate={handleCreate}
           onUpdate={handleUpdate}
           onDelete={handleDelete}
           onStartEdit={() => setPanelMode("edit")}
+          onMarkerRefresh={(m) => {
+            setSelected(m);
+            setMarkers((prev) => prev.map((x) => (x.id === m.id ? m : x)));
+          }}
         />
       ) : null}
     </div>

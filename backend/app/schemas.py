@@ -81,18 +81,52 @@ class MarkerUpdate(BaseModel):
     polygon: Optional[list[LatLng]] = None
 
 
-class MarkerOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class PlaceImageOut(BaseModel):
     id: int
-    user_id: int
-    author_name: str
+    url: str
+    sort_order: int
+    group_key: Optional[str] = None
+    content_type: str
+
+
+class MarkerOut(BaseModel):
+    id: int
+    user_id: Optional[int] = None
+    author_name: str = ""
+    contributor_names: list[str] = []
     category: MarkerCategory
     shape: MarkerShape
     title: str
     description: str
+    agent_context: str = ""
     lat: float
     lng: float
     polygon: Optional[list[LatLng]] = None
+    images: list[PlaceImageOut] = []
+    is_agent_suggested: bool = False
     created_at: datetime
     updated_at: datetime
+
+
+class ImageUploadRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=200)
+    content_type: str = Field(default="image/jpeg", max_length=100)
+
+
+class ImageUploadResponse(BaseModel):
+    image_id: int
+    upload_url: str
+    public_url: str
+    s3_key: str
+
+
+class ImageReorderRequest(BaseModel):
+    image_ids: list[int]
+
+
+class AgentRunResponse(BaseModel):
+    ok: bool
+    steps: int
+    message: str
+    unread_before: int
+    unread_after: int

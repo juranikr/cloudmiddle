@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-25 (KST) — 운영 계정 교체(앨리스/밥→실사용, 캐롤→테스트)
+최종 갱신: 2026-07-25 (KST) — Groq 지도 정리 에이전트 + S3 이미지 + 공유 장소 모델
 
 ---
 
@@ -31,7 +31,10 @@
 | RDS | `tourmiddle-dev-postgres…` (Postgres 16, `db.t4g.micro`) |
 | GitHub OIDC role | `arn:aws:iam::155557574983:role/tourmiddle-dev-github-actions` |
 | TF state | S3 `tourmiddle-tfstate-155557574983` + DynamoDB `tourmiddle-tf-lock` |
-| App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`) |
+| App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`, `GROQ_API_KEY`, `GROQ_MODEL`) |
+| 이미지 S3 | `tourmiddle-dev-place-images-155557574983` |
+| 이미지 CDN | https://d3qw5zq6yb15c.cloudfront.net |
+| 에이전트 스케줄 | EventBridge `cron(0 18 * * ? *)` = 매일 03:00 KST → ECS task `tourmiddle-dev-agent` |
 
 **트래픽 경로:** 브라우저 → CloudFront(HTTPS) → ALB(HTTP, CloudFront prefix만 허용) → ECS Fargate → RDS
 
@@ -56,7 +59,10 @@
 - 지도: Leaflet + OSM, 중심 지난
 - 마커: point(핀) / polygon(구역), 카테고리: tourist, lodging, restaurant, transport, shopping, drink, convenience, other
 - UX: 핀 모드 → 드래프트 + ConfirmBar(입력/취소); 구역 모드 → 탭 선택(점-in-폴리곤), 드래그로 그리기; 핀 모드에서는 구역이 클릭을 가로채지 않음
-- 공유 가시성 + 개인 필터
+- 장소는 **공유 모델**: 단일 소유자 없음, `place_contributors` + 로그인 사용자 전원 수정/삭제. **「내 마커」필터 제거**
+- 이력: `place_events` (create/update/delete/merge/image_*/context_*/agent_create) + `groq_read_at`
+- **Groq ReAct+tools** (`backend/app/agent/`): 미읽음 이벤트 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/agent/run`, 매일 새벽 자동
+- **이미지**: S3 presigned PUT + CloudFront URL, 상세 상단 슬라이드 (`ImageSlideshow`)
 - 주소 검색: 백엔드 `/api/geocode` → Nominatim
 - 위치: HTTPS/localhost에서 GPS; HTTP LAN(아이폰)은 지도 중심 **가상 위치**
 - 지도 뷰: center/zoom·locate 플래그 `localStorage` 유지
@@ -76,9 +82,9 @@ cloudmiddle/
   DEV_HISTORY.md          ← 이 파일 (컨텍스트 소스)
   .cursor/rules/          ← Cursor 강제 규칙
   Dockerfile              ← multi-stage: FE build + FastAPI가 static 서빙
-  backend/app/            ← FastAPI (main, auth, models, geocode, seed, …)
-  frontend/src/           ← React/Vite (MapPage, ZoneDrawer, …)
-  infra/                  ← Terraform (VPC/ALB/ECS/RDS/ECR/OIDC/CloudFront)
+  backend/app/            ← FastAPI (main, auth, models, agent/, storage, events, …)
+  frontend/src/           ← React/Vite (MapPage, MarkerPanel, ImageSlideshow, …)
+  infra/                  ← Terraform (+ S3 images CDN, EventBridge agent)
   .github/workflows/deploy-api.yml
 ```
 
@@ -140,7 +146,9 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 
 - `infra/terraform.tfvars`, `infra/backend.hcl`, `infra/outputs.json`, `*.tfstate`, `.env`, DB 파일
 - Access Key를 채팅에 붙인 적 있음 → 가능하면 로테이션
-- RDS 비밀번호·JWT는 Secrets Manager (`tourmiddle-dev/app`)
+- RDS 비밀번호·JWT·Groq·시드 비번은 Secrets Manager (`tourmiddle-dev/app`)
+- Groq 키를 채팅에 붙여 넣었음 → **콘솔에서 로테이션 권장** (레포 public)
+- Terraform `secret_version`은 `lifecycle.ignore_changes`로 CLI 추가 키를 덮어쓰지 않음
 
 ---
 
@@ -150,10 +158,19 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 - NAT Gateway (비용 때문에 public subnet + task public IP)
 - 최소 IAM / 비용 알람 / RDS 중지 스케줄
 - 프론트 CDN 분리 캐시(`/assets`만 캐시) — 현재 CachingDisabled
+- 에이전트 변경 승인 큐(현재 자동 merge/create)
+- 이미지 용량·개수 하드 리밋 / 클라이언트 리사이즈
+- 중국 웹(따종/고덕) 공식 검색 API (Key·번호 이슈)
 
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-25 — Groq 에이전트 + S3 이미지 + 공유 장소
+- 스키마: `place_events`, `place_contributors`, `place_images`, Marker에 `agent_context`/`merged_into_id`/`is_agent_suggested`
+- FE: 내 마커 제거, 전원 수정, 상세 슬라이드 업로드
+- infra: S3+이미지 CloudFront, ECS에 GROQ/S3 env, EventBridge 매일 03:00 KST 에이전트
+- 수동 실행: 로그인 후 `POST /api/agent/run` 또는 ECS `python -m app.agent`
 
 ### 2026-07-25 — 운영 계정 교체
 - alice→성주한(`joohan92@naver.com`), bob→국서정(`tjwjd629@naver.com`), carol→테스트(`test@test.com`)

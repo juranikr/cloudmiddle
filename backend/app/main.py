@@ -6,21 +6,36 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
+from app.agent.runner import run_agent
 from app.auth import create_access_token, get_current_user, verify_password
 from app.config import settings
 from app.db import Base, SessionLocal, engine, get_db
+from app.events import ensure_contributor, log_place_event
 from app.geocode import search_address
 from app.migrate import ensure_schema
-from app.models import Marker, MarkerCategory, MarkerShape, User
+from app.models import (
+    Marker,
+    MarkerCategory,
+    MarkerShape,
+    PlaceContributor,
+    PlaceEventAction,
+    PlaceImage,
+    User,
+)
 from app.schemas import (
+    AgentRunResponse,
     GeocodeResult,
+    ImageReorderRequest,
+    ImageUploadRequest,
+    ImageUploadResponse,
     LatLng,
     LoginRequest,
     MarkerCreate,
     MarkerOut,
     MarkerUpdate,
+    PlaceImageOut,
     ShareImportRequest,
     ShareImportResultOut,
     TokenResponse,
@@ -28,13 +43,14 @@ from app.schemas import (
 )
 from app.seed import seed_data
 from app.share_import import import_share_text
+from app import storage
 
-app = FastAPI(title="Jinan Travel Map API", version="0.1.0")
+app = FastAPI(title="Jinan Travel Map API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?",
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|d232kzujcg4ufp\.cloudfront\.net)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,27 +75,60 @@ def _parse_polygon(raw: Optional[str]) -> Optional[list[LatLng]]:
     return [LatLng(**p) for p in data]
 
 
+def _centroid(points: list[LatLng]) -> tuple[float, float]:
+    lat = sum(p.lat for p in points) / len(points)
+    lng = sum(p.lng for p in points) / len(points)
+    return lat, lng
+
+
 def marker_to_out(marker: Marker) -> MarkerOut:
+    names: list[str] = []
+    for c in marker.contributors or []:
+        if c.user and c.user.display_name and c.user.display_name not in names:
+            names.append(c.user.display_name)
+    if marker.creator and marker.creator.display_name and marker.creator.display_name not in names:
+        names.insert(0, marker.creator.display_name)
+    images = [
+        PlaceImageOut(
+            id=img.id,
+            url=storage.public_url(img.s3_key) if storage.s3_enabled() else "",
+            sort_order=img.sort_order,
+            group_key=img.group_key,
+            content_type=img.content_type,
+        )
+        for img in sorted(marker.images or [], key=lambda x: x.sort_order)
+    ]
     return MarkerOut(
         id=marker.id,
         user_id=marker.user_id,
-        author_name=marker.user.display_name,
+        author_name=names[0] if names else (marker.creator.display_name if marker.creator else "공유"),
+        contributor_names=names,
         category=marker.category,
         shape=marker.shape or MarkerShape.point,
         title=marker.title,
         description=marker.description,
+        agent_context=marker.agent_context or "",
         lat=marker.lat,
         lng=marker.lng,
         polygon=_parse_polygon(marker.polygon),
+        images=images,
+        is_agent_suggested=bool(marker.is_agent_suggested),
         created_at=marker.created_at,
         updated_at=marker.updated_at,
     )
 
 
-def _centroid(points: list[LatLng]) -> tuple[float, float]:
-    lat = sum(p.lat for p in points) / len(points)
-    lng = sum(p.lng for p in points) / len(points)
-    return lat, lng
+def _load_place(db: Session, place_id: int) -> Optional[Marker]:
+    return (
+        db.query(Marker)
+        .options(
+            joinedload(Marker.creator),
+            joinedload(Marker.contributors).joinedload(PlaceContributor.user),
+            joinedload(Marker.images),
+        )
+        .filter(Marker.id == place_id, Marker.merged_into_id.is_(None))
+        .first()
+    )
 
 
 @app.get("/api/health")
@@ -140,14 +189,20 @@ def me(current_user: User = Depends(get_current_user)) -> User:
 
 @app.get("/api/markers", response_model=list[MarkerOut])
 def list_markers(
-    mine: bool = Query(False),
     category: Optional[MarkerCategory] = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[MarkerOut]:
-    q = db.query(Marker).join(User)
-    if mine:
-        q = q.filter(Marker.user_id == current_user.id)
+    _ = current_user
+    q = (
+        db.query(Marker)
+        .options(
+            joinedload(Marker.creator),
+            joinedload(Marker.contributors).joinedload(PlaceContributor.user),
+            joinedload(Marker.images),
+        )
+        .filter(Marker.merged_into_id.is_(None))
+    )
     if category is not None:
         q = q.filter(Marker.category == category)
     markers = q.order_by(Marker.created_at.desc()).all()
@@ -177,8 +232,19 @@ def create_marker(
         polygon=polygon_json,
     )
     db.add(marker)
+    db.flush()
+    ensure_contributor(db, marker.id, current_user.id)
+    log_place_event(
+        db,
+        place_id=marker.id,
+        user=current_user,
+        action=PlaceEventAction.create,
+        summary=f"장소 추가: {marker.title}",
+        payload={"category": marker.category.value, "lat": lat, "lng": lng},
+    )
     db.commit()
-    db.refresh(marker)
+    marker = _load_place(db, marker.id)
+    assert marker is not None
     return marker_to_out(marker)
 
 
@@ -188,9 +254,10 @@ def get_marker(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> MarkerOut:
-    marker = db.query(Marker).filter(Marker.id == marker_id).first()
+    _ = current_user
+    marker = _load_place(db, marker_id)
     if marker is None:
-        raise HTTPException(status_code=404, detail="마커를 찾을 수 없습니다")
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
     return marker_to_out(marker)
 
 
@@ -201,11 +268,9 @@ def update_marker(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> MarkerOut:
-    marker = db.query(Marker).filter(Marker.id == marker_id).first()
+    marker = db.query(Marker).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first()
     if marker is None:
-        raise HTTPException(status_code=404, detail="마커를 찾을 수 없습니다")
-    if marker.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="본인 마커만 수정할 수 있습니다")
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
 
     data = body.model_dump(exclude_unset=True)
     if "title" in data and data["title"] is not None:
@@ -216,16 +281,29 @@ def update_marker(
         poly = data.pop("polygon")
         if poly is not None:
             points = [LatLng(**p) if isinstance(p, dict) else p for p in poly]
-            data["polygon"] = json.dumps([p.model_dump() if isinstance(p, LatLng) else p for p in points])
+            data["polygon"] = json.dumps(
+                [p.model_dump() if isinstance(p, LatLng) else p for p in points]
+            )
             lat, lng = _centroid(points)
             data["lat"] = lat
             data["lng"] = lng
 
+    before = {"title": marker.title, "category": marker.category.value}
     for key, value in data.items():
         setattr(marker, key, value)
 
+    ensure_contributor(db, marker.id, current_user.id)
+    log_place_event(
+        db,
+        place_id=marker.id,
+        user=current_user,
+        action=PlaceEventAction.update,
+        summary=f"장소 수정: {marker.title}",
+        payload={"before": before, "changes": list(data.keys())},
+    )
     db.commit()
-    db.refresh(marker)
+    marker = _load_place(db, marker_id)
+    assert marker is not None
     return marker_to_out(marker)
 
 
@@ -235,13 +313,102 @@ def delete_marker(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    marker = db.query(Marker).filter(Marker.id == marker_id).first()
+    marker = db.query(Marker).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first()
     if marker is None:
-        raise HTTPException(status_code=404, detail="마커를 찾을 수 없습니다")
-    if marker.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="본인 마커만 삭제할 수 있습니다")
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    log_place_event(
+        db,
+        place_id=marker.id,
+        user=current_user,
+        action=PlaceEventAction.delete,
+        summary=f"장소 삭제: {marker.title}",
+        payload={"title": marker.title},
+    )
     db.delete(marker)
     db.commit()
+
+
+@app.post("/api/markers/{marker_id}/images/presign", response_model=ImageUploadResponse)
+def presign_image(
+    marker_id: int,
+    body: ImageUploadRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ImageUploadResponse:
+    if not storage.s3_enabled():
+        raise HTTPException(status_code=501, detail="S3 이미지 업로드가 아직 설정되지 않았습니다")
+    marker = db.query(Marker).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first()
+    if marker is None:
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    ct = body.content_type or "image/jpeg"
+    if not ct.startswith("image/"):
+        raise HTTPException(status_code=400, detail="이미지 파일만 업로드할 수 있습니다")
+    key = storage.build_object_key(marker_id, body.filename, ct)
+    max_order = max([i.sort_order for i in marker.images], default=-1)
+    img = PlaceImage(
+        place_id=marker_id,
+        s3_key=key,
+        content_type=ct,
+        sort_order=max_order + 1,
+        uploaded_by_user_id=current_user.id,
+    )
+    db.add(img)
+    db.flush()
+    ensure_contributor(db, marker_id, current_user.id)
+    log_place_event(
+        db,
+        place_id=marker_id,
+        user=current_user,
+        action=PlaceEventAction.image_add,
+        summary="이미지 추가",
+        payload={"image_id": img.id, "s3_key": key},
+    )
+    db.commit()
+    return ImageUploadResponse(
+        image_id=img.id,
+        upload_url=storage.presign_put(key, ct),
+        public_url=storage.public_url(key),
+        s3_key=key,
+    )
+
+
+@app.put("/api/markers/{marker_id}/images/order", response_model=MarkerOut)
+def reorder_images(
+    marker_id: int,
+    body: ImageReorderRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> MarkerOut:
+    marker = db.query(Marker).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first()
+    if marker is None:
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    by_id = {i.id: i for i in marker.images}
+    for idx, iid in enumerate(body.image_ids):
+        if iid in by_id:
+            by_id[iid].sort_order = idx
+    ensure_contributor(db, marker_id, current_user.id)
+    log_place_event(
+        db,
+        place_id=marker_id,
+        user=current_user,
+        action=PlaceEventAction.image_reorder,
+        summary="이미지 순서 변경",
+        payload={"image_ids": body.image_ids},
+    )
+    db.commit()
+    marker = _load_place(db, marker_id)
+    assert marker is not None
+    return marker_to_out(marker)
+
+
+@app.post("/api/agent/run", response_model=AgentRunResponse)
+def agent_run(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AgentRunResponse:
+    _ = current_user
+    result = run_agent(db)
+    return AgentRunResponse(**result)
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

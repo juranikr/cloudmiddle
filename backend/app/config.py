@@ -15,6 +15,14 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60 * 24 * 7
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,https://localhost:5173,https://127.0.0.1:5173"
 
+    aws_region: str = "ap-northeast-2"
+    s3_bucket: str = ""
+    s3_public_base_url: str = ""  # CloudFront 또는 S3 website URL
+
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+    agent_max_steps: int = 12
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
