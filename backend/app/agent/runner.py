@@ -62,7 +62,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     from groq import Groq
 
     client = Groq(api_key=settings.groq_api_key)
-    model = settings.groq_model or "llama-3.3-70b-versatile"
+    model = settings.groq_model or "openai/gpt-oss-120b"
     steps_limit = max_steps or settings.agent_max_steps
 
     messages: list[dict[str, Any]] = [
@@ -81,49 +81,66 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
 
     steps = 0
     final_text = ""
-    for _ in range(steps_limit):
-        steps += 1
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.2,
-        )
-        msg = resp.choices[0].message
-        tool_calls = msg.tool_calls or []
-        if not tool_calls:
-            final_text = msg.content or ""
-            break
+    try:
+        for _ in range(steps_limit):
+            steps += 1
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.2,
+            )
+            msg = resp.choices[0].message
+            tool_calls = msg.tool_calls or []
+            if not tool_calls:
+                final_text = msg.content or ""
+                break
 
-        messages.append(
-            {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in tool_calls
-                ],
-            }
-        )
-        for tc in tool_calls:
-            raw_args = tc.function.arguments or "{}"
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError:
-                args = {}
-            result = run_tool(db, tc.function.name, args)
             messages.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(result, ensure_ascii=False)[:12000],
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in tool_calls
+                    ],
                 }
             )
+            for tc in tool_calls:
+                raw_args = tc.function.arguments or "{}"
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+                result = run_tool(db, tc.function.name, args)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result, ensure_ascii=False)[:12000],
+                    }
+                )
+    except Exception as exc:
+        detail = str(exc)
+        if "model_permission_blocked" in detail or "blocked at the project" in detail:
+            detail = (
+                f"Groq model '{model}' blocked in project limits. "
+                "Enable it at https://console.groq.com/settings/project/limits "
+                "or change Secrets GROQ_MODEL. "
+                f"Detail: {exc}"
+            )
+        return {
+            "ok": False,
+            "steps": steps,
+            "message": detail[:1500],
+            "unread_before": unread_before,
+            "unread_after": count_unread(db),
+        }
 
     return {
         "ok": True,

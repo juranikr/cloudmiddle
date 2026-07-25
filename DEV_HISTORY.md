@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 관리자 에이전트 롤백 + 다음 주기 교훈 전달
+최종 갱신: 2026-07-26 (KST) — Groq 모델 교체(gpt-oss-120b) + 에이전트 오류 메시지
 
 ---
 
@@ -174,6 +174,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — Groq 모델 차단 대응
+- 원인: llama-3.3-70b-versatile 가 Groq 프로젝트 limits에서 차단(403)
+- 기본/Secrets 모델 → openai/gpt-oss-120b
+- run_agent 예외를 500 대신 관리자 UI용 메시지로 반환
 
 ### 2026-07-26 — 관리자 에이전트 롤백
 - `PlaceEventAction.rollback` + `backend/app/rollback.py` (merge/update/context/agent_create/image_reorder)
