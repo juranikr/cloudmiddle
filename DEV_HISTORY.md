@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-25 (KST) — 관리자 페이지(`/admin`) + 기존 마커 이력 미읽음 백필
+최종 갱신: 2026-07-25 (KST) — 관리자 배포 수정(204) + 장소별 변경 이력 UI
 
 ---
 
@@ -172,6 +172,10 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-25 — 관리자 배포 수정 + 장소 이력
+- FastAPI 204 DELETE `response_class=Response`로 기동 실패 수정
+- `GET /api/markers/{id}/events` + 상세 패널「변경 이력」
 
 ### 2026-07-25 — 관리자 페이지 + 이력 백필
 - `/admin`: 에이전트 수동 실행, 사용자 추가/비번/삭제 (관리자 이메일만)

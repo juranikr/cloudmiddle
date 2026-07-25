@@ -817,6 +817,62 @@ textarea {
   word-break: break-word;
 }
 
+.panel__history {
+  display: grid;
+  gap: 8px;
+}
+
+.panel__history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.panel__history-list li {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(20, 33, 43, 0.04);
+  font-size: 0.84rem;
+}
+
+.panel__history-top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+  margin-bottom: 2px;
+}
+
+.panel__history-top strong {
+  font-size: 0.86rem;
+}
+
+.panel__history-top span {
+  color: var(--muted);
+}
+
+.panel__history-top em {
+  font-style: normal;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #b45309;
+}
+
+.panel__history-list p {
+  margin: 0 0 4px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.panel__history-list time {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
 .panel__appeal {
   display: grid;
   gap: 8px;

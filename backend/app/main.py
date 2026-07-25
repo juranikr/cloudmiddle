@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +23,7 @@ from app.models import (
     MarkerShape,
     PlaceAppeal,
     PlaceContributor,
+    PlaceEvent,
     PlaceEventAction,
     PlaceImage,
     User,
@@ -42,6 +43,7 @@ from app.schemas import (
     MarkerCreate,
     MarkerOut,
     MarkerUpdate,
+    PlaceEventOut,
     PlaceImageOut,
     ShareImportRequest,
     ShareImportResultOut,
@@ -276,6 +278,52 @@ def get_marker(
     return marker_to_out(marker)
 
 
+@app.get("/api/markers/{marker_id}/events", response_model=list[PlaceEventOut])
+def list_marker_events(
+    marker_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[PlaceEventOut]:
+    _ = current_user
+    marker = db.query(Marker).filter(Marker.id == marker_id).first()
+    if marker is None:
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    rows = (
+        db.query(PlaceEvent)
+        .filter(PlaceEvent.place_id == marker_id)
+        .order_by(PlaceEvent.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    user_ids = {e.user_id for e in rows if e.user_id}
+    names: dict[int, str] = {}
+    if user_ids:
+        for u in db.query(User).filter(User.id.in_(user_ids)).all():
+            names[u.id] = u.display_name
+    out: list[PlaceEventOut] = []
+    for e in rows:
+        if e.actor == "agent":
+            actor_name = "에이전트"
+        elif e.actor == "system":
+            actor_name = "시스템"
+        else:
+            actor_name = names.get(e.user_id or -1, "사용자")
+        out.append(
+            PlaceEventOut(
+                id=e.id,
+                place_id=e.place_id,
+                user_id=e.user_id,
+                actor_name=actor_name,
+                actor=e.actor,
+                action=e.action.value if e.action else "",
+                summary=e.summary or "",
+                groq_read=e.groq_read_at is not None,
+                created_at=e.created_at,
+            )
+        )
+    return out
+
+
 @app.patch("/api/markers/{marker_id}", response_model=MarkerOut)
 def update_marker(
     marker_id: int,
@@ -322,12 +370,12 @@ def update_marker(
     return marker_to_out(marker)
 
 
-@app.delete("/api/markers/{marker_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/api/markers/{marker_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def delete_marker(
     marker_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> None:
+) -> Response:
     marker = db.query(Marker).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first()
     if marker is None:
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
@@ -341,6 +389,7 @@ def delete_marker(
     )
     db.delete(marker)
     db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.post("/api/markers/{marker_id}/images/presign", response_model=ImageUploadResponse)

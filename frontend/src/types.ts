@@ -35,6 +35,18 @@ export interface AdminStatus {
   unread_work_items: number;
 }
 
+export interface PlaceEventItem {
+  id: number;
+  place_id: number | null;
+  user_id: number | null;
+  actor_name: string;
+  actor: string;
+  action: string;
+  summary: string;
+  groq_read: boolean;
+  created_at: string;
+}
+
 export interface PlaceImage {
   id: number;
   url: string;

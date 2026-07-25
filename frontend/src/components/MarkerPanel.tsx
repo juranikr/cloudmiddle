@@ -3,9 +3,28 @@ import * as api from "../api";
 import type { ShareImportResult } from "../api";
 import { CATEGORY_LIST, CATEGORY_META } from "../categories";
 import { linkifyText } from "../linkify";
-import type { LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
+import type {
+  LatLng,
+  MarkerCategory,
+  MarkerItem,
+  MarkerPayload,
+  MarkerShape,
+  PlaceEventItem,
+} from "../types";
 import ImageSlideshow from "./ImageSlideshow";
 import ShareImport from "./ShareImport";
+
+const ACTION_LABEL: Record<string, string> = {
+  create: "추가",
+  update: "수정",
+  delete: "삭제",
+  merge: "병합",
+  image_add: "사진 추가",
+  image_reorder: "사진 순서",
+  context_update: "정리 메모",
+  agent_create: "추천 추가",
+  appeal: "이의신청",
+};
 
 export interface CreateDefaults {
   title?: string;
@@ -54,6 +73,9 @@ export default function MarkerPanel({
   const [appealOpen, setAppealOpen] = useState(false);
   const [appealBody, setAppealBody] = useState("");
   const [appealDone, setAppealDone] = useState(false);
+  const [events, setEvents] = useState<PlaceEventItem[]>([]);
+  const [eventsOpen, setEventsOpen] = useState(false);
+  const [eventsLoading, setEventsLoading] = useState(false);
 
   useEffect(() => {
     if (marker && (mode === "view" || mode === "edit")) {
@@ -69,7 +91,29 @@ export default function MarkerPanel({
     setAppealOpen(false);
     setAppealBody("");
     setAppealDone(false);
+    setEvents([]);
+    setEventsOpen(false);
   }, [marker, mode, latlng, polygon, createDefaults]);
+
+  useEffect(() => {
+    if (!token || !marker || mode !== "view" || !eventsOpen) return;
+    let cancelled = false;
+    setEventsLoading(true);
+    void api
+      .fetchMarkerEvents(token, marker.id)
+      .then((rows) => {
+        if (!cancelled) setEvents(rows);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "이력을 불러오지 못했습니다");
+      })
+      .finally(() => {
+        if (!cancelled) setEventsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, marker, mode, eventsOpen]);
 
   async function submitAppeal() {
     if (!token || !marker || !appealBody.trim()) return;
@@ -206,6 +250,40 @@ export default function MarkerPanel({
             <div className="panel__context">
               <strong>정리 메모</strong>
               <p>{linkifyText(marker.agent_context)}</p>
+            </div>
+          ) : null}
+          {token ? (
+            <div className="panel__history">
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={() => setEventsOpen((v) => !v)}
+              >
+                {eventsOpen ? "이력 닫기" : "변경 이력"}
+              </button>
+              {eventsOpen ? (
+                eventsLoading ? (
+                  <p className="panel__meta">이력 불러오는 중…</p>
+                ) : events.length === 0 ? (
+                  <p className="panel__meta">이력이 없습니다</p>
+                ) : (
+                  <ul className="panel__history-list">
+                    {events.map((ev) => (
+                      <li key={ev.id}>
+                        <div className="panel__history-top">
+                          <strong>{ACTION_LABEL[ev.action] ?? ev.action}</strong>
+                          <span>{ev.actor_name}</span>
+                          {!ev.groq_read ? <em>에이전트 미확인</em> : null}
+                        </div>
+                        <p>{ev.summary}</p>
+                        <time dateTime={ev.created_at}>
+                          {new Date(ev.created_at).toLocaleString("ko-KR")}
+                        </time>
+                      </li>
+                    ))}
+                  </ul>
+                )
+              ) : null}
             </div>
           ) : null}
           {canEdit ? (

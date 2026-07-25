@@ -158,3 +158,15 @@ class AppealOut(BaseModel):
     agent_note: str = ""
     created_at: datetime
     resolved_at: Optional[datetime] = None
+
+
+class PlaceEventOut(BaseModel):
+    id: int
+    place_id: Optional[int] = None
+    user_id: Optional[int] = None
+    actor_name: str = ""
+    actor: str
+    action: str
+    summary: str
+    groq_read: bool = False
+    created_at: datetime

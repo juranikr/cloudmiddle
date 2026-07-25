@@ -1,4 +1,11 @@
-import type { AdminStatus, MarkerItem, MarkerPayload, User, UserMessage } from "./types";
+import type {
+  AdminStatus,
+  MarkerItem,
+  MarkerPayload,
+  PlaceEventItem,
+  User,
+  UserMessage,
+} from "./types";
 
 export interface GeocodeHit {
   display_name: string;
@@ -138,6 +145,13 @@ export async function deleteMarker(token: string, id: number): Promise<void> {
     headers: authHeaders(token),
   });
   await handle<void>(res);
+}
+
+export async function fetchMarkerEvents(token: string, id: number): Promise<PlaceEventItem[]> {
+  const res = await request(`/api/markers/${id}/events`, {
+    headers: authHeaders(token),
+  });
+  return handle<PlaceEventItem[]>(res);
 }
 
 export async function geocode(token: string, q: string): Promise<GeocodeHit[]> {

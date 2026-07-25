@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
@@ -141,12 +141,12 @@ def admin_update_user(
     db.refresh(user)
     return _user_out(user)
 
-@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def admin_delete_user(
     user_id: int,
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
-) -> None:
+) -> Response:
     if user_id == admin.id:
         raise HTTPException(status_code=400, detail="자기 자신은 삭제할 수 없습니다")
     user = db.get(User, user_id)
@@ -156,3 +156,4 @@ def admin_delete_user(
         raise HTTPException(status_code=400, detail="관리자 계정은 삭제할 수 없습니다")
     db.delete(user)
     db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
