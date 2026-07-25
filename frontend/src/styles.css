@@ -963,6 +963,118 @@ textarea {
   resize: vertical;
 }
 
+.admin {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 16px 48px;
+  display: grid;
+  gap: 16px;
+}
+
+.admin__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.admin__header h1 {
+  margin: 0 0 4px;
+  font-size: 1.4rem;
+}
+
+.admin__header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.admin__card {
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 12px;
+}
+
+.admin__card h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.admin__card h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.admin__stats {
+  margin: 0;
+  padding-left: 1.1rem;
+  line-height: 1.6;
+}
+
+.admin__info {
+  margin: 0;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(15, 118, 110, 0.08);
+  white-space: pre-wrap;
+  font-size: 0.86rem;
+}
+
+.admin__users {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.admin__users li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(20, 33, 43, 0.04);
+}
+
+.admin__users strong {
+  display: block;
+}
+
+.admin__users span {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.admin__user-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.admin__form {
+  display: grid;
+  gap: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(20, 33, 43, 0.08);
+}
+
+.admin__form label {
+  display: grid;
+  gap: 4px;
+  font-size: 0.86rem;
+}
+
+.admin__form input {
+  border: 1px solid rgba(20, 33, 43, 0.12);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font: inherit;
+}
+
 .panel__badge {
   justify-self: start;
   color: #fff;

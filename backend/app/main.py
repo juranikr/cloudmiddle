@@ -8,8 +8,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, joinedload
 
+from app.admin_api import router as admin_router
 from app.agent.runner import run_agent
-from app.auth import create_access_token, get_current_user, verify_password
+from app.auth import create_access_token, get_admin_user, get_current_user, verify_password
 from app.config import settings
 from app.db import Base, SessionLocal, engine, get_db
 from app.events import ensure_contributor, log_place_event
@@ -53,6 +54,7 @@ from app.share_import import import_share_text
 from app import storage
 
 app = FastAPI(title="Jinan Travel Map API", version="0.2.0")
+app.include_router(admin_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -190,8 +192,14 @@ def login(body: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
 
 
 @app.get("/api/auth/me", response_model=UserOut)
-def me(current_user: User = Depends(get_current_user)) -> User:
-    return current_user
+def me(current_user: User = Depends(get_current_user)) -> UserOut:
+    return UserOut(
+        id=current_user.id,
+        email=current_user.email,
+        display_name=current_user.display_name,
+        created_at=current_user.created_at,
+        is_admin=current_user.email.lower() in settings.admin_email_list,
+    )
 
 
 @app.get("/api/markers", response_model=list[MarkerOut])
@@ -411,9 +419,10 @@ def reorder_images(
 @app.post("/api/agent/run", response_model=AgentRunResponse)
 def agent_run(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    admin: User = Depends(get_admin_user),
 ) -> AgentRunResponse:
-    _ = current_user
+    """하위 호환. 관리자만 실행 가능 — `/api/admin/agent/run` 권장."""
+    _ = admin
     result = run_agent(db)
     return AgentRunResponse(**result)
 

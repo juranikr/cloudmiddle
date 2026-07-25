@@ -1,9 +1,16 @@
 import { useAuth } from "./auth";
+import AdminPage from "./pages/AdminPage";
 import LoginPage from "./pages/LoginPage";
 import MapPage from "./pages/MapPage";
 
+function pathIsAdmin(): boolean {
+  const p = window.location.pathname.replace(/\/+$/, "") || "/";
+  return p === "/admin";
+}
+
 export default function App() {
   const { user, loading } = useAuth();
+  const adminRoute = pathIsAdmin();
 
   if (loading) {
     return (
@@ -18,5 +25,13 @@ export default function App() {
     );
   }
 
-  return user ? <MapPage /> : <LoginPage />;
+  if (!user) {
+    return <LoginPage />;
+  }
+
+  if (adminRoute) {
+    return <AdminPage />;
+  }
+
+  return <MapPage />;
 }

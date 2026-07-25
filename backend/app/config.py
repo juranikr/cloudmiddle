@@ -22,10 +22,16 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     agent_max_steps: int = 12
+    # 쉼표 구분. 기본: 성주한
+    admin_emails: str = "joohan92@naver.com"
 
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def admin_email_list(self) -> list[str]:
+        return [e.strip().lower() for e in self.admin_emails.split(",") if e.strip()]
 
     @property
     def is_sqlite(self) -> bool:

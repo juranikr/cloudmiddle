@@ -53,6 +53,7 @@ class UserOut(BaseModel):
     email: EmailStr
     display_name: str
     created_at: datetime
+    is_admin: bool = False
 
 
 class MarkerCreate(BaseModel):

@@ -1,4 +1,4 @@
-import type { MarkerItem, MarkerPayload, User, UserMessage } from "./types";
+import type { AdminStatus, MarkerItem, MarkerPayload, User, UserMessage } from "./types";
 
 export interface GeocodeHit {
   display_name: string;
@@ -211,4 +211,61 @@ export async function createAppeal(
     body: JSON.stringify(body),
   });
   await handle(res);
+}
+
+export async function fetchAdminStatus(token: string): Promise<AdminStatus> {
+  const res = await request("/api/admin/status", { headers: authHeaders(token) });
+  return handle<AdminStatus>(res);
+}
+
+export async function runAdminAgent(token: string): Promise<{
+  ok: boolean;
+  steps: number;
+  message: string;
+  unread_before: number;
+  unread_after: number;
+}> {
+  const res = await request("/api/admin/agent/run", {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  return handle(res);
+}
+
+export async function fetchAdminUsers(token: string): Promise<User[]> {
+  const res = await request("/api/admin/users", { headers: authHeaders(token) });
+  return handle<User[]>(res);
+}
+
+export async function createAdminUser(
+  token: string,
+  body: { email: string; display_name: string; password: string },
+): Promise<User> {
+  const res = await request("/api/admin/users", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return handle<User>(res);
+}
+
+export async function updateAdminUser(
+  token: string,
+  id: number,
+  body: { email?: string; display_name?: string; password?: string },
+): Promise<User> {
+  const res = await request(`/api/admin/users/${id}`, {
+    method: "PATCH",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return handle<User>(res);
+}
+
+export async function deleteAdminUser(token: string, id: number): Promise<void> {
+  const res = await request(`/api/admin/users/${id}`, {
+    method: "DELETE",
+    headers: authHeaders(token),
+  });
+  await handle<void>(res);
 }

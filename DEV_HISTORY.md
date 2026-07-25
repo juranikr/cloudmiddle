@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-25 (KST) — 에이전트 알림·이의신청 + 보존형 편집 정책
+최종 갱신: 2026-07-25 (KST) — 관리자 페이지(`/admin`) + 기존 마커 이력 미읽음 백필
 
 ---
 
@@ -67,6 +67,8 @@
   - 편집은 덮어쓰기보다 **기존 기록 보존·보완** (append_note, local_name 병기)
   - UI/설명은 한국어, **명칭·주소는 현지 표기 유지**
 - **메시지함** UI (상단) + 장소 상세/메시지에서 이의신청
+- **관리자** `/admin` (성주한 `joohan92@naver.com`만, `ADMIN_EMAILS`): 에이전트 수동 실행, 사용자 CRUD, 미읽음/Groq 상태. API 키는 Secrets Manager
+- 기존 마커에 `place_events`가 없으면 기동 시 **create 미읽음 백필**
 - **이미지**: S3 presigned PUT + CloudFront URL, 상세 상단 슬라이드 (`ImageSlideshow`)
 - 주소 검색: 백엔드 `/api/geocode` → Nominatim
 - 위치: HTTPS/localhost에서 GPS; HTTP LAN(아이폰)은 지도 중심 **가상 위치**
@@ -170,6 +172,10 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-25 — 관리자 페이지 + 이력 백필
+- `/admin`: 에이전트 수동 실행, 사용자 추가/비번/삭제 (관리자 이메일만)
+- `ensure_schema`가 이벤트 없는 기존 마커에 미읽음 create 이력 백필
 
 ### 2026-07-25 — 에이전트 알림·이의신청·보존 정책
 - `user_messages` / `place_appeals` + API(`/api/messages*`, `/api/appeals`)

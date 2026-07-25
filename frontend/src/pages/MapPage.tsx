@@ -358,6 +358,11 @@ export default function MapPage() {
           <span>{user?.display_name}</span>
         </div>
         <div className="topbar__filters">
+          {user?.is_admin ? (
+            <a className="topbar__inbox" href="/admin">
+              관리
+            </a>
+          ) : null}
           <button
             type="button"
             className={`topbar__inbox ${unreadMsg ? "has-unread" : ""}`}

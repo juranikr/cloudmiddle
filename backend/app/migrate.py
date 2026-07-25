@@ -49,6 +49,29 @@ def ensure_schema() -> None:
         if "markers" in tables_now and engine.dialect.name == "postgresql":
             conn.execute(text("ALTER TABLE markers ALTER COLUMN user_id DROP NOT NULL"))
 
+        # 기존 마커에 이력이 없으면 create 이벤트를 미읽음으로 백필 (에이전트가 아직 안 본 상태)
+        if "markers" in tables_now and "place_events" in tables_now:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO place_events (place_id, user_id, actor, action, summary, payload, groq_read_at, created_at)
+                    SELECT
+                      m.id,
+                      m.user_id,
+                      'system',
+                      'create',
+                      '기존 장소 백필: ' || m.title,
+                      '{}',
+                      NULL,
+                      m.created_at
+                    FROM markers m
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM place_events pe WHERE pe.place_id = m.id
+                    )
+                    """
+                )
+            )
+
 
 def clear_all_markers() -> int:
     with engine.begin() as conn:

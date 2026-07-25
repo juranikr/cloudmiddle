@@ -20,6 +20,19 @@ export interface User {
   email: string;
   display_name: string;
   created_at: string;
+  is_admin?: boolean;
+}
+
+export interface AdminStatus {
+  admin_email: string;
+  groq_configured: boolean;
+  groq_model: string;
+  markers_active: number;
+  events_total: number;
+  events_unread: number;
+  appeals_open: number;
+  users_total: number;
+  unread_work_items: number;
 }
 
 export interface PlaceImage {
