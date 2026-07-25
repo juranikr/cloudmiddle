@@ -2,16 +2,39 @@ import { useState, type FormEvent } from "react";
 import * as api from "../api";
 import type { ShareImportResult } from "../api";
 
+type Source = "amap" | "dianping";
+
 interface Props {
   token: string;
+  source: Source;
+  /** 메인(고덕) / 등록 패널(따종) */
+  placement: "main" | "panel";
   onImported: (result: ShareImportResult) => void;
 }
 
-export default function ShareImport({ token, onImported }: Props) {
+const COPY: Record<Source, { button: string; title: string; hint: string; placeholder: string }> = {
+  amap: {
+    button: "고덕 공유하기로 초안만들기",
+    title: "고덕지도 공유 → 등록 초안",
+    hint: "고덕에서 공유한 전문(명칭·가격·주소·링크)을 붙여넣으세요. 좌표·명칭이 자동으로 채워집니다.",
+    placeholder:
+      "예)\n桥下把子肉\n¥22/사람·중국 음식\n工业南路68号华润置地广场\nhttps://surl.amap.com/…",
+  },
+  dianping: {
+    button: "따종 공유하기로 초안만들기",
+    title: "따종 공유 → 이 위치에 초안",
+    hint: "이미 찍은 위치는 유지됩니다. 따종 공유 문구를 붙여넣으면 이름·설명·링크만 채웁니다.",
+    placeholder:
+      "예)\n【燕喜堂·中华老字号(CBD店)】★★★★☆ 4.7\n¥93/人\n解放东路 鲁菜\n山左路与秦公街交叉口东北角 http://dpurl.cn/…",
+  },
+};
+
+export default function ShareImport({ token, source, placement, onImported }: Props) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const copy = COPY[source];
 
   async function handleSubmit(e?: FormEvent) {
     e?.preventDefault();
@@ -20,7 +43,7 @@ export default function ShareImport({ token, onImported }: Props) {
     setBusy(true);
     setError("");
     try {
-      const result = await api.importShare(token, payload);
+      const result = await api.importShare(token, payload, source);
       onImported(result);
       setText("");
       setOpen(false);
@@ -32,24 +55,26 @@ export default function ShareImport({ token, onImported }: Props) {
   }
 
   return (
-    <div className="share-import">
+    <div className={`share-import share-import--${placement}`}>
       <button
         type="button"
         className={`share-import__toggle ${open ? "is-active" : ""}`}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setOpen((v) => !v);
+          setError("");
+        }}
       >
-        따종·고덕 가져오기
+        {copy.button}
       </button>
       {open ? (
         <form className="share-import__panel" onSubmit={handleSubmit}>
-          <p className="share-import__hint">
-            따종 공유 문구 전체, 또는 고덕 <code>surl.amap.com</code> 링크를 붙여넣으세요.
-          </p>
+          <strong className="share-import__title">{copy.title}</strong>
+          <p className="share-import__hint">{copy.hint}</p>
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
-            rows={5}
-            placeholder={"예)\n【가게이름】★★★★☆ 4.7\n¥93/人\n…\n주소 http://dpurl.cn/…\n\n또는\nhttps://surl.amap.com/…"}
+            rows={placement === "panel" ? 5 : 6}
+            placeholder={copy.placeholder}
           />
           {error ? <p className="share-import__error">{error}</p> : null}
           <div className="share-import__actions">
@@ -57,7 +82,7 @@ export default function ShareImport({ token, onImported }: Props) {
               닫기
             </button>
             <button type="submit" className="btn btn--primary" disabled={busy || !text.trim()}>
-              {busy ? "해석 중…" : "가져오기"}
+              {busy ? "해석 중…" : "초안 채우기"}
             </button>
           </div>
         </form>

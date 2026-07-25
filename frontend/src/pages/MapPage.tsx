@@ -403,7 +403,12 @@ export default function MapPage() {
         {token ? (
           <>
             <AddressSearch token={token} onPick={handleSearchPick} />
-            <ShareImport token={token} onImported={handleShareImported} />
+            <ShareImport
+              token={token}
+              source="amap"
+              placement="main"
+              onImported={handleShareImported}
+            />
           </>
         ) : null}
 
@@ -430,9 +435,9 @@ export default function MapPage() {
         </div>
         <p className="topbar__hint">
           {awaitingImportPick
-            ? "가져온 장소의 위치를 지도에서 탭하세요 (이름·설명은 자동 입력됩니다)"
+            ? "위치를 지도에서 탭하세요 (이름·설명은 자동 입력됩니다)"
             : toolMode === "pin"
-              ? "지도를 탭해 위치를 고른 뒤, 아래 ‘입력’으로 내용을 작성하세요"
+              ? "핀: 지도 탭 → 입력. 따종은 등록 화면에서 초안 만들기 · 고덕은 위 버튼"
               : "구역을 탭하면 내용 수정 · 손가락으로 길게 그리면 새 구역 생성"}
         </p>
         {locateOn && locateMsg ? <p className="topbar__status">{locateMsg}</p> : null}
@@ -553,6 +558,7 @@ export default function MapPage() {
           polygon={draftPolygon}
           marker={selected}
           createDefaults={createDefaults}
+          token={token}
           canEdit={!!selected && selected.user_id === user?.id}
           onClose={closePanel}
           onCreate={handleCreate}

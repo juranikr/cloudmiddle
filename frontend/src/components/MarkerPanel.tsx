@@ -1,7 +1,9 @@
 import { useEffect, useState, type FormEvent } from "react";
+import type { ShareImportResult } from "../api";
 import { CATEGORY_LIST, CATEGORY_META } from "../categories";
 import { linkifyText } from "../linkify";
 import type { LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
+import ShareImport from "./ShareImport";
 
 export interface CreateDefaults {
   title?: string;
@@ -16,6 +18,7 @@ interface Props {
   polygon?: LatLng[] | null;
   marker?: MarkerItem | null;
   createDefaults?: CreateDefaults | null;
+  token?: string | null;
   canEdit: boolean;
   onClose: () => void;
   onCreate: (payload: MarkerPayload) => Promise<void>;
@@ -31,6 +34,7 @@ export default function MarkerPanel({
   polygon,
   marker,
   createDefaults,
+  token,
   canEdit,
   onClose,
   onCreate,
@@ -56,6 +60,18 @@ export default function MarkerPanel({
     }
     setError("");
   }, [marker, mode, latlng, polygon, createDefaults]);
+
+  function applyDianpingDraft(result: ShareImportResult) {
+    setTitle(result.title);
+    setDescription(result.description);
+    const hint = result.category_hint as MarkerCategory;
+    if (CATEGORY_LIST.includes(hint)) {
+      setCategory(hint);
+    } else {
+      setCategory("restaurant");
+    }
+    setError("");
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -159,11 +175,25 @@ export default function MarkerPanel({
         </div>
       ) : (
         <form className="panel__body panel__form" onSubmit={handleSubmit}>
+          {mode === "create" && createDefaults?.title ? (
+            <p className="panel__import-banner">
+              공유에서 초안을 채웠습니다. <strong>유형</strong>만 확인하고 저장하면 됩니다. (제목·설명은
+              필요 시만 수정)
+            </p>
+          ) : null}
           <p className="panel__meta">
             {isZone
               ? `구역 꼭짓점 ${polygon?.length ?? marker?.polygon?.length ?? 0}개`
               : `위치 ${(latlng ?? marker)!.lat.toFixed(5)}, ${(latlng ?? marker)!.lng.toFixed(5)}`}
           </p>
+          {mode === "create" && !isZone && token ? (
+            <ShareImport
+              token={token}
+              source="dianping"
+              placement="panel"
+              onImported={applyDianpingDraft}
+            />
+          ) : null}
           <label>
             유형
             <select value={category} onChange={(e) => setCategory(e.target.value as MarkerCategory)}>
@@ -194,7 +224,7 @@ export default function MarkerPanel({
               취소
             </button>
             <button type="submit" className="btn btn--primary" disabled={busy}>
-              {busy ? "저장 중…" : "저장"}
+              {busy ? "저장 중…" : mode === "create" && createDefaults?.title ? "초안 저장" : "저장"}
             </button>
           </div>
         </form>

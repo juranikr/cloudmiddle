@@ -20,6 +20,7 @@ class GeocodeResult(BaseModel):
 
 class ShareImportRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
+    source: str = Field(default="", max_length=20, description="amap | dianping | 자동")
 
 
 class ShareImportResultOut(BaseModel):

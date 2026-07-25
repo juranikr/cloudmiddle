@@ -1,11 +1,10 @@
-"""따종/고덕 공유 텍스트·단축 URL → 제목/주소/좌표 추출."""
+"""따종/고덕 공유 텍스트·단축 URL → 제목/주소/좌표 추출 (등록 초안)."""
 
 from __future__ import annotations
 
 import re
 import ssl
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
@@ -29,7 +28,12 @@ DP_URL_RE = re.compile(
 )
 TITLE_BRACKET_RE = re.compile(r"【([^】]+)】")
 RATING_RE = re.compile(r"★+[☆★]*\s*([0-9.]+)")
-PRICE_RE = re.compile(r"¥\s*([0-9.]+)\s*/\s*人")
+PRICE_RE = re.compile(r"¥\s*([0-9.]+)\s*/\s*(?:人|사람)")
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+FOOD_HINT_RE = re.compile(
+    r"(음식|餐饮|美食|菜|肉|火锅|烧烤|咖啡|奶茶|甜点|小吃|饭店|餐厅|食堂)",
+    re.I,
+)
 
 
 @dataclass
@@ -41,7 +45,7 @@ class ShareImportResult:
     source_url: str
     lat: Optional[float]
     lng: Optional[float]
-    category_hint: str  # restaurant | other | ...
+    category_hint: str
     needs_map_pick: bool
     note: str
 
@@ -57,16 +61,22 @@ def looks_like_share_text(text: str) -> bool:
     return False
 
 
-def import_share_text(text: str) -> ShareImportResult:
+def import_share_text(text: str, preferred_source: str = "") -> ShareImportResult:
     raw = text.strip()
     if not raw:
         raise ValueError("붙여넣을 내용이 없습니다")
 
     amap_url = _first_match(AMAP_URL_RE, raw)
     dp_url = _first_match(DP_URL_RE, raw)
+    pref = preferred_source.strip().lower()
 
-    if amap_url or "surl.amap.com" in raw.lower() or "amap.com" in raw.lower():
-        url = amap_url or raw.split()[0]
+    if pref == "dianping" or (not pref and (dp_url or "【" in raw) and not amap_url):
+        return _import_dianping(raw, dp_url)
+
+    if pref == "amap" or amap_url or "surl.amap.com" in raw.lower() or "amap.com" in raw.lower():
+        url = amap_url or ""
+        if not url:
+            raise ValueError("고덕 공유 링크(surl.amap.com)가 필요합니다")
         return _import_amap(url, raw)
 
     if dp_url or "【" in raw:
@@ -78,6 +88,20 @@ def import_share_text(text: str) -> ShareImportResult:
 def _first_match(pattern: re.Pattern[str], text: str) -> str:
     m = pattern.search(text)
     return m.group(0).rstrip(".,);]") if m else ""
+
+
+def _has_cjk(s: str) -> bool:
+    return bool(CJK_RE.search(s or ""))
+
+
+def _prefer_name(*candidates: str) -> str:
+    cjk = [c.strip() for c in candidates if c and c.strip() and _has_cjk(c)]
+    if cjk:
+        return cjk[0]
+    for c in candidates:
+        if c and c.strip():
+            return c.strip()
+    return ""
 
 
 def _follow_redirects(url: str, max_hops: int = 8) -> str:
@@ -102,48 +126,105 @@ def _follow_redirects(url: str, max_hops: int = 8) -> str:
     return cur
 
 
+def _parse_share_body_lines(text: str, url: str) -> tuple[str, str, str, str]:
+    """본문에서 (title, address, price_label, cuisine_or_meta) 추출."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    title = ""
+    address = ""
+    price_label = ""
+    meta = ""
+
+    for ln in lines:
+        cleaned = ln
+        if url:
+            cleaned = cleaned.replace(url, "").strip()
+        cleaned = AMAP_URL_RE.sub("", cleaned).strip()
+        cleaned = DP_URL_RE.sub("", cleaned).strip()
+        if not cleaned:
+            continue
+
+        price_m = PRICE_RE.search(cleaned)
+        if price_m or cleaned.startswith("¥"):
+            price_label = cleaned
+            # ¥22/사람·중국 음식
+            if "·" in cleaned:
+                meta = cleaned.split("·", 1)[1].strip()
+            elif "・" in cleaned:
+                meta = cleaned.split("・", 1)[1].strip()
+            continue
+
+        if "★" in cleaned:
+            continue
+
+        if any(k in cleaned for k in ("路", "街", "号", "广场", "大厦", "路口", "交叉口")):
+            if not address:
+                address = cleaned
+            continue
+
+        if not title and not cleaned.startswith("http"):
+            title = cleaned
+
+    return title, address, price_label, meta
+
+
+def _category_from_text(*parts: str) -> str:
+    blob = " ".join(p for p in parts if p)
+    if any(k in blob for k in ("酒店", "宾馆", "民宿", "旅馆")):
+        return "lodging"
+    if FOOD_HINT_RE.search(blob) or "鲁菜" in blob or "人" in blob or "사람" in blob:
+        return "restaurant"
+    if any(k in blob for k in ("咖啡", "奶茶", "酒吧", "酒馆")):
+        return "drink"
+    return "other"
+
+
 def _import_amap(url: str, original: str) -> ShareImportResult:
     final = _follow_redirects(url)
     parsed = _parse_amap_final(final)
     if not parsed:
         raise RuntimeError("고덕 링크에서 위치 정보를 읽지 못했습니다. 링크가 만료됐을 수 있습니다.")
 
-    lat_gcj, lng_gcj, title, address = parsed
+    lat_gcj, lng_gcj, url_title, url_address = parsed
     lat, lng = gcj02_to_wgs84(lat_gcj, lng_gcj)
-    title = title or "고덕 장소"
-    desc_parts = []
+
+    text_title, text_address, price_label, meta = _parse_share_body_lines(original, url)
+    title = _prefer_name(text_title, url_title) or "고덕 장소"
+    address = text_address or url_address
+
+    desc_lines: list[str] = []
+    if price_label:
+        desc_lines.append(price_label)
+    elif meta:
+        desc_lines.append(meta)
     if address:
-        desc_parts.append(address)
-    desc_parts.append(url)
-    if original.strip() != url.strip():
-        # 원문 추가 정보는 생략 (URL만으로 충분한 경우)
-        pass
+        desc_lines.append(address)
+    desc_lines.append(url)
+
+    category = _category_from_text(title, address, price_label, meta, original)
 
     return ShareImportResult(
         source="amap",
         title=title[:200],
-        description="\n".join(desc_parts)[:2000],
+        description="\n".join(desc_lines)[:2000],
         address=address,
         source_url=url,
         lat=lat,
         lng=lng,
-        category_hint="other",
+        category_hint=category,
         needs_map_pick=False,
-        note="고덕 공유 링크에서 좌표·명칭을 가져왔습니다 (GCJ-02→WGS84 변환).",
+        note="고덕 공유에서 명칭·주소·좌표 초안을 만들었습니다. 유형만 확인하고 저장하세요.",
     )
 
 
 def _parse_amap_final(final_url: str) -> Optional[tuple[float, float, str, str]]:
     qs = parse_qs(urlparse(final_url).query)
 
-    # android=androidamap?action=shorturl&p=POIID,lat,lng,name,address
     android = unquote(qs.get("android", [""])[0])
     if android:
         aqs = parse_qs(urlparse("x://" + android.replace("androidamap?", "?", 1)).query)
         p = aqs.get("p", [""])[0]
         if not p and "p=" in android:
-            p = android.split("p=", 1)[1].split("&", 1)[0]
-            p = unquote(p)
+            p = unquote(android.split("p=", 1)[1].split("&", 1)[0])
         hit = _parse_amap_p(p)
         if hit:
             return hit
@@ -171,7 +252,6 @@ def _parse_amap_final(final_url: str) -> Optional[tuple[float, float, str, str]]
             except ValueError:
                 pass
 
-    # URL 전체에서 lat,lng 패턴
     m = re.search(r"(3[0-9]\.\d+)[,/%2C]+(11[0-9]\.\d+)", final_url)
     if m:
         try:
@@ -188,7 +268,6 @@ def _parse_amap_p(p: str) -> Optional[tuple[float, float, str, str]]:
     if len(parts) < 3:
         return None
     try:
-        # POIID, lat, lng, name, address...
         lat = float(parts[1])
         lng = float(parts[2])
     except ValueError:
@@ -209,34 +288,33 @@ def _import_dianping(text: str, url: str) -> ShareImportResult:
     source_url = url or _first_match(DP_URL_RE, text)
     title_m = TITLE_BRACKET_RE.search(text)
     title = (title_m.group(1).strip() if title_m else "").strip()
+    text_title, text_address, price_label, meta = _parse_share_body_lines(text, source_url)
     if not title:
-        title = "따종 장소"
+        title = text_title or "따종 장소"
 
     rating_m = RATING_RE.search(text)
     price_m = PRICE_RE.search(text)
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    address = ""
-    area_cuisine = ""
+    address = text_address
+    area_cuisine = meta
     for ln in lines:
-        if ln.startswith("【") or ln.startswith("http") or "★" in ln or ln.startswith("¥"):
+        if ln.startswith("【") or "★" in ln or ln.startswith("¥") or ln.startswith("http"):
             continue
-        if re.search(r"https?://", ln):
-            # 같은 줄 끝 URL 제거
-            cleaned = DP_URL_RE.sub("", ln).strip()
-            if cleaned and not address:
+        cleaned = DP_URL_RE.sub("", ln).strip()
+        if not cleaned:
+            continue
+        if not area_cuisine and ("路" in cleaned or "街" in cleaned) and len(cleaned) < 40 and "交叉" not in cleaned:
+            # 解放东路 鲁菜 — 짧은 상권/요리 줄
+            if " " in cleaned or "鲁" in cleaned or "菜" in cleaned:
+                area_cuisine = cleaned
+                continue
+        if re.search(r"(交叉口|东北角|西南角|号)", cleaned) or len(cleaned) >= 10:
+            if not address:
                 address = cleaned
-            continue
-        # "解放东路 鲁菜" 형태
-        if not area_cuisine and ("路" in ln or "街" in ln) and len(ln) < 40:
-            area_cuisine = ln
-            continue
-        if not address:
-            address = ln
 
-    # 같은 줄에 주소+URL
     for ln in lines:
-        if "http" in ln and ("路" in ln or "街" in ln or "号" in ln):
+        if "http" in ln and any(k in ln for k in ("路", "街", "号", "交叉")):
             cleaned = DP_URL_RE.sub("", ln).strip()
             if cleaned:
                 address = cleaned
@@ -246,10 +324,12 @@ def _import_dianping(text: str, url: str) -> ShareImportResult:
         meta_bits.append(f"평점 {rating_m.group(1)}")
     if price_m:
         meta_bits.append(f"¥{price_m.group(1)}/인")
+    elif price_label:
+        meta_bits.append(price_label)
     if area_cuisine:
         meta_bits.append(area_cuisine)
 
-    desc_lines = []
+    desc_lines: list[str] = []
     if meta_bits:
         desc_lines.append(" · ".join(meta_bits))
     if address:
@@ -259,14 +339,12 @@ def _import_dianping(text: str, url: str) -> ShareImportResult:
 
     lat: Optional[float] = None
     lng: Optional[float] = None
-    note = "따종 공유 문구에서 이름·주소를 채웠습니다."
     needs_pick = True
+    note = "따종 공유에서 이름·주소를 채웠습니다. 지도에서 위치만 탭한 뒤 유형을 확인하고 저장하세요."
 
-    # Nominatim으로 주소/이름 추정 (중국 POI는 실패하는 경우 많음)
     geo_queries = []
     if address:
-        geo_queries.append(f"{address} 济南")
-        geo_queries.append(address)
+        geo_queries.extend([f"{address} 济南", address])
     geo_queries.append(f"{title} 济南")
     for q in geo_queries:
         try:
@@ -277,15 +355,12 @@ def _import_dianping(text: str, url: str) -> ShareImportResult:
             lat = hits[0]["lat"]
             lng = hits[0]["lng"]
             needs_pick = False
-            note = "따종 문구를 파싱했고, 주소 검색으로 위치를 추정했습니다. 핀이 어긋나면 지도를 옮겨 주세요."
+            note = "따종 초안을 만들었습니다. 핀 위치가 맞는지 확인한 뒤 유형만 고르고 저장하세요."
             break
 
-    if needs_pick:
-        note = "따종 문구에서 이름·링크는 채웠습니다. 좌표는 지도를 탭해 위치를 지정해 주세요."
-
-    category = "restaurant"
-    if area_cuisine and any(k in area_cuisine for k in ("酒店", "宾馆", "民宿")):
-        category = "lodging"
+    category = _category_from_text(title, address, area_cuisine, " ".join(meta_bits), text)
+    if category == "other":
+        category = "restaurant"
 
     return ShareImportResult(
         source="dianping",

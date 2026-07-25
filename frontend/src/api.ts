@@ -128,11 +128,15 @@ export interface ShareImportResult {
   note: string;
 }
 
-export async function importShare(token: string, text: string): Promise<ShareImportResult> {
+export async function importShare(
+  token: string,
+  text: string,
+  source: "amap" | "dianping" | "" = "",
+): Promise<ShareImportResult> {
   const res = await request("/api/import/share", {
     method: "POST",
     headers: authHeaders(token),
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, source }),
   });
   return handle<ShareImportResult>(res);
 }
