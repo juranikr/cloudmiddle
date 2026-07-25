@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-25 (KST) — 관리자 배포 수정(204) + 장소별 변경 이력 UI
+최종 갱신: 2026-07-26 (KST) — 관리자 에이전트 롤백 + 다음 주기 교훈 전달
 
 ---
 
@@ -60,14 +60,16 @@
 - 마커: point(핀) / polygon(구역), 카테고리: tourist, lodging, restaurant, transport, shopping, drink, convenience, other
 - UX: 핀 모드 → 드래프트 + ConfirmBar(입력/취소); 구역 모드 → 탭 선택(점-in-폴리곤), 드래그로 그리기; 핀 모드에서는 구역이 클릭을 가로채지 않음
 - 장소는 **공유 모델**: 단일 소유자 없음, `place_contributors` + 로그인 사용자 전원 수정/삭제. **「내 마커」필터 제거**
-- 이력: `place_events` (create/update/delete/merge/image_*/context_*/agent_create) + `groq_read_at`
-- **Groq ReAct+tools** (`backend/app/agent/`): 미읽음 이벤트·이의신청 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/agent/run`, 매일 새벽 자동
+- 이력: `place_events` (create/update/delete/merge/image_*/context_*/agent_create/**rollback**) + `groq_read_at`
+- **Groq ReAct+tools** (`backend/app/agent/`): 미읽음 이벤트·이의신청·롤백 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/admin/agent/run`, 매일 새벽 자동
   - 병합/추가 시 관련 사용자에게 **인앱 메시지** (`user_messages`)
   - **이의신청** (`place_appeals`) → 다음 주기에 `list_open_appeals`로 재고려
   - 편집은 덮어쓰기보다 **기존 기록 보존·보완** (append_note, local_name 병기)
   - UI/설명은 한국어, **명칭·주소는 현지 표기 유지**
+  - 에이전트 변경은 `before` 스냅샷 저장 → 관리자 롤백 가능
+  - `list_recent_rollbacks`: 롤백 교훈을 읽고 **같은 방향 수정 반복 금지**
 - **메시지함** UI (상단) + 장소 상세/메시지에서 이의신청
-- **관리자** `/admin` (성주한 `joohan92@naver.com`만, `ADMIN_EMAILS`): 에이전트 수동 실행, 사용자 CRUD, 미읽음/Groq 상태. API 키는 Secrets Manager
+- **관리자** `/admin` (성주한 `joohan92@naver.com`만, `ADMIN_EMAILS`): 에이전트 수동 실행, **에이전트 변경 이력·롤백**, 사용자 CRUD, 미읽음/Groq 상태. API 키는 Secrets Manager
 - 기존 마커에 `place_events`가 없으면 기동 시 **create 미읽음 백필**
 - **이미지**: S3 presigned PUT + CloudFront URL, 상세 상단 슬라이드 (`ImageSlideshow`)
 - 주소 검색: 백엔드 `/api/geocode` → Nominatim
@@ -172,6 +174,12 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 관리자 에이전트 롤백
+- `PlaceEventAction.rollback` + `backend/app/rollback.py` (merge/update/context/agent_create/image_reorder)
+- 에이전트 조치에 `before` 스냅샷 저장; tool `list_recent_rollbacks`
+- 관리 API: `GET /api/admin/agent/actions`, `POST .../rollback`
+- `/admin`에 에이전트 변경 이력·롤백 버튼; 롤백은 미읽음으로 남아 다음 주기 교훈
 
 ### 2026-07-25 — 관리자 배포 수정 + 장소 이력
 - FastAPI 204 DELETE `response_class=Response`로 기동 실패 수정

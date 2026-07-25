@@ -47,6 +47,17 @@ export interface PlaceEventItem {
   created_at: string;
 }
 
+export interface AdminAgentAction {
+  id: number;
+  place_id: number | null;
+  place_title: string;
+  action: string;
+  summary: string;
+  rolled_back: boolean;
+  can_rollback: boolean;
+  created_at: string;
+}
+
 export interface PlaceImage {
   id: number;
   url: string;

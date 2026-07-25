@@ -27,6 +27,7 @@ from app.models import (
     PlaceImage,
     UserMessageKind,
 )
+from app.rollback import marker_snapshot
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -227,6 +228,20 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_recent_rollbacks",
+            "description": (
+                "관리자가 에이전트 조치를 롤백한 미읽음 이력. "
+                "같은 실수를 반복하지 않도록 반드시 확인한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "default": 20}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "웹에서 장소 관련 정보를 간단히 검색한다 (DuckDuckGo).",
             "parameters": {
@@ -359,6 +374,15 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         if not target or not source:
             return {"error": "not_found"}
         source_title = source.title
+        before = {
+            "target": marker_snapshot(target),
+            "source": marker_snapshot(source),
+            "source_images": {
+                str(img.id): {"sort_order": img.sort_order, "group_key": img.group_key}
+                for img in source.images
+            },
+        }
+        moved_image_ids = [img.id for img in list(source.images)]
         # 기존 기록 보존: 설명·제목 정보를 덧붙임
         chunks = [target.description or ""]
         if source.description and source.description not in (target.description or ""):
@@ -385,7 +409,13 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             user=None,
             action=PlaceEventAction.merge,
             summary=f"병합: #{source.id} → #{target.id} ({reason})",
-            payload={"source_id": source_id, "target_id": target_id, "reason": reason},
+            payload={
+                "source_id": source_id,
+                "target_id": target_id,
+                "reason": reason,
+                "before": before,
+                "moved_image_ids": moved_image_ids,
+            },
             actor="agent",
         )
         db.flush()
@@ -413,6 +443,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
         if not m:
             return {"error": "not_found"}
+        before_ctx = m.agent_context or ""
         # 덮어쓰기보다 병합 선호
         if m.agent_context and ctx and ctx not in m.agent_context:
             m.agent_context = (m.agent_context.rstrip() + "\n\n" + ctx).strip()[:8000]
@@ -424,7 +455,10 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             user=None,
             action=PlaceEventAction.context_update,
             summary="에이전트 컨텍스트 보완",
-            payload={"chars": len(m.agent_context or "")},
+            payload={
+                "chars": len(m.agent_context or ""),
+                "before": {"agent_context": before_ctx},
+            },
             actor="agent",
         )
         db.commit()
@@ -435,6 +469,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
         if not m:
             return {"error": "not_found"}
+        before = marker_snapshot(m)
         changed: dict[str, Any] = {}
         local_name = str(args.get("local_name") or "").strip()
         if local_name and local_name not in m.title:
@@ -467,7 +502,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             user=None,
             action=PlaceEventAction.update,
             summary="에이전트 정보 보완",
-            payload=changed,
+            payload={**changed, "before": before},
             actor="agent",
         )
         db.commit()
@@ -499,7 +534,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             user=None,
             action=PlaceEventAction.agent_create,
             summary=f"에이전트 장소 추가: {title}",
-            payload={"lat": m.lat, "lng": m.lng},
+            payload={"lat": m.lat, "lng": m.lng, "place_id": m.id, "before": {}},
             actor="agent",
         )
         db.flush()
@@ -578,6 +613,9 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         ordered = [int(x) for x in (args.get("ordered_ids") or [])]
         groups = args.get("group_keys") or {}
         images = db.query(PlaceImage).filter(PlaceImage.place_id == pid).all()
+        before_orders = {
+            str(i.id): {"sort_order": i.sort_order, "group_key": i.group_key} for i in images
+        }
         by_id = {i.id: i for i in images}
         for idx, iid in enumerate(ordered):
             if iid in by_id:
@@ -591,11 +629,34 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             user=None,
             action=PlaceEventAction.image_reorder,
             summary="에이전트 이미지 순서 조정",
-            payload={"ordered_ids": ordered},
+            payload={"ordered_ids": ordered, "before": {"image_orders": before_orders}},
             actor="agent",
         )
         db.commit()
         return {"ok": True}
+
+    if name == "list_recent_rollbacks":
+        limit = int(args.get("limit") or 20)
+        rows = (
+            db.query(PlaceEvent)
+            .filter(
+                PlaceEvent.action == PlaceEventAction.rollback,
+                PlaceEvent.groq_read_at.is_(None),
+            )
+            .order_by(PlaceEvent.created_at.desc())
+            .limit(max(1, min(limit, 50)))
+            .all()
+        )
+        return [
+            {
+                "id": e.id,
+                "place_id": e.place_id,
+                "summary": e.summary,
+                "payload": json.loads(e.payload or "{}"),
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in rows
+        ]
 
     if name == "web_search":
         query = str(args.get("query") or "").strip()

@@ -24,6 +24,7 @@ const ACTION_LABEL: Record<string, string> = {
   context_update: "정리 메모",
   agent_create: "추천 추가",
   appeal: "이의신청",
+  rollback: "롤백",
 };
 
 export interface CreateDefaults {

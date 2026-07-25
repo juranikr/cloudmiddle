@@ -45,6 +45,7 @@ class PlaceEventAction(str, enum.Enum):
     context_update = "context_update"
     agent_create = "agent_create"
     appeal = "appeal"
+    rollback = "rollback"
 
 
 class UserMessageKind(str, enum.Enum):

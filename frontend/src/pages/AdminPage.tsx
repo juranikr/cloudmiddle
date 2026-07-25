@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import * as api from "../api";
 import { useAuth } from "../auth";
-import type { AdminStatus, User } from "../types";
+import type { AdminAgentAction, AdminStatus, User } from "../types";
+
+const ACTION_LABEL: Record<string, string> = {
+  merge: "병합",
+  update: "수정",
+  context_update: "컨텍스트",
+  agent_create: "추천 추가",
+  image_reorder: "이미지 순서",
+};
 
 export default function AdminPage() {
   const { token, user, logout } = useAuth();
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [users, setUsers] = useState<User[]>([]);
+  const [actions, setActions] = useState<AdminAgentAction[]>([]);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
   const [busy, setBusy] = useState(false);
@@ -18,9 +27,14 @@ export default function AdminPage() {
     if (!token) return;
     setError("");
     try {
-      const [s, u] = await Promise.all([api.fetchAdminStatus(token), api.fetchAdminUsers(token)]);
+      const [s, u, a] = await Promise.all([
+        api.fetchAdminStatus(token),
+        api.fetchAdminUsers(token),
+        api.fetchAdminAgentActions(token),
+      ]);
       setStatus(s);
       setUsers(u);
+      setActions(a);
     } catch (e) {
       setError(e instanceof Error ? e.message : "관리자 정보를 불러오지 못했습니다");
     }
@@ -100,6 +114,30 @@ export default function AdminPage() {
     }
   }
 
+  async function rollbackAction(a: AdminAgentAction) {
+    if (!token) return;
+    const label = ACTION_LABEL[a.action] || a.action;
+    const note =
+      prompt(
+        `#${a.id} (${label}) 롤백합니다.\n다음 에이전트 실행에 전달할 메모(선택):`,
+        "",
+      ) ?? null;
+    if (note === null) return;
+    if (!confirm(`에이전트 조치 #${a.id}를 롤백할까요?\n${a.summary}`)) return;
+    setBusy(true);
+    setError("");
+    setInfo("");
+    try {
+      const r = await api.rollbackAdminAgentAction(token, a.id, note.trim());
+      setInfo(`롤백 완료 · 이벤트 #${r.rollback_event_id}\n${r.message}`);
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "롤백 실패");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!user?.is_admin) {
     return (
       <div className="admin">
@@ -158,6 +196,54 @@ export default function AdminPage() {
           매일 새벽 03:00(KST)에도 자동 실행됩니다. API 키는 AWS Secrets Manager
           (`tourmiddle-dev/app`의 GROQ_*)에서 관리합니다.
         </p>
+      </section>
+
+      <section className="admin__card">
+        <h2>에이전트 변경 이력</h2>
+        <p className="panel__meta">
+          롤백하면 지도가 이전 상태로 돌아가고, 다음 에이전트 실행 시 같은 방향의 수정을
+          피하도록 이력이 전달됩니다.
+        </p>
+        {actions.length === 0 ? (
+          <p className="panel__meta">에이전트 변경 이력이 없습니다.</p>
+        ) : (
+          <ul className="admin__actions">
+            {actions.map((a) => (
+              <li key={a.id}>
+                <div>
+                  <strong>
+                    #{a.id} · {ACTION_LABEL[a.action] || a.action}
+                    {a.rolled_back ? " · 롤백됨" : ""}
+                  </strong>
+                  <span>
+                    {a.place_title
+                      ? `${a.place_title}${a.place_id ? ` (#${a.place_id})` : ""}`
+                      : a.place_id
+                        ? `장소 #${a.place_id}`
+                        : "장소 없음"}
+                    {" · "}
+                    {new Date(a.created_at).toLocaleString("ko-KR")}
+                  </span>
+                  <span className="admin__action-summary">{a.summary}</span>
+                </div>
+                <div className="admin__user-actions">
+                  {a.can_rollback ? (
+                    <button
+                      type="button"
+                      className="btn btn--danger"
+                      onClick={() => void rollbackAction(a)}
+                      disabled={busy}
+                    >
+                      롤백
+                    </button>
+                  ) : (
+                    <span className="panel__meta">{a.rolled_back ? "완료" : "불가"}</span>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <section className="admin__card">

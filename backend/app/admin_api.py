@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -13,6 +15,7 @@ from app.auth import get_admin_user, hash_password
 from app.config import settings
 from app.db import get_db
 from app.models import Marker, PlaceAppeal, PlaceAppealStatus, PlaceEvent, User
+from app.rollback import is_rollbackable, list_agent_actions, rollback_event
 from app.schemas import AgentRunResponse, UserOut
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -73,6 +76,79 @@ def admin_run_agent(
 ) -> AgentRunResponse:
     _ = admin
     return AgentRunResponse(**run_agent(db))
+
+
+class AdminAgentActionOut(BaseModel):
+    id: int
+    place_id: Optional[int] = None
+    place_title: str = ""
+    action: str
+    summary: str
+    rolled_back: bool = False
+    can_rollback: bool = False
+    created_at: datetime
+
+
+class AdminRollbackRequest(BaseModel):
+    note: str = Field(default="", max_length=1000)
+
+
+class AdminRollbackOut(BaseModel):
+    ok: bool
+    rollback_event_id: int
+    message: str
+
+
+@router.get("/agent/actions", response_model=list[AdminAgentActionOut])
+def admin_agent_actions(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+    limit: int = 40,
+) -> list[AdminAgentActionOut]:
+    _ = admin
+    rows = list_agent_actions(db, limit=limit)
+    place_ids = {e.place_id for e in rows if e.place_id}
+    titles: dict[int, str] = {}
+    if place_ids:
+        for m in db.query(Marker).filter(Marker.id.in_(place_ids)).all():
+            titles[m.id] = m.title
+    out: list[AdminAgentActionOut] = []
+    for e in rows:
+        try:
+            payload = json.loads(e.payload or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        out.append(
+            AdminAgentActionOut(
+                id=e.id,
+                place_id=e.place_id,
+                place_title=titles.get(e.place_id or -1, ""),
+                action=e.action.value if e.action else "",
+                summary=e.summary or "",
+                rolled_back=bool(payload.get("rolled_back")),
+                can_rollback=is_rollbackable(e),
+                created_at=e.created_at,
+            )
+        )
+    return out
+
+
+@router.post("/agent/actions/{event_id}/rollback", response_model=AdminRollbackOut)
+def admin_rollback_action(
+    event_id: int,
+    body: AdminRollbackRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> AdminRollbackOut:
+    try:
+        rb = rollback_event(db, event_id=event_id, admin=admin, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return AdminRollbackOut(
+        ok=True,
+        rollback_event_id=rb.id,
+        message=rb.summary,
+    )
 
 
 def _user_out(user: User) -> UserOut:

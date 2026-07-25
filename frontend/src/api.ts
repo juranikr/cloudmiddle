@@ -1,4 +1,5 @@
 import type {
+  AdminAgentAction,
   AdminStatus,
   MarkerItem,
   MarkerPayload,
@@ -282,4 +283,22 @@ export async function deleteAdminUser(token: string, id: number): Promise<void> 
     headers: authHeaders(token),
   });
   await handle<void>(res);
+}
+
+export async function fetchAdminAgentActions(token: string): Promise<AdminAgentAction[]> {
+  const res = await request("/api/admin/agent/actions", { headers: authHeaders(token) });
+  return handle<AdminAgentAction[]>(res);
+}
+
+export async function rollbackAdminAgentAction(
+  token: string,
+  eventId: number,
+  note = "",
+): Promise<{ ok: boolean; rollback_event_id: number; message: string }> {
+  const res = await request(`/api/admin/agent/actions/${eventId}/rollback`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({ note }),
+  });
+  return handle(res);
 }
