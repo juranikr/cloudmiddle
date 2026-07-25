@@ -9,32 +9,39 @@ from sqlalchemy.orm import Session
 
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
+from app.knowledge import knowledge_brief
 from app.messages import list_open_appeals
 from app.models import PlaceEvent
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
-목표: 미읽음 이력·이의신청·롤백을 바탕으로 지도를 더 완성도 있게 만든다.
+목표: 미읽음 이력·이의신청·롤백·웹조사를 바탕으로 지도를 더 유용하게 만들고,
+교훈을 agent_knowledge에 주제별로 병합·갱신해 사용할수록 똑똑해진다.
 
 원칙:
-- 설명·제목 등 사용자 기록은 최대한 보존. 마음대로 덮어쓰지 말고 append_note·local_name으로 보완.
-- 안내 문장·agent_context·이의 답변은 한국어. 다만 장소 명칭·주소·공식명은 중국어 등 현지 표기를 살리고 제목에 병기.
-- 좌표는 WGS84.
-- list_recent_rollbacks로 관리자 롤백을 확인한다. 롤백된 조치와 같은 방향(같은 병합/같은 추천 추가/같은 필드 덮어쓰기)을 반복하지 말고 다른 접근을 취한다.
+- 설명·제목 등 사용자 기록은 최대한 보존. append_note·local_name으로 보완.
+- 안내·agent_context·이의 답변·지식베이스는 한국어. 장소 명칭·주소는 현지 표기 병기.
+- 좌표는 WGS84. 새 장소는 반드시 geocode_place 또는 신뢰할 좌표로 등록.
+- list_recent_rollbacks·list_knowledge를 먼저 보고 같은 실수를 반복하지 말 것.
+- 이의/롤백/새 데이터에서 얻은 교훈은 upsert_knowledge로 기존 주제와 유기적으로 병합.
+- 웹 검색(web_search)으로 지난 핵심 명소·맛집·교통을 조사하고, 지도에 없는 유용한 장소는
+  매 사이클 1~5개 create_place로 추천 추가(중복·남발 금지, 기존 list_places와 대조).
 
 우선순위:
-1) list_recent_rollbacks → 교훈 파악
-2) list_open_appeals로 이의신청 검토, 필요 시 보완 후 resolve_appeal
-3) 같은 장소로 보이는 핀 병합 (가까운 거리 + 이름 유사). 병합 시 양쪽 설명/별칭 보존
-4) agent_context에 한국어 유용 요약 보완(기존 내용 위에 덧붙이기)
-5) 필요하면 web_search로 정보 보완 (불확실하면 단정 금지)
-6) 꼭 필요해 보이는 핵심 장소만 소수 추가 (남발 금지)
-7) 이미지 순서가 이상하면 reorder_images
-끝나면 mark_events_read / mark_appeals_read 호출 (롤백 이벤트 ID도 mark_events_read에 포함).
+1) list_knowledge, list_recent_rollbacks
+2) list_open_appeals → 조치 후 교훈 upsert_knowledge
+3) list_unread_events → 병합/보완
+4) web_search로 지난 여행 정보 조사 → geocode_place → create_place(소수)
+5) agent_context·지식 주제 갱신
+6) mark_events_read / mark_appeals_read (사용자/시스템 미읽음만)
 """
 
 
 def count_unread(db: Session) -> int:
-    events = db.query(PlaceEvent).filter(PlaceEvent.groq_read_at.is_(None)).count()
+    events = (
+        db.query(PlaceEvent)
+        .filter(PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent")
+        .count()
+    )
     appeals = len(list_open_appeals(db, limit=100))
     return events + appeals
 
@@ -50,33 +57,42 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         }
 
     unread_before = count_unread(db)
-    if unread_before == 0:
-        return {
-            "ok": True,
-            "steps": 0,
-            "message": "미읽음 이력·이의 없음",
-            "unread_before": 0,
-            "unread_after": 0,
-        }
+    research_only = unread_before == 0
+    kb = knowledge_brief(db, limit=12)
+    kb_hint = json.dumps(kb, ensure_ascii=False)[:4000] if kb else "[]"
 
     from groq import Groq
 
     client = Groq(api_key=settings.groq_api_key)
     model = settings.groq_model or "openai/gpt-oss-120b"
     steps_limit = max_steps or settings.agent_max_steps
+    if research_only:
+        steps_limit = max(steps_limit, 10)
+
+    if research_only:
+        user_msg = (
+            "현재 미읽음 작업은 없습니다. 연구 사이클을 수행하세요.\n"
+            f"기존 지식베이스 요약: {kb_hint}\n"
+            "1) list_knowledge / list_places로 현황 파악\n"
+            "2) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
+            "3) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
+            "4) 새 교훈은 upsert_knowledge로 병합\n"
+            "끝나면 한 줄 요약."
+        )
+    else:
+        user_msg = (
+            f"미읽음 작업 {unread_before}건이 있습니다.\n"
+            f"기존 지식베이스 요약: {kb_hint}\n"
+            "list_knowledge·list_recent_rollbacks를 먼저 보고, "
+            "list_open_appeals·list_unread_events를 처리하세요. "
+            "교훈은 upsert_knowledge로 병합. "
+            "가능하면 web_search 후 부족한 장소를 create_place로 소수 추가. "
+            "끝나면 mark_events_read·mark_appeals_read 후 요약."
+        )
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                f"미읽음 작업 {unread_before}건이 있습니다. "
-                "먼저 list_recent_rollbacks로 관리자 롤백 교훈을 확인하세요. "
-                "이어서 list_open_appeals, list_unread_events로 정리하세요. "
-                "롤백된 방향은 반복하지 말 것. 기존 문구는 보존·보완 위주. "
-                "끝나면 mark_events_read·mark_appeals_read 후 한 줄 요약."
-            ),
-        },
+        {"role": "user", "content": user_msg},
     ]
 
     steps = 0
@@ -105,7 +121,10 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                         {
                             "id": tc.id,
                             "type": "function",
-                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
                         }
                         for tc in tool_calls
                     ],

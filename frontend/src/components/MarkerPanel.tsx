@@ -203,6 +203,19 @@ export default function MarkerPanel({
           ? "구역 정보"
           : "마커 정보";
 
+  async function toggleFavorite() {
+    if (!token || !marker || mode === "create") return;
+    try {
+      const r = marker.is_favorite
+        ? await api.removeFavorite(token, marker.id)
+        : await api.addFavorite(token, marker.id);
+      onMarkerRefresh?.({ ...marker, is_favorite: r.is_favorite });
+    } catch {
+      /* ignore */
+    }
+  }
+
+
   return (
     <aside className="panel" role="dialog" aria-label={heading}>
       <div className="panel__handle" aria-hidden />
@@ -235,7 +248,20 @@ export default function MarkerPanel({
             {marker.shape === "polygon" ? " · 구역" : ""}
             {marker.is_agent_suggested ? " · 추천" : ""}
           </span>
-          <h3 className="panel__title">{marker.title}</h3>
+          <div className="panel__title-row">
+            <h3 className="panel__title">{marker.title}</h3>
+            {mode !== "create" ? (
+              <button
+                type="button"
+                className={`btn btn--ghost panel__fav ${marker.is_favorite ? "is-on" : ""}`}
+                onClick={() => void toggleFavorite()}
+                aria-label={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
+                title={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
+              >
+                {marker.is_favorite ? "★" : "☆"}
+              </button>
+            ) : null}
+          </div>
           <p className="panel__meta">
             {(marker.contributor_names?.length
               ? marker.contributor_names.join(" · ")

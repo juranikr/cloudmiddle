@@ -74,6 +74,7 @@ class User(Base):
     contributions: Mapped[list["PlaceContributor"]] = relationship(back_populates="user")
     messages: Mapped[list["UserMessage"]] = relationship(back_populates="user")
     appeals: Mapped[list["PlaceAppeal"]] = relationship(back_populates="user")
+    favorites: Mapped[list["PlaceFavorite"]] = relationship(back_populates="user")
 
 
 class Marker(Base):
@@ -249,3 +250,34 @@ class PlaceAppeal(Base):
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="appeals")
+
+class AgentKnowledge(Base):
+    """에이전트 장기 교훈/지식. 이의·롤백·웹조사 결과를 주제별로 병합 저장."""
+
+    __tablename__ = "agent_knowledge"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    topic: Mapped[str] = mapped_column(String(120), unique=True, index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PlaceFavorite(Base):
+    __tablename__ = "place_favorites"
+    __table_args__ = (UniqueConstraint("user_id", "place_id", name="uq_user_favorite_place"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    place_id: Mapped[int] = mapped_column(ForeignKey("markers.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user: Mapped[User] = relationship(back_populates="favorites")
+    place: Mapped[Marker] = relationship()
+

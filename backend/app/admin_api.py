@@ -14,9 +14,10 @@ from app.agent.runner import count_unread, run_agent
 from app.auth import get_admin_user, hash_password
 from app.config import settings
 from app.db import get_db
-from app.models import Marker, PlaceAppeal, PlaceAppealStatus, PlaceEvent, User
+from app.models import AgentKnowledge, Marker, PlaceAppeal, PlaceAppealStatus, PlaceEvent, User
+from app.knowledge import list_knowledge
 from app.rollback import is_rollbackable, list_agent_actions, rollback_event
-from app.schemas import AgentRunResponse, UserOut
+from app.schemas import AgentKnowledgeOut, AgentRunResponse, UserOut
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -31,6 +32,8 @@ class AdminStatusOut(BaseModel):
     appeals_open: int
     users_total: int
     unread_work_items: int
+    knowledge_topics: int = 0
+    agent_suggested_places: int = 0
 
 
 class AdminUserCreate(BaseModel):
@@ -66,6 +69,10 @@ def admin_status(
         appeals_open=appeals_open,
         users_total=db.query(User).count(),
         unread_work_items=count_unread(db),
+        knowledge_topics=db.query(AgentKnowledge).count(),
+        agent_suggested_places=db.query(Marker).filter(
+            Marker.is_agent_suggested.is_(True), Marker.merged_into_id.is_(None)
+        ).count(),
     )
 
 
@@ -76,6 +83,28 @@ def admin_run_agent(
 ) -> AgentRunResponse:
     _ = admin
     return AgentRunResponse(**run_agent(db))
+
+
+@router.get("/knowledge", response_model=list[AgentKnowledgeOut])
+def admin_knowledge(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+    limit: int = 50,
+) -> list[AgentKnowledgeOut]:
+    _ = admin
+    rows = list_knowledge(db, limit=limit)
+    return [
+        AgentKnowledgeOut(
+            id=r.id,
+            topic=r.topic,
+            title=r.title,
+            content=r.content or "",
+            place_id=r.place_id,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+        )
+        for r in rows
+    ]
 
 
 class AdminAgentActionOut(BaseModel):

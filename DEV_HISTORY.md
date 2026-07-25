@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — Groq 모델 교체(gpt-oss-120b) + 에이전트 오류 메시지
+최종 갱신: 2026-07-26 (KST) — 에이전트 지식베이스·자동읽음·웹추천·즐겨찾기
 
 ---
 
@@ -174,6 +174,12 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 지식베이스·즐겨찾기·웹 추천
+- 에이전트 actor 이벤트는 groq_read_at 즉시 기록(미읽음에서 제외)
+- gent_knowledge + tools list_knowledge/upsert_knowledge/geocode_place
+- 미읽음 0이어도 연구 사이클로 web_search→create_place
+- 사용자 즐겨찾기 API/UI, 관리자 지식베이스 패널
 
 ### 2026-07-26 — Groq 모델 차단 대응
 - 원인: llama-3.3-70b-versatile 가 Groq 프로젝트 limits에서 차단(403)

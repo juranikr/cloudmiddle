@@ -10,6 +10,8 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session, joinedload
 
 from app.events import ensure_contributor, log_place_event, mark_events_read
+from app.geocode import search_address
+from app.knowledge import list_knowledge, upsert_knowledge
 from app.messages import (
     list_open_appeals,
     mark_appeals_read,
@@ -148,7 +150,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_place",
-            "description": "꼭 필요해 보이는 장소를 에이전트가 추가한다. 제목에 현지 명칭을 함께 넣는다.",
+            "description": "웹 조사·지오코딩 후 지도에 없는 유용한 지난 장소를 추천 추가한다. 매 사이클 소수를 적극 등록. 제목에 현지 명칭 병기.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -239,6 +241,55 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "list_knowledge",
+            "description": "에이전트 장기 지식/교훈 목록. 작업 전에 반드시 확인한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "default": 30}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "upsert_knowledge",
+            "description": (
+                "교훈·조사 결과를 주제(topic)별로 저장/병합한다. "
+                "기존 내용과 모순되면 정리해 하나의 완성된 content로 넘긴다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "영문/숫자 slug, 예: appeal_lessons, jinan_food"},
+                    "title": {"type": "string"},
+                    "content": {"type": "string", "description": "한국어로 정리된 지식 본문"},
+                    "place_id": {"type": "integer"},
+                    "merge": {"type": "boolean", "default": True},
+                },
+                "required": ["topic", "title", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "geocode_place",
+            "description": "지난(济南) 중심 주소/장소명 지오코딩. create_place 전에 사용.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+
     {
         "type": "function",
         "function": {
@@ -283,7 +334,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         limit = int(args.get("limit") or 30)
         rows = (
             db.query(PlaceEvent)
-            .filter(PlaceEvent.groq_read_at.is_(None))
+            .filter(PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent")
             .order_by(PlaceEvent.created_at.asc())
             .limit(max(1, min(limit, 100)))
             .all()
@@ -657,6 +708,44 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             }
             for e in rows
         ]
+
+
+    if name == "list_knowledge":
+        limit = int(args.get("limit") or 30)
+        rows = list_knowledge(db, limit=limit)
+        return [
+            {
+                "id": r.id,
+                "topic": r.topic,
+                "title": r.title,
+                "content": r.content,
+                "place_id": r.place_id,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ]
+
+    if name == "upsert_knowledge":
+        row = upsert_knowledge(
+            db,
+            topic=str(args.get("topic") or "general"),
+            title=str(args.get("title") or "교훈"),
+            content=str(args.get("content") or ""),
+            place_id=int(args["place_id"]) if args.get("place_id") is not None else None,
+            merge=bool(args.get("merge", True)),
+        )
+        db.commit()
+        return {"ok": True, "topic": row.topic, "id": row.id, "chars": len(row.content or "")}
+
+    if name == "geocode_place":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return {"results": []}
+        try:
+            hits = search_address(query, limit=int(args.get("limit") or 5))
+        except Exception as exc:
+            return {"results": [], "error": str(exc)}
+        return {"results": hits}
 
     if name == "web_search":
         query = str(args.get("query") or "").strip()

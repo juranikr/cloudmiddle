@@ -73,6 +73,19 @@ def ensure_schema() -> None:
             )
 
 
+
+        # 에이전트가 남긴 이력은 미읽음에서 제외
+        if "place_events" in tables_now:
+            conn.execute(
+                text(
+                    """
+                    UPDATE place_events
+                    SET groq_read_at = COALESCE(groq_read_at, created_at, CURRENT_TIMESTAMP)
+                    WHERE actor = 'agent' AND groq_read_at IS NULL
+                    """
+                )
+            )
+
 def clear_all_markers() -> int:
     with engine.begin() as conn:
         names = set(inspect(engine).get_table_names())

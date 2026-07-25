@@ -1250,3 +1250,45 @@ textarea {
     display: none;
   }
 }
+
+
+.panel__title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panel__fav {
+  font-size: 1.25rem;
+  line-height: 1;
+  padding: 4px 8px;
+  color: var(--muted);
+}
+
+.panel__fav.is-on {
+  color: #c9a227;
+}
+
+.admin__knowledge {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.admin__knowledge li {
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(20, 33, 43, 0.04);
+}
+
+.admin__knowledge pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  font-size: 0.82rem;
+  font-family: inherit;
+}

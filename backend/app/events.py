@@ -29,6 +29,8 @@ def log_place_event(
     payload: Optional[dict[str, Any]] = None,
     actor: str = "user",
 ) -> PlaceEvent:
+    now = datetime.now(timezone.utc)
+    # Agent-authored events are already "known" to the agent — mark read immediately.
     event = PlaceEvent(
         place_id=place_id,
         user_id=user.id if user else None,
@@ -36,6 +38,7 @@ def log_place_event(
         action=action,
         summary=summary[:500],
         payload=json.dumps(payload or {}, ensure_ascii=False),
+        groq_read_at=now if actor == "agent" else None,
     )
     db.add(event)
     return event

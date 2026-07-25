@@ -105,6 +105,8 @@ export default function MapPage() {
   const { token, user, logout } = useAuth();
   const [markers, setMarkers] = useState<MarkerItem[]>([]);
   const [categoryFilter, setCategoryFilter] = useState<MarkerCategory | null>(null);
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  const [agentSuggestedOnly, setAgentSuggestedOnly] = useState(false);
   const [toolMode, setToolMode] = useState<ToolMode>("pin");
   const [panelMode, setPanelMode] = useState<PanelMode>(null);
   const [draftKind, setDraftKind] = useState<DraftKind>(null);
@@ -140,6 +142,8 @@ export default function MapPage() {
     try {
       const data = await api.fetchMarkers(token, {
         category: categoryFilter,
+        favoritesOnly,
+        agentSuggestedOnly,
       });
       setMarkers(data);
     } catch (err) {
@@ -147,7 +151,7 @@ export default function MapPage() {
     } finally {
       setLoading(false);
     }
-  }, [token, categoryFilter]);
+  }, [token, categoryFilter, favoritesOnly, agentSuggestedOnly]);
 
   useEffect(() => {
     void loadMarkers();
@@ -417,12 +421,36 @@ export default function MapPage() {
         <div className="chips" role="list">
           <button
             type="button"
-            className={`chip ${categoryFilter === null ? "is-active" : ""}`}
-            onClick={() => setCategoryFilter(null)}
+            className={`chip ${categoryFilter === null && !favoritesOnly && !agentSuggestedOnly ? "is-active" : ""}`}
+            onClick={() => {
+              setCategoryFilter(null);
+              setFavoritesOnly(false);
+              setAgentSuggestedOnly(false);
+            }}
           >
             모든 유형
           </button>
-          {CATEGORY_LIST.map((c) => (
+                    <button
+            type="button"
+            className={`chip ${favoritesOnly ? "is-active" : ""}`}
+            onClick={() => {
+              setFavoritesOnly((v) => !v);
+              setAgentSuggestedOnly(false);
+            }}
+          >
+            즐겨찾기
+          </button>
+          <button
+            type="button"
+            className={`chip ${agentSuggestedOnly ? "is-active" : ""}`}
+            onClick={() => {
+              setAgentSuggestedOnly((v) => !v);
+              setFavoritesOnly(false);
+            }}
+          >
+            에이전트 추천
+          </button>
+{CATEGORY_LIST.map((c) => (
             <button
               key={c}
               type="button"

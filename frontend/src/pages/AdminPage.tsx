@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import * as api from "../api";
 import { useAuth } from "../auth";
-import type { AdminAgentAction, AdminStatus, User } from "../types";
+import type { AdminAgentAction, AdminKnowledge, AdminStatus, User } from "../types";
 
 const ACTION_LABEL: Record<string, string> = {
   merge: "병합",
@@ -16,6 +16,7 @@ export default function AdminPage() {
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [actions, setActions] = useState<AdminAgentAction[]>([]);
+  const [knowledge, setKnowledge] = useState<AdminKnowledge[]>([]);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
   const [busy, setBusy] = useState(false);
@@ -27,14 +28,16 @@ export default function AdminPage() {
     if (!token) return;
     setError("");
     try {
-      const [s, u, a] = await Promise.all([
+      const [s, u, a, k] = await Promise.all([
         api.fetchAdminStatus(token),
         api.fetchAdminUsers(token),
         api.fetchAdminAgentActions(token),
+        api.fetchAdminKnowledge(token),
       ]);
       setStatus(s);
       setUsers(u);
       setActions(a);
+      setKnowledge(k);
     } catch (e) {
       setError(e instanceof Error ? e.message : "관리자 정보를 불러오지 못했습니다");
     }
@@ -180,6 +183,8 @@ export default function AdminPage() {
             </li>
             <li>열린 이의: {status.appeals_open}</li>
             <li>작업 대기(이력+이의): {status.unread_work_items}</li>
+            <li>지식 주제: {status.knowledge_topics ?? 0}</li>
+            <li>에이전트 추천 장소: {status.agent_suggested_places ?? 0}</li>
           </ul>
         ) : (
           <p className="panel__meta">불러오는 중…</p>
@@ -240,6 +245,32 @@ export default function AdminPage() {
                     <span className="panel__meta">{a.rolled_back ? "완료" : "불가"}</span>
                   )}
                 </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      
+      <section className="admin__card">
+        <h2>에이전트 지식베이스</h2>
+        <p className="panel__meta">
+          이의·롤백·웹조사에서 얻은 교훈을 주제별로 병합해 다음 실행에 사용합니다.
+        </p>
+        {knowledge.length === 0 ? (
+          <p className="panel__meta">아직 저장된 지식이 없습니다. 에이전트를 실행하면 쌓입니다.</p>
+        ) : (
+          <ul className="admin__knowledge">
+            {knowledge.map((k) => (
+              <li key={k.id}>
+                <strong>
+                  {k.title} <span className="panel__meta">({k.topic})</span>
+                </strong>
+                <span className="panel__meta">
+                  {new Date(k.updated_at).toLocaleString("ko-KR")}
+                  {k.place_id ? ` · 장소 #${k.place_id}` : ""}
+                </span>
+                <pre>{k.content}</pre>
               </li>
             ))}
           </ul>

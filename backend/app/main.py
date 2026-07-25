@@ -18,6 +18,7 @@ from app.geocode import search_address
 from app.messages import create_appeal
 from app.migrate import ensure_schema
 from app.models import (
+    PlaceFavorite,
     Marker,
     MarkerCategory,
     MarkerShape,
@@ -31,6 +32,8 @@ from app.models import (
     UserMessageKind,
 )
 from app.schemas import (
+    AgentKnowledgeOut,
+    FavoriteToggleOut,
     AgentRunResponse,
     AppealCreate,
     AppealOut,
@@ -92,7 +95,7 @@ def _centroid(points: list[LatLng]) -> tuple[float, float]:
     return lat, lng
 
 
-def marker_to_out(marker: Marker) -> MarkerOut:
+def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
     names: list[str] = []
     for c in marker.contributors or []:
         if c.user and c.user.display_name and c.user.display_name not in names:
@@ -124,6 +127,7 @@ def marker_to_out(marker: Marker) -> MarkerOut:
         polygon=_parse_polygon(marker.polygon),
         images=images,
         is_agent_suggested=bool(marker.is_agent_suggested),
+        is_favorite=is_favorite,
         created_at=marker.created_at,
         updated_at=marker.updated_at,
     )
@@ -207,10 +211,15 @@ def me(current_user: User = Depends(get_current_user)) -> UserOut:
 @app.get("/api/markers", response_model=list[MarkerOut])
 def list_markers(
     category: Optional[MarkerCategory] = Query(None),
+    favorites_only: bool = Query(False),
+    agent_suggested_only: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[MarkerOut]:
-    _ = current_user
+    fav_ids = {
+        r.place_id
+        for r in db.query(PlaceFavorite.place_id).filter(PlaceFavorite.user_id == current_user.id).all()
+    }
     q = (
         db.query(Marker)
         .options(
@@ -222,8 +231,14 @@ def list_markers(
     )
     if category is not None:
         q = q.filter(Marker.category == category)
+    if favorites_only:
+        if not fav_ids:
+            return []
+        q = q.filter(Marker.id.in_(fav_ids))
+    if agent_suggested_only:
+        q = q.filter(Marker.is_agent_suggested.is_(True))
     markers = q.order_by(Marker.created_at.desc()).all()
-    return [marker_to_out(m) for m in markers]
+    return [marker_to_out(m, is_favorite=m.id in fav_ids) for m in markers]
 
 
 @app.post("/api/markers", response_model=MarkerOut, status_code=status.HTTP_201_CREATED)
@@ -275,7 +290,8 @@ def get_marker(
     marker = _load_place(db, marker_id)
     if marker is None:
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
-    return marker_to_out(marker)
+    fav = db.query(PlaceFavorite).filter(PlaceFavorite.user_id == current_user.id, PlaceFavorite.place_id == marker.id).first()
+    return marker_to_out(marker, is_favorite=fav is not None)
 
 
 @app.get("/api/markers/{marker_id}/events", response_model=list[PlaceEventOut])
@@ -491,6 +507,72 @@ def _message_to_out(msg: UserMessage) -> UserMessageOut:
         can_appeal=can_appeal,
     )
 
+
+
+
+@app.get("/api/favorites", response_model=list[MarkerOut])
+def list_favorites(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[MarkerOut]:
+    fav_ids = [
+        r.place_id
+        for r in db.query(PlaceFavorite)
+        .filter(PlaceFavorite.user_id == current_user.id)
+        .order_by(PlaceFavorite.created_at.desc())
+        .all()
+    ]
+    if not fav_ids:
+        return []
+    markers = (
+        db.query(Marker)
+        .options(
+            joinedload(Marker.creator),
+            joinedload(Marker.contributors).joinedload(PlaceContributor.user),
+            joinedload(Marker.images),
+        )
+        .filter(Marker.id.in_(fav_ids), Marker.merged_into_id.is_(None))
+        .all()
+    )
+    by_id = {m.id: m for m in markers}
+    return [marker_to_out(by_id[i], is_favorite=True) for i in fav_ids if i in by_id]
+
+
+@app.post("/api/favorites/{place_id}", response_model=FavoriteToggleOut)
+def add_favorite(
+    place_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FavoriteToggleOut:
+    place = db.query(Marker).filter(Marker.id == place_id, Marker.merged_into_id.is_(None)).first()
+    if not place:
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    exists = (
+        db.query(PlaceFavorite)
+        .filter(PlaceFavorite.user_id == current_user.id, PlaceFavorite.place_id == place_id)
+        .first()
+    )
+    if exists is None:
+        db.add(PlaceFavorite(user_id=current_user.id, place_id=place_id))
+        db.commit()
+    return FavoriteToggleOut(place_id=place_id, is_favorite=True)
+
+
+@app.delete("/api/favorites/{place_id}", response_model=FavoriteToggleOut)
+def remove_favorite(
+    place_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> FavoriteToggleOut:
+    row = (
+        db.query(PlaceFavorite)
+        .filter(PlaceFavorite.user_id == current_user.id, PlaceFavorite.place_id == place_id)
+        .first()
+    )
+    if row:
+        db.delete(row)
+        db.commit()
+    return FavoriteToggleOut(place_id=place_id, is_favorite=False)
 
 @app.get("/api/messages", response_model=list[UserMessageOut])
 def list_messages(

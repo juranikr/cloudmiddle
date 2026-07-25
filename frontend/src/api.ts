@@ -1,5 +1,6 @@
 import type {
   AdminAgentAction,
+  AdminKnowledge,
   AdminStatus,
   MarkerItem,
   MarkerPayload,
@@ -73,14 +74,14 @@ export async function fetchMe(token: string): Promise<User> {
 
 export async function fetchMarkers(
   token: string,
-  opts: { category?: string | null },
+  opts?: { category?: string | null; favoritesOnly?: boolean; agentSuggestedOnly?: boolean },
 ): Promise<MarkerItem[]> {
-  const params = new URLSearchParams();
-  if (opts.category) params.set("category", opts.category);
-  const qs = params.toString();
-  const res = await request(`/api/markers${qs ? `?${qs}` : ""}`, {
-    headers: authHeaders(token),
-  });
+  const q = new URLSearchParams();
+  if (opts?.category) q.set("category", opts.category);
+  if (opts?.favoritesOnly) q.set("favorites_only", "true");
+  if (opts?.agentSuggestedOnly) q.set("agent_suggested_only", "true");
+  const qs = q.toString();
+  const res = await request(`/api/markers${qs ? `?${qs}` : ""}`, { headers: authHeaders(token) });
   return handle<MarkerItem[]>(res);
 }
 
@@ -300,5 +301,21 @@ export async function rollbackAdminAgentAction(
     headers: authHeaders(token),
     body: JSON.stringify({ note }),
   });
+  return handle(res);
+}
+
+
+export async function fetchAdminKnowledge(token: string): Promise<AdminKnowledge[]> {
+  const res = await request("/api/admin/knowledge", { headers: authHeaders(token) });
+  return handle<AdminKnowledge[]>(res);
+}
+
+export async function addFavorite(token: string, placeId: number): Promise<{ place_id: number; is_favorite: boolean }> {
+  const res = await request(`/api/favorites/${placeId}`, { method: "POST", headers: authHeaders(token) });
+  return handle(res);
+}
+
+export async function removeFavorite(token: string, placeId: number): Promise<{ place_id: number; is_favorite: boolean }> {
+  const res = await request(`/api/favorites/${placeId}`, { method: "DELETE", headers: authHeaders(token) });
   return handle(res);
 }

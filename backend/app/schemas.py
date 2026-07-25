@@ -105,6 +105,7 @@ class MarkerOut(BaseModel):
     polygon: Optional[list[LatLng]] = None
     images: list[PlaceImageOut] = []
     is_agent_suggested: bool = False
+    is_favorite: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -170,3 +171,18 @@ class PlaceEventOut(BaseModel):
     summary: str
     groq_read: bool = False
     created_at: datetime
+
+
+class AgentKnowledgeOut(BaseModel):
+    id: int
+    topic: str
+    title: str
+    content: str
+    place_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class FavoriteToggleOut(BaseModel):
+    place_id: int
+    is_favorite: bool

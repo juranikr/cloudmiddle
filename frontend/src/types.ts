@@ -33,6 +33,8 @@ export interface AdminStatus {
   appeals_open: number;
   users_total: number;
   unread_work_items: number;
+  knowledge_topics?: number;
+  agent_suggested_places?: number;
 }
 
 export interface PlaceEventItem {
@@ -81,6 +83,7 @@ export interface MarkerItem {
   polygon: LatLng[] | null;
   images: PlaceImage[];
   is_agent_suggested: boolean;
+  is_favorite?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -104,4 +107,15 @@ export interface UserMessage {
   read_at: string | null;
   created_at: string;
   can_appeal: boolean;
+}
+
+
+export interface AdminKnowledge {
+  id: number;
+  topic: string;
+  title: string;
+  content: string;
+  place_id: number | null;
+  created_at: string;
+  updated_at: string;
 }
