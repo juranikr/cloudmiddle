@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-25 (KST) — 따종=등록화면 / 고덕=메인 초안 버튼 분리
+최종 갱신: 2026-07-25 (KST) — 운영 계정 교체(앨리스/밥→실사용, 캐롤→테스트)
 
 ---
 
@@ -31,10 +31,23 @@
 | RDS | `tourmiddle-dev-postgres…` (Postgres 16, `db.t4g.micro`) |
 | GitHub OIDC role | `arn:aws:iam::155557574983:role/tourmiddle-dev-github-actions` |
 | TF state | S3 `tourmiddle-tfstate-155557574983` + DynamoDB `tourmiddle-tf-lock` |
+| App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`) |
 
 **트래픽 경로:** 브라우저 → CloudFront(HTTPS) → ALB(HTTP, CloudFront prefix만 허용) → ECS Fargate → RDS
 
 **대략 월 비용 (24/7):** 약 $45–60 (ALB+RDS+Fargate 중심, NAT 없음). CloudFront는 소량 트래픽이면 소액 추가.
+
+### 운영 접속·계정
+
+| 용도 | 값 |
+|------|-----|
+| 앱 URL | https://d232kzujcg4ufp.cloudfront.net |
+| 성주한 | `joohan92@naver.com` (비밀번호: Secrets `SEED_PASSWORD_JOOHAN`, Git에 평문 없음) |
+| 국서정 | `tjwjd629@naver.com` (비밀번호: Secrets `SEED_PASSWORD_GUKSEO`) |
+| 테스트 | `test@test.com` / `test1234` |
+| 로그인 UI | 테스트 계정 안내 문구 없음 (직접 입력) |
+
+> 레포가 **public**이라 실사용 비밀번호는 README/DEV_HISTORY/seed 코드에 넣지 않음. ECS 기동 시 `seed.py`가 Secrets 환경변수로 해시 갱신.
 
 ---
 
@@ -52,7 +65,7 @@
   - **메인**: `고덕 공유하기로 초안만들기` → surl에서 명칭·주소·좌표(GCJ→WGS84) → 등록 폼
   - **등록 화면(핀 찍은 뒤)**: `따종 공유하기로 초안만들기` → 이름/설명/링크만 채움(위치는 이미 찍은 좌표 유지)
   - 고덕 Key 없음(중국 번호) → 따종 주소 자동 지오코딩 불가, Nominatim도 중국 주소 실패
-- 인증: JWT. 시드 계정 `alice@test.com` / `bob@test.com` / `carol@test.com` / 비밀번호 `test1234`
+- 인증: JWT. 운영 계정은 §2 표 참고. 테스트만 `test@test.com` / `test1234`
 
 ---
 
@@ -141,6 +154,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-25 — 운영 계정 교체
+- alice→성주한(`joohan92@naver.com`), bob→국서정(`tjwjd629@naver.com`), carol→테스트(`test@test.com`)
+- 비밀번호는 Secrets Manager + ECS env. 로그인 페이지 테스트 안내 삭제
+- 기존 user_id 유지(별칭 이메일로 찾아 갱신) → 마커 소유권 유지
 
 ### 2026-07-25 — 공유 초안 UI 분리
 - 메인: 고덕 초안 버튼 / 등록 패널: 따종 초안 버튼

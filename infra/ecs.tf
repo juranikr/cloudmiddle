@@ -110,6 +110,18 @@ resource "aws_ecs_task_definition" "api" {
         {
           name      = "JWT_SECRET"
           valueFrom = "${aws_secretsmanager_secret.app.arn}:JWT_SECRET::"
+        },
+        {
+          name      = "SEED_PASSWORD_JOOHAN"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:SEED_PASSWORD_JOOHAN::"
+        },
+        {
+          name      = "SEED_PASSWORD_GUKSEO"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:SEED_PASSWORD_GUKSEO::"
+        },
+        {
+          name      = "SEED_PASSWORD_TEST"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:SEED_PASSWORD_TEST::"
         }
       ]
       logConfiguration = {

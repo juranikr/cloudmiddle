@@ -3,8 +3,8 @@ import { useAuth } from "../auth";
 
 export default function LoginPage() {
   const { login } = useAuth();
-  const [email, setEmail] = useState("alice@test.com");
-  const [password, setPassword] = useState("test1234");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -58,15 +58,6 @@ export default function LoginPage() {
             {busy ? "로그인 중…" : "로그인"}
           </button>
         </form>
-
-        <div className="login__accounts">
-          <p>테스트 계정 (비밀번호 모두 <code>test1234</code>)</p>
-          <ul>
-            <li>alice@test.com · 앨리스</li>
-            <li>bob@test.com · 밥</li>
-            <li>carol@test.com · 캐롤</li>
-          </ul>
-        </div>
       </div>
     </div>
   );

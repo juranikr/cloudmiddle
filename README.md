@@ -60,15 +60,10 @@ npm run dev
   - PC에서 `http://localhost:5173` (localhost는 예외로 허용)
   - 또는 HTTPS: PowerShell에서 `$env:VITE_DEV_HTTPS=1; npm run dev` 후 `https://IP:5173`
 
-## 테스트 계정
+## 계정
 
-비밀번호 모두 `test1234`
-
-| 이메일 | 이름 |
-|--------|------|
-| alice@test.com | 앨리스 |
-| bob@test.com | 밥 |
-| carol@test.com | 캐롤 |
+운영 계정은 공개 README에 적지 않습니다. 접속 URL·인프라는 [`DEV_HISTORY.md`](DEV_HISTORY.md) §2를 보세요.  
+로컬/점검용 테스트 계정만: `test@test.com` / `test1234`
 
 ## Docker / PostgreSQL (선택)
 
