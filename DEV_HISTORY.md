@@ -28,7 +28,7 @@
 | ALB (origin 전용) | `tourmiddle-dev-alb-295541249.ap-northeast-2.elb.amazonaws.com` |
 | ECR | `…/tourmiddle-dev-api` |
 | ECS | cluster `tourmiddle-dev-cluster` / service `tourmiddle-dev-api` |
-| RDS | `tourmiddle-dev-postgres…` (Postgres 16, `db.t4g.micro`) |
+| RDS | `tourmiddle-dev-postgres…` (Postgres 16, `db.t4g.micro`, **publicly accessible**, SG `0.0.0.0/0:5432` — 강한 비밀번호 의존) |
 | GitHub OIDC role | `arn:aws:iam::155557574983:role/tourmiddle-dev-github-actions` |
 | TF state | S3 `tourmiddle-tfstate-155557574983` + DynamoDB `tourmiddle-tf-lock` |
 | App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`, `GROQ_API_KEY`, `GROQ_MODEL`) |

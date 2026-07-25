@@ -1,6 +1,7 @@
 resource "aws_db_subnet_group" "main" {
-  name       = "${local.name_prefix}-db-subnets"
-  subnet_ids = aws_subnet.private[*].id
+  name = "${local.name_prefix}-db-subnets"
+  # public 포함(인터넷 접속) + 기존 private 유지(인스턴스가 쓰는 서브넷 제거 불가)
+  subnet_ids = concat(aws_subnet.public[*].id, aws_subnet.private[*].id)
 
   tags = {
     Name = "${local.name_prefix}-db-subnets"
@@ -23,7 +24,7 @@ resource "aws_db_instance" "main" {
 
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.rds.id]
-  publicly_accessible    = false
+  publicly_accessible    = true
   multi_az               = false
 
   backup_retention_period = var.environment == "prod" ? 7 : 1
