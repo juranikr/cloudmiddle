@@ -3,12 +3,19 @@ import { CATEGORY_LIST, CATEGORY_META } from "../categories";
 import { linkifyText } from "../linkify";
 import type { LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
 
+export interface CreateDefaults {
+  title?: string;
+  description?: string;
+  category?: MarkerCategory;
+}
+
 interface Props {
   mode: "create" | "view" | "edit";
   shape: MarkerShape;
   latlng?: LatLng | null;
   polygon?: LatLng[] | null;
   marker?: MarkerItem | null;
+  createDefaults?: CreateDefaults | null;
   canEdit: boolean;
   onClose: () => void;
   onCreate: (payload: MarkerPayload) => Promise<void>;
@@ -23,6 +30,7 @@ export default function MarkerPanel({
   latlng,
   polygon,
   marker,
+  createDefaults,
   canEdit,
   onClose,
   onCreate,
@@ -42,12 +50,12 @@ export default function MarkerPanel({
       setTitle(marker.title);
       setDescription(marker.description);
     } else if (mode === "create") {
-      setCategory("tourist");
-      setTitle("");
-      setDescription("");
+      setCategory(createDefaults?.category ?? "tourist");
+      setTitle(createDefaults?.title ?? "");
+      setDescription(createDefaults?.description ?? "");
     }
     setError("");
-  }, [marker, mode, latlng, polygon]);
+  }, [marker, mode, latlng, polygon, createDefaults]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();

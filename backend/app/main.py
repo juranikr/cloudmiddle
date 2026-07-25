@@ -21,10 +21,13 @@ from app.schemas import (
     MarkerCreate,
     MarkerOut,
     MarkerUpdate,
+    ShareImportRequest,
+    ShareImportResultOut,
     TokenResponse,
     UserOut,
 )
 from app.seed import seed_data
+from app.share_import import import_share_text
 
 app = FastAPI(title="Jinan Travel Map API", version="0.1.0")
 
@@ -94,6 +97,32 @@ def geocode(
         return [GeocodeResult(**item) for item in search_address(q)]
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/import/share", response_model=ShareImportResultOut)
+def import_share(
+    body: ShareImportRequest,
+    current_user: User = Depends(get_current_user),
+) -> ShareImportResultOut:
+    _ = current_user
+    try:
+        result = import_share_text(body.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return ShareImportResultOut(
+        source=result.source,
+        title=result.title,
+        description=result.description,
+        address=result.address,
+        source_url=result.source_url,
+        lat=result.lat,
+        lng=result.lng,
+        category_hint=result.category_hint,
+        needs_map_pick=result.needs_map_pick,
+        note=result.note,
+    )
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)

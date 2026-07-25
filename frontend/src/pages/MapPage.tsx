@@ -11,13 +11,14 @@ import { MapContainer, Marker, Polygon, TileLayer, Tooltip, useMap, useMapEvents
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import * as api from "../api";
-import type { GeocodeHit } from "../api";
+import type { GeocodeHit, ShareImportResult } from "../api";
 import { useAuth } from "../auth";
 import { CATEGORY_LIST, CATEGORY_META } from "../categories";
 import AddressSearch from "../components/AddressSearch";
 import ConfirmBar from "../components/ConfirmBar";
 import MapViewPersistence from "../components/MapViewPersistence";
-import MarkerPanel from "../components/MarkerPanel";
+import MarkerPanel, { type CreateDefaults } from "../components/MarkerPanel";
+import ShareImport from "../components/ShareImport";
 import UserLocation, { type LocateStatus } from "../components/UserLocation";
 import ZoneDrawer from "../components/ZoneDrawer";
 import {
@@ -118,6 +119,9 @@ export default function MapPage() {
   const [locateBusy, setLocateBusy] = useState(false);
   const [locateMsg, setLocateMsg] = useState("");
   const [searchPin, setSearchPin] = useState<(LatLng & { label: string }) | null>(null);
+  const [createDefaults, setCreateDefaults] = useState<CreateDefaults | null>(null);
+  const [awaitingImportPick, setAwaitingImportPick] = useState(false);
+  const pendingImportPick = useRef(false);
   const [flyTarget, setFlyTarget] = useState<LatLng | null>(null);
   const ignoreNextClick = useRef(false);
   const searchIcon = useMemo(() => getSearchResultIcon(), []);
@@ -163,13 +167,20 @@ export default function MapPage() {
     setDraftPolygon(null);
   }
 
-  function placePinDraft(lat: number, lng: number) {
-    if (panelOpen) return;
+  function placePinDraft(lat: number, lng: number, options?: { openCreate?: boolean }) {
+    const forceCreate = Boolean(options?.openCreate || pendingImportPick.current);
+    if (panelOpen && !forceCreate) return;
     setSelected(null);
     setDraftKind("point");
     setDraftLatLng({ lat, lng });
     setDraftPolygon(null);
-    setPanelMode(null);
+    if (forceCreate) {
+      pendingImportPick.current = false;
+      setAwaitingImportPick(false);
+      setPanelMode("create");
+    } else {
+      setPanelMode(null);
+    }
   }
 
   function placeZoneDraft(points: LatLng[]) {
@@ -191,6 +202,9 @@ export default function MapPage() {
   function closePanel() {
     setPanelMode(null);
     setSelected(null);
+    setCreateDefaults(null);
+    pendingImportPick.current = false;
+    setAwaitingImportPick(false);
     clearDraft();
   }
 
@@ -226,6 +240,9 @@ export default function MapPage() {
     clearDraft();
     setPanelMode(null);
     setSelected(null);
+    setCreateDefaults(null);
+    pendingImportPick.current = false;
+    setAwaitingImportPick(false);
   }
 
   function handleSearchPick(hit: GeocodeHit) {
@@ -235,6 +252,38 @@ export default function MapPage() {
     if (toolMode === "pin" && !panelOpen) {
       placePinDraft(hit.lat, hit.lng);
     }
+  }
+
+  function handleShareImported(result: ShareImportResult) {
+    const hint = result.category_hint as MarkerCategory;
+    const category = CATEGORY_LIST.includes(hint)
+      ? hint
+      : result.source === "dianping"
+        ? "restaurant"
+        : "other";
+    setCreateDefaults({
+      title: result.title,
+      description: result.description,
+      category,
+    });
+    setToolMode("pin");
+    setSelected(null);
+    setError(result.note);
+
+    if (result.lat != null && result.lng != null && !result.needs_map_pick) {
+      pendingImportPick.current = false;
+      setAwaitingImportPick(false);
+      const point = { lat: result.lat, lng: result.lng };
+      setSearchPin({ ...point, label: result.title });
+      setFlyTarget(point);
+      placePinDraft(result.lat, result.lng, { openCreate: true });
+      return;
+    }
+
+    pendingImportPick.current = true;
+    setAwaitingImportPick(true);
+    clearDraft();
+    setPanelMode(null);
   }
 
   function handleLocateStatus(status: LocateStatus, message: string) {
@@ -352,7 +401,10 @@ export default function MapPage() {
         </div>
 
         {token ? (
-          <AddressSearch token={token} onPick={handleSearchPick} />
+          <>
+            <AddressSearch token={token} onPick={handleSearchPick} />
+            <ShareImport token={token} onImported={handleShareImported} />
+          </>
         ) : null}
 
         <div className="chips" role="list">
@@ -377,9 +429,11 @@ export default function MapPage() {
           ))}
         </div>
         <p className="topbar__hint">
-          {toolMode === "pin"
-            ? "지도를 탭해 위치를 고른 뒤, 아래 ‘입력’으로 내용을 작성하세요"
-            : "구역을 탭하면 내용 수정 · 손가락으로 길게 그리면 새 구역 생성"}
+          {awaitingImportPick
+            ? "가져온 장소의 위치를 지도에서 탭하세요 (이름·설명은 자동 입력됩니다)"
+            : toolMode === "pin"
+              ? "지도를 탭해 위치를 고른 뒤, 아래 ‘입력’으로 내용을 작성하세요"
+              : "구역을 탭하면 내용 수정 · 손가락으로 길게 그리면 새 구역 생성"}
         </p>
         {locateOn && locateMsg ? <p className="topbar__status">{locateMsg}</p> : null}
         {error ? <p className="topbar__error">{error}</p> : null}
@@ -498,6 +552,7 @@ export default function MapPage() {
           latlng={draftLatLng}
           polygon={draftPolygon}
           marker={selected}
+          createDefaults={createDefaults}
           canEdit={!!selected && selected.user_id === user?.id}
           onClose={closePanel}
           onCreate={handleCreate}

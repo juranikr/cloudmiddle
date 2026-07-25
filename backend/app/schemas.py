@@ -18,6 +18,23 @@ class GeocodeResult(BaseModel):
     type: str = ""
 
 
+class ShareImportRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+
+
+class ShareImportResultOut(BaseModel):
+    source: str
+    title: str
+    description: str
+    address: str = ""
+    source_url: str = ""
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    category_hint: str = "other"
+    needs_map_pick: bool = False
+    note: str = ""
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str

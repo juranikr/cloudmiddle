@@ -114,3 +114,25 @@ export async function geocode(token: string, q: string): Promise<GeocodeHit[]> {
   });
   return handle<GeocodeHit[]>(res);
 }
+
+export interface ShareImportResult {
+  source: string;
+  title: string;
+  description: string;
+  address: string;
+  source_url: string;
+  lat: number | null;
+  lng: number | null;
+  category_hint: string;
+  needs_map_pick: boolean;
+  note: string;
+}
+
+export async function importShare(token: string, text: string): Promise<ShareImportResult> {
+  const res = await request("/api/import/share", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({ text }),
+  });
+  return handle<ShareImportResult>(res);
+}
