@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-25 (KST) — Groq 지도 정리 에이전트 + S3 이미지 + 공유 장소 모델
+최종 갱신: 2026-07-25 (KST) — 에이전트 알림·이의신청 + 보존형 편집 정책
 
 ---
 
@@ -61,7 +61,12 @@
 - UX: 핀 모드 → 드래프트 + ConfirmBar(입력/취소); 구역 모드 → 탭 선택(점-in-폴리곤), 드래그로 그리기; 핀 모드에서는 구역이 클릭을 가로채지 않음
 - 장소는 **공유 모델**: 단일 소유자 없음, `place_contributors` + 로그인 사용자 전원 수정/삭제. **「내 마커」필터 제거**
 - 이력: `place_events` (create/update/delete/merge/image_*/context_*/agent_create) + `groq_read_at`
-- **Groq ReAct+tools** (`backend/app/agent/`): 미읽음 이벤트 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/agent/run`, 매일 새벽 자동
+- **Groq ReAct+tools** (`backend/app/agent/`): 미읽음 이벤트·이의신청 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/agent/run`, 매일 새벽 자동
+  - 병합/추가 시 관련 사용자에게 **인앱 메시지** (`user_messages`)
+  - **이의신청** (`place_appeals`) → 다음 주기에 `list_open_appeals`로 재고려
+  - 편집은 덮어쓰기보다 **기존 기록 보존·보완** (append_note, local_name 병기)
+  - UI/설명은 한국어, **명칭·주소는 현지 표기 유지**
+- **메시지함** UI (상단) + 장소 상세/메시지에서 이의신청
 - **이미지**: S3 presigned PUT + CloudFront URL, 상세 상단 슬라이드 (`ImageSlideshow`)
 - 주소 검색: 백엔드 `/api/geocode` → Nominatim
 - 위치: HTTPS/localhost에서 GPS; HTTP LAN(아이폰)은 지도 중심 **가상 위치**
@@ -165,6 +170,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-25 — 에이전트 알림·이의신청·보존 정책
+- `user_messages` / `place_appeals` + API(`/api/messages*`, `/api/appeals`)
+- 병합→기여자 알림, 추천 추가→전원 알림, 이의는 다음 새벽 재검토
+- 에이전트: append 위주 편집, 한국어 안내 + 현지 명칭 병기
 
 ### 2026-07-25 — Groq 에이전트 + S3 이미지 + 공유 장소
 - 스키마: `place_events`, `place_contributors`, `place_images`, Marker에 `agent_context`/`merged_into_id`/`is_agent_suggested`

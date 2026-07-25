@@ -18,6 +18,7 @@ import AddressSearch from "../components/AddressSearch";
 import ConfirmBar from "../components/ConfirmBar";
 import MapViewPersistence from "../components/MapViewPersistence";
 import MarkerPanel, { type CreateDefaults } from "../components/MarkerPanel";
+import MessageInbox from "../components/MessageInbox";
 import ShareImport from "../components/ShareImport";
 import UserLocation, { type LocateStatus } from "../components/UserLocation";
 import ZoneDrawer from "../components/ZoneDrawer";
@@ -122,8 +123,15 @@ export default function MapPage() {
   const [awaitingImportPick, setAwaitingImportPick] = useState(false);
   const pendingImportPick = useRef(false);
   const [flyTarget, setFlyTarget] = useState<LatLng | null>(null);
+  const [inboxOpen, setInboxOpen] = useState(false);
+  const [unreadMsg, setUnreadMsg] = useState(0);
   const ignoreNextClick = useRef(false);
   const searchIcon = useMemo(() => getSearchResultIcon(), []);
+
+  useEffect(() => {
+    if (!token) return;
+    void api.fetchUnreadMessageCount(token).then(setUnreadMsg).catch(() => setUnreadMsg(0));
+  }, [token]);
 
   const loadMarkers = useCallback(async () => {
     if (!token) return;
@@ -350,6 +358,13 @@ export default function MapPage() {
           <span>{user?.display_name}</span>
         </div>
         <div className="topbar__filters">
+          <button
+            type="button"
+            className={`topbar__inbox ${unreadMsg ? "has-unread" : ""}`}
+            onClick={() => setInboxOpen(true)}
+          >
+            메시지{unreadMsg ? ` (${unreadMsg})` : ""}
+          </button>
           <button type="button" className="topbar__logout" onClick={logout}>
             로그아웃
           </button>
@@ -550,6 +565,23 @@ export default function MapPage() {
           onMarkerRefresh={(m) => {
             setSelected(m);
             setMarkers((prev) => prev.map((x) => (x.id === m.id ? m : x)));
+          }}
+        />
+      ) : null}
+
+      {token ? (
+        <MessageInbox
+          token={token}
+          open={inboxOpen}
+          onClose={() => setInboxOpen(false)}
+          onUnreadChange={setUnreadMsg}
+          onOpenPlace={(placeId) => {
+            const m = markers.find((x) => x.id === placeId);
+            if (m) {
+              setInboxOpen(false);
+              openView(m);
+              setFlyTarget({ lat: m.lat, lng: m.lng });
+            }
           }}
         />
       ) : null}

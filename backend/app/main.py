@@ -14,18 +14,24 @@ from app.config import settings
 from app.db import Base, SessionLocal, engine, get_db
 from app.events import ensure_contributor, log_place_event
 from app.geocode import search_address
+from app.messages import create_appeal
 from app.migrate import ensure_schema
 from app.models import (
     Marker,
     MarkerCategory,
     MarkerShape,
+    PlaceAppeal,
     PlaceContributor,
     PlaceEventAction,
     PlaceImage,
     User,
+    UserMessage,
+    UserMessageKind,
 )
 from app.schemas import (
     AgentRunResponse,
+    AppealCreate,
+    AppealOut,
     GeocodeResult,
     ImageReorderRequest,
     ImageUploadRequest,
@@ -39,6 +45,7 @@ from app.schemas import (
     ShareImportRequest,
     ShareImportResultOut,
     TokenResponse,
+    UserMessageOut,
     UserOut,
 )
 from app.seed import seed_data
@@ -409,6 +416,146 @@ def agent_run(
     _ = current_user
     result = run_agent(db)
     return AgentRunResponse(**result)
+
+
+def _message_to_out(msg: UserMessage) -> UserMessageOut:
+    can_appeal = msg.kind in (UserMessageKind.agent_merge, UserMessageKind.agent_create) and bool(
+        msg.place_id
+    )
+    return UserMessageOut(
+        id=msg.id,
+        place_id=msg.place_id,
+        kind=msg.kind.value if msg.kind else "system",
+        title=msg.title,
+        body=msg.body,
+        read_at=msg.read_at,
+        created_at=msg.created_at,
+        can_appeal=can_appeal,
+    )
+
+
+@app.get("/api/messages", response_model=list[UserMessageOut])
+def list_messages(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[UserMessageOut]:
+    rows = (
+        db.query(UserMessage)
+        .filter(UserMessage.user_id == current_user.id)
+        .order_by(UserMessage.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return [_message_to_out(m) for m in rows]
+
+
+@app.get("/api/messages/unread-count")
+def messages_unread_count(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    n = (
+        db.query(UserMessage)
+        .filter(UserMessage.user_id == current_user.id, UserMessage.read_at.is_(None))
+        .count()
+    )
+    return {"count": n}
+
+
+@app.post("/api/messages/{message_id}/read", response_model=UserMessageOut)
+def read_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UserMessageOut:
+    from datetime import datetime, timezone
+
+    msg = (
+        db.query(UserMessage)
+        .filter(UserMessage.id == message_id, UserMessage.user_id == current_user.id)
+        .first()
+    )
+    if msg is None:
+        raise HTTPException(status_code=404, detail="메시지를 찾을 수 없습니다")
+    if msg.read_at is None:
+        msg.read_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(msg)
+    return _message_to_out(msg)
+
+
+@app.post("/api/messages/read-all")
+def read_all_messages(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    rows = (
+        db.query(UserMessage)
+        .filter(UserMessage.user_id == current_user.id, UserMessage.read_at.is_(None))
+        .all()
+    )
+    for m in rows:
+        m.read_at = now
+    db.commit()
+    return {"marked": len(rows)}
+
+
+@app.post("/api/appeals", response_model=AppealOut, status_code=status.HTTP_201_CREATED)
+def post_appeal(
+    body: AppealCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> AppealOut:
+    try:
+        appeal = create_appeal(
+            db,
+            user=current_user,
+            place_id=body.place_id,
+            body=body.body,
+            message_id=body.message_id,
+        )
+        db.commit()
+        db.refresh(appeal)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return AppealOut(
+        id=appeal.id,
+        place_id=appeal.place_id,
+        body=appeal.body,
+        status=appeal.status.value,
+        agent_note=appeal.agent_note or "",
+        created_at=appeal.created_at,
+        resolved_at=appeal.resolved_at,
+    )
+
+
+@app.get("/api/appeals/mine", response_model=list[AppealOut])
+def my_appeals(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[AppealOut]:
+    rows = (
+        db.query(PlaceAppeal)
+        .filter(PlaceAppeal.user_id == current_user.id)
+        .order_by(PlaceAppeal.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        AppealOut(
+            id=a.id,
+            place_id=a.place_id,
+            body=a.body,
+            status=a.status.value,
+            agent_note=a.agent_note or "",
+            created_at=a.created_at,
+            resolved_at=a.resolved_at,
+        )
+        for a in rows
+    ]
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

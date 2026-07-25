@@ -10,7 +10,23 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session, joinedload
 
 from app.events import ensure_contributor, log_place_event, mark_events_read
-from app.models import Marker, MarkerCategory, MarkerShape, PlaceEvent, PlaceEventAction, PlaceImage
+from app.messages import (
+    list_open_appeals,
+    mark_appeals_read,
+    notify_all_users,
+    notify_place_contributors,
+)
+from app.models import (
+    Marker,
+    MarkerCategory,
+    MarkerShape,
+    PlaceAppeal,
+    PlaceAppealStatus,
+    PlaceEvent,
+    PlaceEventAction,
+    PlaceImage,
+    UserMessageKind,
+)
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -109,13 +125,18 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "update_place_fields",
-            "description": "장소 제목/설명/카테고리를 정리한다.",
+            "description": (
+                "기존 기록을 최대한 보존하며 보완한다. "
+                "설명은 append_note로만 추가. 제목은 local_name(현지 명칭)을 병기하거나, "
+                "정말 필요할 때만 replace_title로 교체."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "place_id": {"type": "integer"},
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
+                    "append_note": {"type": "string", "description": "설명 끝에 덧붙일 한국어 보완 정보"},
+                    "local_name": {"type": "string", "description": "현지(중국어 등) 공식 명칭·주소 병기"},
+                    "replace_title": {"type": "string", "description": "기존 제목을 꼭 바꿔야 할 때만"},
                     "category": {"type": "string"},
                 },
                 "required": ["place_id"],
@@ -126,7 +147,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_place",
-            "description": "꼭 필요해 보이는 장소를 에이전트가 추가한다.",
+            "description": "꼭 필요해 보이는 장소를 에이전트가 추가한다. 제목에 현지 명칭을 함께 넣는다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -158,6 +179,48 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["place_id", "ordered_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_open_appeals",
+            "description": "사용자가 낸 미처리 이의신청 목록. 다음 주기 재고려 대상.",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "default": 30}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resolve_appeal",
+            "description": (
+                "이의신청을 검토한 뒤 반영/기각하고 신청자에게 결과 메시지를 보낸다. "
+                "잘못된 병합이면 설명을 보완하거나 별도 장소를 create_place로 복원하는 식으로 조치."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "appeal_id": {"type": "integer"},
+                    "status": {"type": "string", "enum": ["resolved", "dismissed"]},
+                    "agent_note": {"type": "string", "description": "한국어로 조치 설명"},
+                },
+                "required": ["appeal_id", "status", "agent_note"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_appeals_read",
+            "description": "검토를 마친 이의신청 ID를 읽음 처리한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {"appeal_ids": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["appeal_ids"],
             },
         },
     },
@@ -295,20 +358,28 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         source = db.query(Marker).filter(Marker.id == source_id, Marker.merged_into_id.is_(None)).first()
         if not target or not source:
             return {"error": "not_found"}
-        # merge text
+        source_title = source.title
+        # 기존 기록 보존: 설명·제목 정보를 덧붙임
         chunks = [target.description or ""]
         if source.description and source.description not in (target.description or ""):
-            chunks.append(f"[병합:{source.title}] {source.description}")
+            chunks.append(f"[병합 보존:{source.title}] {source.description}")
+        elif source.title and source.title not in (target.title or ""):
+            chunks.append(f"[병합 보존 별칭] {source.title}")
         target.description = "\n\n".join(c for c in chunks if c).strip()[:2000]
+        if source.title and source.title not in target.title:
+            combined = f"{target.title} / {source.title}"
+            target.title = combined[:200]
         if source.agent_context:
             target.agent_context = ((target.agent_context or "") + "\n" + source.agent_context).strip()[:8000]
         for c in list(source.contributors):
             ensure_contributor(db, target.id, c.user_id)
+        if source.user_id:
+            ensure_contributor(db, target.id, source.user_id)
         for img in list(source.images):
             img.place_id = target.id
             img.sort_order = 1000 + img.sort_order
         source.merged_into_id = target.id
-        log_place_event(
+        ev = log_place_event(
             db,
             place_id=target.id,
             user=None,
@@ -316,6 +387,22 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             summary=f"병합: #{source.id} → #{target.id} ({reason})",
             payload={"source_id": source_id, "target_id": target_id, "reason": reason},
             actor="agent",
+        )
+        db.flush()
+        notify_place_contributors(
+            db,
+            place_ids=[target_id, source_id],
+            kind=UserMessageKind.agent_merge,
+            title=f"장소가 병합되었습니다: {target.title}",
+            body=(
+                f"에이전트가 「{source_title}」(#{source_id})를 "
+                f"「{target.title}」(#{target_id})로 합쳤습니다.\n"
+                f"사유: {reason}\n\n"
+                "잘못되었다고 생각되면 메시지에서 이의신청을 남겨 주세요. "
+                "다음 새벽 정리 주기에 다시 검토합니다."
+            ),
+            place_id=target_id,
+            related_event_id=ev.id,
         )
         db.commit()
         return {"ok": True, "target_id": target_id, "source_id": source_id}
@@ -326,14 +413,18 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
         if not m:
             return {"error": "not_found"}
-        m.agent_context = ctx
+        # 덮어쓰기보다 병합 선호
+        if m.agent_context and ctx and ctx not in m.agent_context:
+            m.agent_context = (m.agent_context.rstrip() + "\n\n" + ctx).strip()[:8000]
+        else:
+            m.agent_context = ctx or m.agent_context
         log_place_event(
             db,
             place_id=pid,
             user=None,
             action=PlaceEventAction.context_update,
-            summary="에이전트 컨텍스트 갱신",
-            payload={"chars": len(ctx)},
+            summary="에이전트 컨텍스트 보완",
+            payload={"chars": len(m.agent_context or "")},
             actor="agent",
         )
         db.commit()
@@ -344,25 +435,38 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
         if not m:
             return {"error": "not_found"}
-        changed = {}
-        if args.get("title"):
-            m.title = str(args["title"])[:200]
-            changed["title"] = m.title
-        if args.get("description") is not None:
-            m.description = str(args["description"])[:2000]
-            changed["description"] = True
+        changed: dict[str, Any] = {}
+        local_name = str(args.get("local_name") or "").strip()
+        if local_name and local_name not in m.title:
+            m.title = f"{m.title} ({local_name})"[:200]
+            changed["local_name"] = local_name
+        replace_title = str(args.get("replace_title") or "").strip()
+        if replace_title:
+            # 기존 제목은 설명에 보존
+            if m.title and m.title not in (m.description or ""):
+                note = f"[이전 제목 보존] {m.title}"
+                m.description = ((m.description or "") + "\n" + note).strip()[:2000]
+            m.title = replace_title[:200]
+            changed["replace_title"] = m.title
+        append_note = str(args.get("append_note") or "").strip()
+        if append_note:
+            if append_note not in (m.description or ""):
+                m.description = ((m.description or "").rstrip() + "\n\n" + append_note).strip()[:2000]
+            changed["append_note"] = True
         if args.get("category"):
             try:
                 m.category = MarkerCategory(str(args["category"]))
                 changed["category"] = m.category.value
             except ValueError:
                 pass
+        if not changed:
+            return {"ok": True, "changed": {}}
         log_place_event(
             db,
             place_id=pid,
             user=None,
             action=PlaceEventAction.update,
-            summary="에이전트 필드 정리",
+            summary="에이전트 정보 보완",
             payload=changed,
             actor="agent",
         )
@@ -389,7 +493,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         )
         db.add(m)
         db.flush()
-        log_place_event(
+        ev = log_place_event(
             db,
             place_id=m.id,
             user=None,
@@ -398,8 +502,76 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             payload={"lat": m.lat, "lng": m.lng},
             actor="agent",
         )
+        db.flush()
+        notify_all_users(
+            db,
+            kind=UserMessageKind.agent_create,
+            title=f"새 추천 장소: {title}",
+            body=(
+                f"에이전트가 장소를 추가했습니다.\n"
+                f"이름: {title}\n좌표: {m.lat:.5f}, {m.lng:.5f}\n\n"
+                "필요 없거나 잘못되었으면 해당 장소 상세 또는 이 메시지에서 이의신청을 남겨 주세요. "
+                "다음 새벽 정리 주기에 다시 검토합니다."
+            ),
+            place_id=m.id,
+            related_event_id=ev.id,
+        )
         db.commit()
         return {"ok": True, "place_id": m.id}
+
+    if name == "list_open_appeals":
+        limit = int(args.get("limit") or 30)
+        rows = list_open_appeals(db, limit=limit)
+        return [
+            {
+                "id": a.id,
+                "place_id": a.place_id,
+                "user_id": a.user_id,
+                "body": a.body,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in rows
+        ]
+
+    if name == "resolve_appeal":
+        aid = int(args["appeal_id"])
+        status_raw = str(args.get("status") or "resolved")
+        note = str(args.get("agent_note") or "").strip()[:2000]
+        try:
+            status = PlaceAppealStatus(status_raw)
+        except ValueError:
+            return {"error": "bad_status"}
+        if status not in (PlaceAppealStatus.resolved, PlaceAppealStatus.dismissed):
+            return {"error": "bad_status"}
+        appeal = db.query(PlaceAppeal).filter(PlaceAppeal.id == aid).first()
+        if not appeal:
+            return {"error": "not_found"}
+        appeal.status = status
+        appeal.agent_note = note
+        appeal.resolved_at = datetime.now(timezone.utc)
+        if appeal.groq_read_at is None:
+            appeal.groq_read_at = appeal.resolved_at
+        label = "반영" if status == PlaceAppealStatus.resolved else "기각"
+        from app.messages import contributor_user_ids, notify_users
+
+        recipients = contributor_user_ids(db, [appeal.place_id])
+        recipients.add(appeal.user_id)
+        notify_users(
+            db,
+            user_ids=recipients,
+            kind=UserMessageKind.appeal_result,
+            title=f"이의신청 {label} (장소 #{appeal.place_id})",
+            body=f"이의 내용: {appeal.body[:500]}\n\n에이전트 조치: {note}",
+            place_id=appeal.place_id,
+        )
+        db.commit()
+        return {"ok": True, "status": status.value}
+
+    if name == "mark_appeals_read":
+        ids = [int(x) for x in (args.get("appeal_ids") or [])]
+        n = mark_appeals_read(db, ids)
+        db.commit()
+        return {"marked": n}
 
     if name == "reorder_images":
         pid = int(args["place_id"])

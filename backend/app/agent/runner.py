@@ -9,23 +9,32 @@ from sqlalchemy.orm import Session
 
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
+from app.messages import list_open_appeals
 from app.models import PlaceEvent
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
-목표: 미읽음 이력을 바탕으로 지도를 더 완성도 있게 만든다.
+목표: 미읽음 이력·이의신청을 바탕으로 지도를 더 완성도 있게 만든다.
+
+원칙:
+- 설명·제목 등 사용자 기록은 최대한 보존. 마음대로 덮어쓰지 말고 append_note·local_name으로 보완.
+- 안내 문장·agent_context·이의 답변은 한국어. 다만 장소 명칭·주소·공식명은 중국어 등 현지 표기를 살리고 제목에 병기.
+- 좌표는 WGS84.
+
 우선순위:
-1) 같은 장소로 보이는 핀 병합 (가까운 거리 + 이름 유사)
-2) 각 장소 agent_context에 한국어로 유용한 요약 컨텍스트 저장
-3) 필요하면 web_search로 정보 보완 (불확실하면 단정하지 말 것)
-4) 꼭 필요해 보이는 핵심 장소만 소수 추가 (남발 금지)
-5) 이미지 순서가 이상하면 reorder_images
-작업이 끝나면 처리한 이벤트는 mark_events_read 호출.
-좌표는 WGS84. 답변/컨텍스트는 한국어.
+1) list_open_appeals로 이의신청을 먼저 검토하고, 필요 시 보완·복원 후 resolve_appeal
+2) 같은 장소로 보이는 핀 병합 (가까운 거리 + 이름 유사). 병합 시 양쪽 설명/별칭 보존
+3) agent_context에 한국어 유용 요약 보완(기존 내용 위에 덧붙이기)
+4) 필요하면 web_search로 정보 보완 (불확실하면 단정 금지)
+5) 꼭 필요해 보이는 핵심 장소만 소수 추가 (남발 금지)
+6) 이미지 순서가 이상하면 reorder_images
+끝나면 mark_events_read / mark_appeals_read 호출.
 """
 
 
 def count_unread(db: Session) -> int:
-    return db.query(PlaceEvent).filter(PlaceEvent.groq_read_at.is_(None)).count()
+    events = db.query(PlaceEvent).filter(PlaceEvent.groq_read_at.is_(None)).count()
+    appeals = len(list_open_appeals(db, limit=100))
+    return events + appeals
 
 
 def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
@@ -43,7 +52,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         return {
             "ok": True,
             "steps": 0,
-            "message": "미읽음 이력 없음",
+            "message": "미읽음 이력·이의 없음",
             "unread_before": 0,
             "unread_after": 0,
         }
@@ -60,8 +69,9 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "role": "user",
             "content": (
                 f"미읽음 이벤트 {unread_before}건이 있습니다. "
-                "list_unread_events로 확인한 뒤 필요한 tool을 호출해 지도를 정리하세요. "
-                "끝나면 mark_events_read로 처리 완료 표시 후 한 줄 요약."
+                "먼저 list_open_appeals로 이의신청을 확인하세요. "
+                "이어서 list_unread_events로 이력을 보고 필요한 tool로 지도를 정리하세요. "
+                "기존 문구는 보존·보완 위주. 끝나면 mark_events_read·mark_appeals_read 후 한 줄 요약."
             ),
         },
     ]

@@ -1,4 +1,4 @@
-import type { MarkerItem, MarkerPayload, User } from "./types";
+import type { MarkerItem, MarkerPayload, User, UserMessage } from "./types";
 
 export interface GeocodeHit {
   display_name: string;
@@ -172,4 +172,43 @@ export async function importShare(
     body: JSON.stringify({ text, source }),
   });
   return handle<ShareImportResult>(res);
+}
+
+export async function fetchMessages(token: string): Promise<UserMessage[]> {
+  const res = await request("/api/messages", { headers: authHeaders(token) });
+  return handle<UserMessage[]>(res);
+}
+
+export async function fetchUnreadMessageCount(token: string): Promise<number> {
+  const res = await request("/api/messages/unread-count", { headers: authHeaders(token) });
+  const data = await handle<{ count: number }>(res);
+  return data.count;
+}
+
+export async function markMessageRead(token: string, id: number): Promise<UserMessage> {
+  const res = await request(`/api/messages/${id}/read`, {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  return handle<UserMessage>(res);
+}
+
+export async function markAllMessagesRead(token: string): Promise<void> {
+  const res = await request("/api/messages/read-all", {
+    method: "POST",
+    headers: authHeaders(token),
+  });
+  await handle<{ marked: number }>(res);
+}
+
+export async function createAppeal(
+  token: string,
+  body: { place_id: number; body: string; message_id?: number | null },
+): Promise<void> {
+  const res = await request("/api/appeals", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  await handle(res);
 }

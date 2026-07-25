@@ -130,3 +130,30 @@ class AgentRunResponse(BaseModel):
     message: str
     unread_before: int
     unread_after: int
+
+
+class UserMessageOut(BaseModel):
+    id: int
+    place_id: Optional[int] = None
+    kind: str
+    title: str
+    body: str
+    read_at: Optional[datetime] = None
+    created_at: datetime
+    can_appeal: bool = False
+
+
+class AppealCreate(BaseModel):
+    place_id: int
+    body: str = Field(min_length=2, max_length=4000)
+    message_id: Optional[int] = None
+
+
+class AppealOut(BaseModel):
+    id: int
+    place_id: int
+    body: str
+    status: str
+    agent_note: str = ""
+    created_at: datetime
+    resolved_at: Optional[datetime] = None

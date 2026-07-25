@@ -44,6 +44,20 @@ class PlaceEventAction(str, enum.Enum):
     image_reorder = "image_reorder"
     context_update = "context_update"
     agent_create = "agent_create"
+    appeal = "appeal"
+
+
+class UserMessageKind(str, enum.Enum):
+    agent_merge = "agent_merge"
+    agent_create = "agent_create"
+    appeal_result = "appeal_result"
+    system = "system"
+
+
+class PlaceAppealStatus(str, enum.Enum):
+    open = "open"
+    resolved = "resolved"
+    dismissed = "dismissed"
 
 
 class User(Base):
@@ -57,6 +71,8 @@ class User(Base):
 
     markers: Mapped[list["Marker"]] = relationship(back_populates="creator")
     contributions: Mapped[list["PlaceContributor"]] = relationship(back_populates="user")
+    messages: Mapped[list["UserMessage"]] = relationship(back_populates="user")
+    appeals: Mapped[list["PlaceAppeal"]] = relationship(back_populates="user")
 
 
 class Marker(Base):
@@ -172,3 +188,63 @@ class PlaceImage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     place: Mapped[Marker] = relationship(back_populates="images")
+
+
+class UserMessage(Base):
+    """인앱 알림. 에이전트 병합/추가·이의 처리 결과 등."""
+
+    __tablename__ = "user_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    kind: Mapped[UserMessageKind] = mapped_column(
+        Enum(
+            UserMessageKind,
+            name="user_message_kind",
+            native_enum=False,
+            values_callable=lambda e: [x.value for x in e],
+        ),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    related_event_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("place_events.id", ondelete="SET NULL"), nullable=True
+    )
+    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    user: Mapped[User] = relationship(back_populates="messages")
+
+
+class PlaceAppeal(Base):
+    """에이전트 조치에 대한 이의. 다음 주기(미읽음)에 재고려."""
+
+    __tablename__ = "place_appeals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    place_id: Mapped[int] = mapped_column(ForeignKey("markers.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("user_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[PlaceAppealStatus] = mapped_column(
+        Enum(
+            PlaceAppealStatus,
+            name="place_appeal_status",
+            native_enum=False,
+            values_callable=lambda e: [x.value for x in e],
+        ),
+        default=PlaceAppealStatus.open,
+        nullable=False,
+    )
+    agent_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    groq_read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="appeals")

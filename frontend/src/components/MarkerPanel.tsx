@@ -51,6 +51,9 @@ export default function MarkerPanel({
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [appealOpen, setAppealOpen] = useState(false);
+  const [appealBody, setAppealBody] = useState("");
+  const [appealDone, setAppealDone] = useState(false);
 
   useEffect(() => {
     if (marker && (mode === "view" || mode === "edit")) {
@@ -63,7 +66,26 @@ export default function MarkerPanel({
       setDescription(createDefaults?.description ?? "");
     }
     setError("");
+    setAppealOpen(false);
+    setAppealBody("");
+    setAppealDone(false);
   }, [marker, mode, latlng, polygon, createDefaults]);
+
+  async function submitAppeal() {
+    if (!token || !marker || !appealBody.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.createAppeal(token, { place_id: marker.id, body: appealBody.trim() });
+      setAppealDone(true);
+      setAppealOpen(false);
+      setAppealBody("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "이의신청 실패");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   function applyDianpingDraft(result: ShareImportResult) {
     setTitle(result.title);
@@ -194,6 +216,40 @@ export default function MarkerPanel({
               <button type="button" className="btn btn--danger" onClick={handleDelete} disabled={busy}>
                 삭제
               </button>
+            </div>
+          ) : null}
+          {token ? (
+            <div className="panel__appeal">
+              {appealDone ? (
+                <p className="panel__meta">이의신청을 남겼습니다. 다음 새벽 정리 때 다시 검토합니다.</p>
+              ) : appealOpen ? (
+                <>
+                  <textarea
+                    value={appealBody}
+                    onChange={(e) => setAppealBody(e.target.value)}
+                    rows={3}
+                    maxLength={4000}
+                    placeholder="병합·추천이 잘못되었거나 보완이 필요하면 내용을 적어 주세요"
+                  />
+                  <div className="panel__actions">
+                    <button type="button" className="btn btn--ghost" onClick={() => setAppealOpen(false)}>
+                      취소
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn--primary"
+                      disabled={busy || !appealBody.trim()}
+                      onClick={() => void submitAppeal()}
+                    >
+                      이의 남기기
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <button type="button" className="btn btn--ghost" onClick={() => setAppealOpen(true)}>
+                  에이전트 조치에 이의신청
+                </button>
+              )}
             </div>
           ) : null}
           {error ? <p className="panel__error">{error}</p> : null}

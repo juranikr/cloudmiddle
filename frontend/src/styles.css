@@ -817,6 +817,152 @@ textarea {
   word-break: break-word;
 }
 
+.panel__appeal {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(20, 33, 43, 0.08);
+}
+
+.panel__appeal textarea {
+  width: 100%;
+  border: 1px solid rgba(20, 33, 43, 0.12);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font: inherit;
+  resize: vertical;
+}
+
+.topbar__inbox {
+  border: 0;
+  background: rgba(15, 118, 110, 0.1);
+  color: var(--teal-deep);
+  font-weight: 700;
+  font-size: 0.86rem;
+  padding: 8px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.topbar__inbox.has-unread {
+  background: rgba(185, 28, 28, 0.1);
+  color: #b91c1c;
+}
+
+.inbox {
+  position: absolute;
+  z-index: 1200;
+  left: 12px;
+  right: 12px;
+  top: 72px;
+  max-height: min(70vh, 560px);
+  background: var(--surface);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.inbox__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(20, 33, 43, 0.08);
+}
+
+.inbox__header h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.inbox__header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inbox__body {
+  padding: 12px 14px 16px;
+  overflow: auto;
+  display: grid;
+  gap: 12px;
+}
+
+.inbox__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.inbox__item {
+  border-radius: 12px;
+  background: rgba(20, 33, 43, 0.04);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.inbox__item.is-unread {
+  background: rgba(15, 118, 110, 0.08);
+}
+
+.inbox__item-main {
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  display: grid;
+  gap: 4px;
+}
+
+.inbox__item-main strong {
+  font-size: 0.95rem;
+}
+
+.inbox__item-main p {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.86rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.inbox__kind {
+  font-size: 0.72rem;
+  color: var(--teal-deep);
+  font-weight: 600;
+}
+
+.inbox__appeal-btn {
+  justify-self: start;
+}
+
+.inbox__appeal {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(185, 28, 28, 0.06);
+}
+
+.inbox__appeal textarea {
+  width: 100%;
+  border: 1px solid rgba(20, 33, 43, 0.12);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font: inherit;
+  resize: vertical;
+}
+
 .panel__badge {
   justify-self: start;
   color: #fff;

@@ -58,3 +58,14 @@ export interface MarkerPayload {
   lng: number;
   polygon?: LatLng[] | null;
 }
+
+export interface UserMessage {
+  id: number;
+  place_id: number | null;
+  kind: string;
+  title: string;
+  body: string;
+  read_at: string | null;
+  created_at: string;
+  can_appeal: boolean;
+}
