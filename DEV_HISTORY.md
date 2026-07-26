@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 툴 인자 스키마 오류 내성
+최종 갱신: 2026-07-26 (KST) — 병합 판단 유연화 (거리는 참고 신호)
 
 ---
 
@@ -174,6 +174,13 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 병합 판단 유연화
+- 증상: 동일 명소(천불산 11 / 千佛山 25)인데 150m 고정 반경 미충족으로 병합 안 됨, 이의도 거리로 기각
+- 프롬프트: "같은 실체인가" 기준 명시 — 동명(한글/한자/병음)·이의 주장·웹 근거면 거리 무관 병합, 넓은 명소는 radius 1000~5000m
+- 연구 사이클에 전체 지도 중복 스캔 단계 추가
+- 툴 설명: find_nearby_candidates/merge_places/list_places에 거리=참고 신호 명시
+- 운영 KB의 "150m 규칙" 교훈을 직접 교정 (fix_kb 스크립트, agent_knowledge UPDATE)
 
 ### 2026-07-26 — 툴 인자 스키마 오류 내성
 - 증상: 모델이 upsert_knowledge에 place_id:null → Groq 400 tool_use_failed로 사이클 중단

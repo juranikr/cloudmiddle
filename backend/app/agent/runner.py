@@ -24,7 +24,17 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
   mark_appeals_read만으로 open 이의를 넘기지 말 것 (툴이 거부한다).
 - 미읽음 이벤트: 각 ID를 검토 → 필요 시 병합/보완/무시 판단 → mark_events_read.
   일부만 처리하고 끝내면 실패다. unread가 0이 될 때까지 계속한다.
-- 병합 판단 시 find_nearby_candidates / list_places로 전체 활성 지도와 비교한다.
+
+【병합 판단 — 거리는 참고 신호일 뿐】
+- 반경(120~150m)은 기본 힌트이지 절대 기준이 아니다. 고정 반경으로 기각하지 말 것.
+- 판단 기준은 "같은 실체인가"다. 다음이 있으면 거리가 멀어도 병합한다:
+  · 동일/동의 명칭 (한글·한자·병음 표기 차이 포함, 예: 천불산 = 千佛山 = Qianfoshan)
+  · 사용자 이의제기의 "같은 장소" 주장 (강한 근거로 취급, 거리만으로 기각 금지)
+  · 웹 조사로 확인된 동일 명소
+- 산·공원·호수·대학처럼 넓은 명소는 핀이 수백 m~수 km 떨어질 수 있다.
+  find_nearby_candidates radius_m을 1000~5000으로 넓히고, list_places(q=이름)로도 전체 검색.
+- 반대로 50m 이내라도 명칭·성격이 다르면 별개 장소로 유지한다.
+- 병합 방향: 정보가 풍부한 쪽(설명·이미지·기여자)을 target으로.
 
 【지식베이스 — 필수】
 - 작업 시작 시 list_knowledge를 호출한다.
@@ -41,9 +51,10 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 1) list_knowledge → list_recent_rollbacks
 2) 작업 큐의 이의신청 전원 resolve_appeal
 3) 작업 큐의 미읽음 이벤트 전원 검토·조치 → mark_events_read
-4) (큐가 비었을 때만) web_search → create_place 소수 → upsert_knowledge
-5) agent_context 보완
-6) upsert_knowledge 최종 정리 후 한 줄 요약
+4) (큐가 비었을 때만) 전체 지도 중복 스캔(list_places로 동명·동의어 장소) → 병합
+5) web_search → create_place 소수 → upsert_knowledge
+6) agent_context 보완
+7) upsert_knowledge 최종 정리 후 한 줄 요약
 """
 
 
@@ -136,9 +147,11 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             f"기존 지식베이스 요약: {kb_hint}\n"
             "필수: 시작 list_knowledge, 종료 전 upsert_knowledge 1회 이상.\n"
             "1) list_knowledge / list_places로 현황 파악\n"
-            "2) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
-            "3) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
-            "4) 조사·추가에서 배운 점을 upsert_knowledge로 병합 (빠뜨리면 실패)\n"
+            "2) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
+            "같은 실체면 거리와 무관하게 merge_places (거리 기준으로 건너뛰지 말 것)\n"
+            "3) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
+            "4) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
+            "5) 조사·추가에서 배운 점을 upsert_knowledge로 병합 (빠뜨리면 실패)\n"
             "끝나면 한 줄 요약."
         )
     else:
@@ -150,7 +163,8 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "1) list_knowledge, list_recent_rollbacks\n"
             "2) appeal_ids 각각 resolve_appeal\n"
             "3) event_ids 각각 검토(필요 시 find_nearby_candidates/list_places로 전체 지도 비교·병합) "
-            "후 mark_events_read\n"
+            "후 mark_events_read. 이의가 '같은 장소'라고 주장하면 거리만으로 기각하지 말고 "
+            "이름·웹 근거로 같은 실체인지 판단\n"
             "4) count상 미처리가 0인지 list_open_appeals·list_unread_events로 재확인\n"
             "5) 큐가 비었을 때만 web_search/create_place 소수\n"
             "6) upsert_knowledge 후 한 줄 요약\n"

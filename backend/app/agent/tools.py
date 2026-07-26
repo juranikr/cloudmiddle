@@ -76,7 +76,9 @@ TOOLS: list[dict[str, Any]] = [
                 "활성 장소(병합되지 않은 것)를 조건으로 조회한다. "
                 "병합 후보를 찾을 때 미읽음/이의 대상뿐 아니라 수정되지 않은 기존 장소까지 "
                 "이 툴로 전체 지도에서 쿼리한다. "
-                "q·category·near_lat/near_lng/radius_m를 조합해 필요한 범위만 가져올 것."
+                "q·category·near_lat/near_lng/radius_m를 조합해 필요한 범위만 가져올 것. "
+                "동명 중복 탐색은 q(이름 부분일치)로, 한글/한자 표기가 다르면 "
+                "전체 목록을 가져와 직접 비교한다."
             ),
             "parameters": {
                 "type": "object",
@@ -125,13 +127,18 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "기준 place_id 주변의 활성 장소를 거리순으로 반환한다. "
                 "수정/이의가 없는 기존 핀도 모두 포함되므로, 병합 후보 탐색의 1순위 툴이다. "
-                "반경을 넓혀(예: 120~250m) 이름 유사 후보를 놓치지 말 것."
+                "거리는 참고 신호일 뿐이다. 산·공원·호수 등 넓은 명소는 radius_m을 "
+                "1000~5000까지 넓혀서 검색하고, 이름이 같으면 거리가 멀어도 병합 후보다."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "place_id": {"type": "integer", "description": "미읽음/이의로 주목 중인 기준 장소"},
-                    "radius_m": {"type": "number", "default": 120},
+                    "radius_m": {
+                        "type": "number",
+                        "default": 120,
+                        "description": "미터. 넓은 명소는 1000~5000 권장. 고정 기준 아님",
+                    },
                 },
                 "required": ["place_id"],
             },
@@ -141,7 +148,11 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "merge_places",
-            "description": "source_place_id를 target_place_id로 병합한다. 설명/기여자/이미지를 합친다.",
+            "description": (
+                "source_place_id를 target_place_id로 병합한다. 설명/기여자/이미지를 합친다. "
+                "같은 실체라는 근거(동일·동의 명칭, 이의제기 주장, 웹 확인)가 있으면 "
+                "거리가 150m를 넘어도 병합한다. 정보가 풍부한 쪽을 target으로."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
