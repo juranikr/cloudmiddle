@@ -180,6 +180,8 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 - 사이클당 할당량 상향: fetch_page 2~4 → 4~8, create_place 1~5 → 5~12,
   재검증 3~5 → 8~12곳, 사진 보강 1~2 → 3~6곳
 - 큐 사이클에도 여유 스텝 시 재검증·사진 보강 수행 항목 추가
+- 조기 종료 방지 넛지 추가: 스텝 60% 미만 사용 시 최대 3회 잔여 할당량 수행 지시
+  (첫 검증 실행에서 110스텝 중 26스텝만 쓰고 "다음 사이클 예고"로 끝내는 문제 확인)
 
 ### 2026-07-27 — 에이전트 추론 강도 high 적용
 - gpt-oss 계열 모델 사용 시 reasoning_effort="high" 전달 (기존 기본값 medium)

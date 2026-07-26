@@ -261,9 +261,11 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     steps = 0
     final_text = ""
     used_tools: set[str] = set()
+    tool_counts: dict[str, int] = {}
     work_nudges = 0
     kb_nudges = 0
     research_nudges = 0
+    volume_nudges = 0
     schema_retries = 0
     try:
         for _ in range(steps_limit):
@@ -348,6 +350,31 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                         }
                     )
                     continue
+                # 스텝 여유가 큰데 조기 종료하려는 경우: 잔여 할당량을 채우도록 계속시킨다
+                if volume_nudges < 3 and steps < int(steps_limit * 0.6):
+                    volume_nudges += 1
+                    done_brief = ", ".join(
+                        f"{t} {c}회"
+                        for t, c in tool_counts.items()
+                        if t in ("create_place", "verify_place", "attach_image_from_url",
+                                 "fetch_page", "update_place_fields")
+                    ) or "주요 작업 없음"
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"아직 스텝 여유가 큽니다 ({steps}/{steps_limit} 사용, 지금까지: {done_brief}). "
+                                "'다음 사이클에 하겠다'는 예고는 금지 — 지금 이 사이클에서 계속 진행하세요. "
+                                "우선순위: ① 조사에서 발견한 미등록 장소 create_place 추가 등록 "
+                                "② 새 키워드 web_search → fetch_page 추가 조사 "
+                                "③ list_stale_places 재검증 8~12곳 verify_place "
+                                "④ image_count 0인 장소 사진 보강 3~6곳 "
+                                "⑤ 언어 규칙 위반 장소 정비. "
+                                "할당량을 채운 뒤 upsert_knowledge로 마무리하세요."
+                            ),
+                        }
+                    )
+                    continue
                 break
 
             messages.append(
@@ -374,6 +401,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                 except json.JSONDecodeError:
                     args = {}
                 used_tools.add(tc.function.name)
+                tool_counts[tc.function.name] = tool_counts.get(tc.function.name, 0) + 1
                 result = run_tool(db, tc.function.name, args)
                 messages.append(
                     {
