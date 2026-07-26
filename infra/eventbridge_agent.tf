@@ -1,4 +1,4 @@
-# 매일 18:00 UTC (= 한국 03:00) Groq 에이전트 1회 실행
+# 하루 3회 (KST 03:00 / 11:00 / 19:00 = UTC 18:00 / 02:00 / 10:00) Groq 에이전트 실행
 resource "aws_cloudwatch_log_group" "agent" {
   name              = "/ecs/${local.name_prefix}-agent"
   retention_in_days = 14
@@ -84,7 +84,7 @@ resource "aws_iam_role_policy" "events_ecs" {
 resource "aws_cloudwatch_event_rule" "agent_daily" {
   name                = "${local.name_prefix}-agent-daily"
   description         = "Daily Groq map curator"
-  schedule_expression = "cron(0 18 * * ? *)" # 03:00 KST
+  schedule_expression = "cron(0 2,10,18 * * ? *)" # KST 11:00, 19:00, 03:00
 }
 
 resource "aws_cloudwatch_event_target" "agent_daily" {

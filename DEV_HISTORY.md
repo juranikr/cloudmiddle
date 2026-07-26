@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 모바일 GNB 더보기 상태 수정
+최종 갱신: 2026-07-26 (KST) — 에이전트 작업량 확대 (하루 3회, 연구 45스텝)
 
 ---
 
@@ -174,6 +174,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 에이전트 작업량 확대
+- EventBridge 스케줄 하루 1회 → 3회 (KST 03:00/11:00/19:00, cron 0 2,10,18 UTC)
+  tf 수정 + aws events put-rule로 즉시 반영 (다음 terraform apply 시 드리프트 없음)
+- 연구 사이클 스텝 한도 36 → 45
 
 ### 2026-07-26 — 모바일 GNB 더보기 상태 수정
 - 더보기는 모달 토글일 뿐 탭 전환이 아니므로 mobileTab을 바꾸지 않게 변경

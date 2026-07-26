@@ -195,7 +195,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     # 작업 건수에 비례해 스텝 확보 (건당 ~4 + 지식/롤백 오버헤드)
     if research_only:
         # 스크래핑 조사 + 재검증 + 사진 보강까지 수행하므로 여유 확보
-        steps_limit = max(base_steps, 36)
+        steps_limit = max(base_steps, 45)
     else:
         # 큐 처리 후 필수 웹 조사 분량(~8스텝) 포함
         steps_limit = max(base_steps, min(56, 18 + unread_before * 4))
