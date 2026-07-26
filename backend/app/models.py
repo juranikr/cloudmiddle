@@ -273,6 +273,37 @@ class AgentKnowledge(Base):
     )
 
 
+class AgentSearchLog(Base):
+    """에이전트 웹 검색 이력. 어떤 키워드를 언제 조사했고 새 콘텐츠가 얼마나 나왔는지."""
+
+    __tablename__ = "agent_search_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    query: Mapped[str] = mapped_column(String(300), index=True, nullable=False)
+    results_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    new_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    searched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class AgentWebVisit(Base):
+    """에이전트가 열람한 웹 페이지. 같은 콘텐츠 재열람 방지용."""
+
+    __tablename__ = "agent_web_visits"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    url: Mapped[str] = mapped_column(String(1000), unique=True, index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    visit_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    first_visited_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_visited_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class PlaceFavorite(Base):
     __tablename__ = "place_favorites"
     __table_args__ = (UniqueConstraint("user_id", "place_id", name="uq_user_favorite_place"),)

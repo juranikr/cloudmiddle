@@ -44,6 +44,22 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
   같은 지점의 이전이 확실할 때만 geocode_place→update_place_fields로 좌표·주소 갱신 후 verify_place(moved, note).
 - 판단이 안 서면 verify_place(uncertain, note)로 남기고 다음 사이클로 넘긴다.
 
+【웹 조사(스크래핑) — 매 사이클 1회 필수】
+- 큐를 비운 뒤(또는 큐가 없으면 바로) 지난 여행 블로그·정보글 스크래핑을 반드시 1회 수행한다.
+- 순서: list_research_history로 과거 검색어·열람 이력 확인 →
+  ① 수확이 있었는데 덜 판 검색어는 심화, ② 소진된 검색어는 회피,
+  ③ 안 해본 테마의 새 키워드 1개 이상 (예: 济南 小吃街 / 夜景 / 免费 景点 / 芙蓉街 美食 /
+  지난 여행 코스 / 济南 网红 打卡 / 계절 행사)
+- web_search 결과에서 seen=false 페이지 위주로 fetch_page 2~4개 정독.
+  seen=true·already_visited=true 페이지는 다시 열지 않는다.
+- 여러 글에서 반복 추천되는데 지도에 없는 장소를 골라
+  list_places로 중복 확인 → geocode_place → create_place (사이클당 1~5개).
+- 이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·꿀팁·교통·현지 표기·별칭 등)가
+  나오면 버리지 말고 update_place_fields(append_note·local_name)나
+  update_place_context로 해당 장소를 보완한다. 사용자 원문은 보존하고 덧붙이기만 할 것.
+- 끝나면 upsert_knowledge(topic 'research_strategy')에 어떤 검색어·소스가 효과적이었는지,
+  다음에 팔 키워드는 무엇인지 전략을 갱신한다.
+
 【지식베이스 — 필수】
 - 작업 시작 시 list_knowledge를 호출한다.
 - 사이클이 끝나기 전에 upsert_knowledge를 최소 1회 이상 호출한다.
@@ -64,9 +80,10 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
    (이전 의심 시 지점 구분 재검토 필수)
 6) 사진 보강: image_count가 0인 장소 1~3곳 → search_place_images(중국어 명칭) →
    attach_image_from_url (위키미디어 자유 라이선스만, source에 출처 기록)
-7) web_search → create_place 소수 → upsert_knowledge
+7) 웹 조사 필수 1회: list_research_history → 키워드 선정 → web_search →
+   fetch_page(미열람 글 2~4개) → 반복 추천 미등록 장소 create_place
 8) agent_context 보완
-9) upsert_knowledge 최종 정리 후 한 줄 요약
+9) upsert_knowledge 최종 정리(research_strategy 포함) 후 한 줄 요약
 """
 
 
@@ -149,10 +166,11 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     base_steps = max_steps or settings.agent_max_steps
     # 작업 건수에 비례해 스텝 확보 (건당 ~4 + 지식/롤백 오버헤드)
     if research_only:
-        # 재검증 + 사진 보강 + 조사까지 수행하므로 여유 확보
-        steps_limit = max(base_steps, 18)
+        # 재검증 + 사진 보강 + 스크래핑 조사까지 수행하므로 여유 확보
+        steps_limit = max(base_steps, 22)
     else:
-        steps_limit = max(base_steps, min(48, 10 + unread_before * 4))
+        # 큐 처리 후 필수 웹 조사 분량(~8스텝) 포함
+        steps_limit = max(base_steps, min(56, 18 + unread_before * 4))
 
     if research_only:
         user_msg = (
@@ -168,9 +186,14 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "같은 지점 이전이 확실할 때만 좌표를 갱신할 것\n"
             "4) 사진 보강: image_count가 0인 장소 1~3곳을 골라 search_place_images(중국어 명칭) → "
             "attach_image_from_url로 업로드 (자유 라이선스만, source에 출처·라이선스 기록)\n"
-            "5) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
-            "6) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
-            "7) 조사·추가에서 배운 점을 upsert_knowledge로 병합 (빠뜨리면 실패)\n"
+            "5) 웹 조사(필수): list_research_history로 과거 검색어·열람 이력 확인 → "
+            "덜 판 검색어 심화 + 새 테마 키워드 조사 → web_search에서 seen=false 결과 위주로 "
+            "fetch_page 2~4개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
+            "6) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
+            "geocode_place → create_place 1~5개. 이미 등록된 장소와 겹치는 유용한 정보"
+            "(영업시간·가격·팁·교통·별칭)는 update_place_fields/update_place_context로 보완\n"
+            "7) 조사 전략(효과적 검색어·소스·다음 키워드)을 upsert_knowledge"
+            "(topic 'research_strategy')로 병합 (빠뜨리면 실패)\n"
             "끝나면 한 줄 요약."
         )
     else:
@@ -185,8 +208,10 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "후 mark_events_read. 이의가 '같은 장소'라고 주장하면 거리만으로 기각하지 말고 "
             "이름·웹 근거로 같은 실체인지 판단\n"
             "4) count상 미처리가 0인지 list_open_appeals·list_unread_events로 재확인\n"
-            "5) 큐가 비었을 때만 web_search/create_place 소수\n"
-            "6) upsert_knowledge 후 한 줄 요약\n"
+            "5) 큐를 비운 뒤 웹 조사 1회 필수: list_research_history → 키워드 선정(심화+새 테마) → "
+            "web_search → seen=false 글 2~3개 fetch_page → 반복 추천 미등록 장소 create_place, "
+            "기존 장소와 겹치는 유용한 정보는 update_place_fields/context로 보완\n"
+            "6) upsert_knowledge(research_strategy 포함) 후 한 줄 요약\n"
             "일부만 처리하고 끝내면 실패다."
         )
 
@@ -200,6 +225,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     used_tools: set[str] = set()
     work_nudges = 0
     kb_nudges = 0
+    research_nudges = 0
     schema_retries = 0
     try:
         for _ in range(steps_limit):
@@ -246,6 +272,21 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                                 "종료할 수 없습니다. 아래 잔여 큐를 전원 처리하세요. "
                                 "이의는 resolve_appeal, 이벤트는 조치 후 mark_events_read. "
                                 f"잔여 큐: {_queue_brief(left)}"
+                            ),
+                        }
+                    )
+                    continue
+                if "fetch_page" not in used_tools and research_nudges < 2 and steps < steps_limit:
+                    research_nudges += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "아직 이번 사이클의 필수 웹 조사(스크래핑)를 하지 않았습니다. "
+                                "list_research_history로 과거 이력을 확인하고, 덜 판 검색어나 "
+                                "새 테마 키워드로 web_search → seen=false 글 2개 이상 fetch_page → "
+                                "반복 추천되는 미등록 장소가 있으면 create_place 하세요. "
+                                "웹 조사 없이 종료하면 실패입니다."
                             ),
                         }
                     )

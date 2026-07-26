@@ -7,6 +7,7 @@ import math
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session, joinedload
@@ -30,6 +31,8 @@ from app.messages import (
     notify_place_contributors,
 )
 from app.models import (
+    AgentSearchLog,
+    AgentWebVisit,
     Marker,
     MarkerCategory,
     MarkerShape,
@@ -363,11 +366,56 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "웹에서 장소 관련 정보를 간단히 검색한다 (DuckDuckGo).",
+            "description": (
+                "웹 검색(DuckDuckGo). 각 결과에 seen(이미 열람한 페이지 여부)이 붙고, "
+                "검색어·시각은 자동으로 이력에 기록된다. "
+                "past_searches로 같은 검색어의 과거 조사 횟수를 알려주니, "
+                "이미 여러 번 조사한 검색어보다 새 키워드를 우선할 것. "
+                "seen=false 결과를 골라 fetch_page로 본문을 읽는다."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}},
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 8},
+                },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_page",
+            "description": (
+                "웹 페이지 본문을 읽는다(블로그·여행기·정보글 스크래핑). "
+                "열람한 URL은 자동 기록되어 다음부터 web_search 결과에 seen=true로 표시된다. "
+                "already_visited=true로 돌아오면 과거에 이미 읽은 페이지이므로 "
+                "다른 새 페이지를 고를 것. 자주 언급되는 미등록 장소를 찾으면 "
+                "list_places로 중복 확인 → geocode_place → create_place. "
+                "이미 등록된 장소에 대한 유용한 정보(영업시간·가격·팁·교통·별칭)가 나오면 "
+                "update_place_fields(append_note)나 update_place_context로 보완할 것."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_research_history",
+            "description": (
+                "과거 웹 조사 이력을 반환한다: 검색어별 조사 횟수·최근 시각·새 콘텐츠 수확량, "
+                "최근 열람 페이지 목록. 웹 조사를 시작하기 전에 반드시 호출해서 "
+                "① 수확이 있었는데 덜 판 검색어는 심화하고 ② 이미 소진된 검색어는 피하고 "
+                "③ 안 해본 테마(먹거리·야경·시장·무료 명소·계절 행사 등)의 새 키워드를 고른다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "default": 20}},
             },
         },
     },
@@ -491,6 +539,82 @@ def _place_brief(m: Marker) -> dict[str, Any]:
         "is_agent_suggested": m.is_agent_suggested,
         "image_count": len(m.images or []),
     }
+
+
+class _TextExtractor(HTMLParser):
+    """script/style 제외 본문 텍스트 + 제목 추출."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self._in_title = False
+        self.title = ""
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in ("script", "style", "noscript", "svg", "iframe"):
+            self._skip_depth += 1
+        elif tag == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style", "noscript", "svg", "iframe") and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title += data
+            return
+        if self._skip_depth:
+            return
+        text = data.strip()
+        if text:
+            self.parts.append(text)
+
+
+def _decode_html(raw: bytes, content_type: str) -> str:
+    charset = ""
+    if "charset=" in content_type:
+        charset = content_type.split("charset=")[-1].split(";")[0].strip().strip('"')
+    for enc in filter(None, [charset, "utf-8", "gb18030"]):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _extract_page_text(url: str) -> dict[str, Any]:
+    req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_UA})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "text" not in ctype:
+            return {"error": f"not_html:{ctype.split(';')[0]}"}
+        raw = resp.read(2 * 1024 * 1024)
+    html_text = _decode_html(raw, ctype)
+    parser = _TextExtractor()
+    try:
+        parser.feed(html_text)
+    except Exception:  # noqa: BLE001 — 깨진 HTML은 파싱된 데까지만 사용
+        pass
+    body = "\n".join(parser.parts)
+    return {"title": parser.title.strip()[:300], "text": body[:7000]}
+
+
+def _record_visit(db: Session, url: str, title: str = "") -> bool:
+    """방문 기록 upsert. 반환값: 이번이 첫 방문인지."""
+    row = db.query(AgentWebVisit).filter(AgentWebVisit.url == url).first()
+    if row:
+        row.visit_count += 1
+        if title and not row.title:
+            row.title = title[:300]
+        db.commit()
+        return False
+    db.add(AgentWebVisit(url=url[:1000], title=title[:300]))
+    db.commit()
+    return True
 
 
 _WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
@@ -1040,19 +1164,122 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         query = str(args.get("query") or "").strip()
         if not query:
             return {"results": []}
+        max_results = max(1, min(int(args.get("max_results") or 8), 15))
         try:
-            from duckduckgo_search import DDGS
+            try:
+                from ddgs import DDGS
+            except ImportError:  # 구버전 환경 호환
+                from duckduckgo_search import DDGS
 
             with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=5))
-            return {
-                "results": [
-                    {"title": r.get("title"), "href": r.get("href"), "body": (r.get("body") or "")[:300]}
-                    for r in results
-                ]
-            }
+                results = list(ddgs.text(query, max_results=max_results))
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc), "results": []}
+
+        hrefs = [r.get("href") or "" for r in results]
+        seen_urls = {
+            row.url
+            for row in db.query(AgentWebVisit.url).filter(AgentWebVisit.url.in_(hrefs)).all()
+        } if hrefs else set()
+        out = [
+            {
+                "title": r.get("title"),
+                "href": r.get("href"),
+                "body": (r.get("body") or "")[:300],
+                "seen": (r.get("href") or "") in seen_urls,
+            }
+            for r in results
+        ]
+        past = (
+            db.query(AgentSearchLog)
+            .filter(AgentSearchLog.query == query)
+            .order_by(AgentSearchLog.searched_at.desc())
+            .all()
+        )
+        db.add(
+            AgentSearchLog(
+                query=query[:300],
+                results_count=len(out),
+                new_count=sum(1 for r in out if not r["seen"]),
+            )
+        )
+        db.commit()
+        return {
+            "results": out,
+            "past_searches": {
+                "times": len(past),
+                "last_at": past[0].searched_at.isoformat() if past else None,
+            },
+        }
+
+    if name == "fetch_page":
+        url = str(args.get("url") or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            return {"error": "bad_url"}
+        prior = db.query(AgentWebVisit).filter(AgentWebVisit.url == url).first()
+        already_visited = prior is not None
+        try:
+            page = _extract_page_text(url)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"fetch_failed: {exc}"[:300]}
+        if "error" in page:
+            return page
+        _record_visit(db, url, page.get("title") or "")
+        return {
+            "url": url,
+            "title": page.get("title") or "",
+            "text": page.get("text") or "",
+            "already_visited": already_visited,
+            "last_visited_at": (
+                prior.last_visited_at.isoformat()
+                if prior and prior.last_visited_at
+                else None
+            ),
+        }
+
+    if name == "list_research_history":
+        limit = max(1, min(int(args.get("limit") or 20), 60))
+        # 검색어별 집계: 횟수·최근 시각·최근 새 콘텐츠 수확
+        logs = (
+            db.query(AgentSearchLog)
+            .order_by(AgentSearchLog.searched_at.desc())
+            .limit(300)
+            .all()
+        )
+        by_query: dict[str, dict[str, Any]] = {}
+        for log in logs:
+            entry = by_query.setdefault(
+                log.query,
+                {
+                    "query": log.query,
+                    "times": 0,
+                    "last_at": log.searched_at.isoformat() if log.searched_at else None,
+                    "last_new_count": log.new_count,
+                    "last_results_count": log.results_count,
+                },
+            )
+            entry["times"] += 1
+        visits = (
+            db.query(AgentWebVisit)
+            .order_by(AgentWebVisit.last_visited_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "searches": list(by_query.values())[:limit],
+            "recent_visits": [
+                {
+                    "url": v.url,
+                    "title": v.title,
+                    "visit_count": v.visit_count,
+                    "last_visited_at": (
+                        v.last_visited_at.isoformat() if v.last_visited_at else None
+                    ),
+                }
+                for v in visits
+            ],
+            "total_visited_pages": db.query(AgentWebVisit).count(),
+        }
 
     if name == "search_place_images":
         query = str(args.get("query") or "").strip()

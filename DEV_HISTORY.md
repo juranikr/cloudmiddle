@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 오래된 장소 재검증 로직
+최종 갱신: 2026-07-26 (KST) — 웹 스크래핑 조사 필수화 + 조사 이력 기록
 
 ---
 
@@ -174,6 +174,17 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 웹 스크래핑 조사 필수화 + 조사 이력 기록
+- 새 테이블: agent_search_logs(검색어·시각·새 콘텐츠 수확량), agent_web_visits(열람 URL·횟수, unique)
+- 새 툴: fetch_page(본문 스크래핑, stdlib HTMLParser, 방문 자동 기록, already_visited 표시),
+  list_research_history(검색어별 집계 + 최근 열람 목록)
+- web_search 개선: 결과마다 seen(기열람) 표시, 검색어 자동 로깅, past_searches 반환
+- duckduckgo-search 7.5.5가 엉터리 결과 반환(deprecated) → ddgs 9.14.4로 교체
+- 매 사이클 웹 조사 1회 필수(큐 처리 후): 이력 확인 → 덜 판/새 키워드 → 미열람 글 2~4개 정독 →
+  반복 추천 미등록 장소 create_place, 기존 장소와 겹치는 유용 정보는 update_place_fields/context로 보완
+- 조사 전략은 upsert_knowledge(topic 'research_strategy')에 축적, fetch_page 미사용 시 넛지
+- steps_limit: research 22, 큐 사이클 18+unread*4(최대 56)
 
 ### 2026-07-26 — 오래된 장소 재검증 로직
 - markers.last_verified_at 컬럼 추가 (멱등 마이그레이션)
