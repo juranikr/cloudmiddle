@@ -43,7 +43,7 @@ from app.models import (
     PlaceImage,
     UserMessageKind,
 )
-from app.rollback import marker_snapshot
+from app.rollback import _rollback_merge, marker_snapshot
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -133,9 +133,10 @@ TOOLS: list[dict[str, Any]] = [
             "name": "find_nearby_candidates",
             "description": (
                 "기준 place_id 주변의 활성 장소를 거리순으로 반환한다. "
-                "수정/이의가 없는 기존 핀도 모두 포함되므로, 병합 후보 탐색의 1순위 툴이다. "
-                "거리는 참고 신호일 뿐이다. 산·공원·호수 등 넓은 명소는 radius_m을 "
-                "1000~5000까지 넓혀서 검색하고, 이름이 같으면 거리가 멀어도 병합 후보다."
+                "수정/이의가 없는 기존 핀도 모두 포함된다. "
+                "주의: 가깝다는 것은 병합 근거가 아니다 — 인접한 별개 명소(趵突泉/五龙潭 등)와 "
+                "다른 가게·지점이 흔하다. 산·공원 등 넓은 명소의 동일 실체 확인에만 "
+                "radius_m 1000~5000을 활용하고, 병합은 명칭·웹 근거로 같은 실체일 때만."
             ),
             "parameters": {
                 "type": "object",
@@ -157,17 +158,44 @@ TOOLS: list[dict[str, Any]] = [
             "name": "merge_places",
             "description": (
                 "source_place_id를 target_place_id로 병합한다. 설명/기여자/이미지를 합친다. "
-                "같은 실체라는 근거(동일·동의 명칭, 이의제기 주장, 웹 확인)가 있으면 "
-                "거리가 150m를 넘어도 병합한다. 정보가 풍부한 쪽을 target으로."
+                "'같은 실체'가 확실할 때만 사용 — 확신이 없으면 병합하지 않는 것이 기본값. "
+                "금지: 각자 고유 명칭의 인접 명소(예: 趵突泉과 五龙潭은 이웃한 별개 공원), "
+                "같은 상호·같은 음식의 다른 가게/지점(예: 把子肉 파자육집들). "
+                "식당은 지점명·주소가 완전히 일치할 때만 동일 실체다. "
+                "사용자가 '다른 장소'라고 이의한 조합은 명백한 반증 없이 병합 금지. "
+                "정보가 풍부한 쪽을 target으로. 잘못 병합했으면 undo_merge로 되돌릴 것."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target_place_id": {"type": "integer"},
                     "source_place_id": {"type": "integer"},
-                    "reason": {"type": "string"},
+                    "reason": {"type": "string", "description": "동일 실체 근거 (웹 출처 포함)"},
                 },
                 "required": ["target_place_id", "source_place_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "undo_merge",
+            "description": (
+                "잘못된 병합을 되돌려 source 장소를 별개 핀으로 복구한다 "
+                "(제목·설명·이미지 원복). 사용자 이의가 '다른 장소/다른 지점'이라고 주장하고 "
+                "동일 실체라는 명백한 반증을 제시할 수 없으면 즉시 호출할 것. "
+                "reason에 분리 근거를 한국어로 기록."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_place_id": {
+                        "type": "integer",
+                        "description": "병합으로 사라진(merged) 쪽 장소 ID",
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["source_place_id"],
             },
         },
     },
@@ -289,7 +317,10 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "이의신청을 검토한 뒤 반영(resolved)/기각(dismissed)하고 신청자에게 결과 메시지를 보낸다. "
                 "open 이의를 끝내는 유일한 정상 경로. "
-                "잘못된 병합이면 설명 보완·별도 create_place 등으로 조치한 뒤 호출."
+                "사용자가 '다른 장소/다른 지점'이라고 주장하면 기본은 수용(resolved) — "
+                "잘못된 병합은 undo_merge로 분리한 뒤 호출한다. "
+                "기각(dismissed)은 동일 실체라는 명백한 웹 근거를 agent_note에 "
+                "제시할 수 있을 때만 허용된다. 거리·이름 유사만으로 기각 금지."
             ),
             "parameters": {
                 "type": "object",
@@ -894,6 +925,71 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         )
         db.commit()
         return {"ok": True, "target_id": target_id, "source_id": source_id}
+
+    if name == "undo_merge":
+        source_id = int(args["source_place_id"])
+        reason = str(args.get("reason") or "사용자 이의 수용")[:500]
+        source = db.query(Marker).filter(Marker.id == source_id).first()
+        if not source:
+            return {"error": "not_found"}
+        if source.merged_into_id is None:
+            return {"error": "not_merged", "detail": "이 장소는 병합된 상태가 아닙니다."}
+        merge_ev = None
+        merge_data: dict[str, Any] = {}
+        rows = (
+            db.query(PlaceEvent)
+            .filter(PlaceEvent.action == PlaceEventAction.merge)
+            .order_by(PlaceEvent.created_at.desc())
+            .all()
+        )
+        for ev in rows:
+            try:
+                data = json.loads(ev.payload or "{}")
+            except json.JSONDecodeError:
+                continue
+            if int(data.get("source_id") or 0) == source_id and not data.get("rolled_back"):
+                merge_ev, merge_data = ev, data
+                break
+        if merge_ev is not None:
+            target_id, detail = _rollback_merge(db, merge_data)
+            merge_data["rolled_back"] = True
+            merge_data["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
+            merge_data["rolled_back_by"] = "agent"
+            merge_ev.payload = json.dumps(merge_data, ensure_ascii=False)
+        else:
+            # 병합 이벤트를 못 찾으면 최소한 분리만 수행
+            target_id = source.merged_into_id
+            source.merged_into_id = None
+            detail = f"병합 해제(스냅샷 없음) #{source_id}"
+        log_place_event(
+            db,
+            place_id=source_id,
+            user=None,
+            action=PlaceEventAction.rollback,
+            summary=f"병합 취소: #{source_id} 분리 ({reason})"[:500],
+            payload={
+                "source_id": source_id,
+                "target_id": target_id,
+                "reason": reason,
+                "detail": detail,
+                "undone_event_id": merge_ev.id if merge_ev else None,
+            },
+            actor="agent",
+        )
+        db.flush()
+        notify_place_contributors(
+            db,
+            place_ids=[source_id] + ([target_id] if target_id else []),
+            kind=UserMessageKind.agent_merge,
+            title=f"병합이 취소되었습니다: {source.title}",
+            body=(
+                f"에이전트가 「{source.title}」(#{source_id})를 다시 별개 장소로 분리했습니다.\n"
+                f"사유: {reason}"
+            ),
+            place_id=source_id,
+        )
+        db.commit()
+        return {"ok": True, "source_id": source_id, "target_id": target_id, "detail": detail}
 
     if name == "update_place_context":
         pid = int(args["place_id"])
