@@ -384,16 +384,19 @@ export default function MapPage() {
   }
 
   function onGnb(tab: MobileTab) {
-    setMobileTab(tab);
     if (tab === "map") {
+      setMobileTab("map");
       setMoreOpen(false);
       setInboxOpen(false);
     } else if (tab === "inbox") {
+      setMobileTab("inbox");
       setInboxOpen(true);
       setMoreOpen(false);
     } else if (tab === "more") {
-      setMoreOpen(true);
+      // 더보기는 모달일 뿐이므로 탭 상태(mobileTab)는 바꾸지 않는다 — 닫으면 원래 화면 그대로
+      setMoreOpen((v) => !v);
       setInboxOpen(false);
+      setMobileTab((t) => (t === "inbox" ? "map" : t));
     }
   }
 
@@ -769,7 +772,7 @@ export default function MapPage() {
         </button>
         <button
           type="button"
-          className={mobileTab === "more" || moreOpen ? "is-active" : ""}
+          className={moreOpen ? "is-active" : ""}
           onClick={() => onGnb("more")}
         >
           <span>더보기</span>
