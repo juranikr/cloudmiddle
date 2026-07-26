@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -104,24 +105,30 @@ def _prefer_name(*candidates: str) -> str:
     return ""
 
 
-def _follow_redirects(url: str, max_hops: int = 8) -> str:
+def _follow_redirects(url: str, max_hops: int = 8, total_budget_s: float = 12.0) -> str:
+    """리다이렉트 추적. 서버 환경에서 amap이 응답을 지연시킬 수 있어 총 시간 예산을 강제한다
+    (게이트웨이 30초 타임아웃 전에 빨리 실패 → 텍스트 폴백 경로로 전환)."""
     ctx = ssl.create_default_context()
     cur = url
+    deadline = time.monotonic() + total_budget_s
     for _ in range(max_hops):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("공유 링크 연결이 시간 초과됐습니다")
         req = urllib.request.Request(
             cur,
             headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"},
             method="GET",
         )
         try:
-            with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            with urllib.request.urlopen(req, context=ctx, timeout=min(6.0, remaining)) as resp:
                 return resp.geturl()
         except urllib.error.HTTPError as exc:
             loc = exc.headers.get("Location")
             if not loc:
                 return cur
             cur = urljoin(cur, loc)
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise RuntimeError("공유 링크에 연결하지 못했습니다") from exc
     return cur
 
@@ -179,8 +186,12 @@ def _category_from_text(*parts: str) -> str:
 
 
 def _import_amap(url: str, original: str) -> ShareImportResult:
-    final = _follow_redirects(url)
-    parsed = _parse_amap_final(final)
+    try:
+        final = _follow_redirects(url)
+        parsed = _parse_amap_final(final)
+    except RuntimeError:
+        # 서버에서 amap 접속이 막히거나 지연되는 경우 — 본문 텍스트로 초안 폴백
+        return _import_amap_text_fallback(url, original)
     if not parsed:
         raise RuntimeError("고덕 링크에서 위치 정보를 읽지 못했습니다. 링크가 만료됐을 수 있습니다.")
 
@@ -213,6 +224,60 @@ def _import_amap(url: str, original: str) -> ShareImportResult:
         category_hint=category,
         needs_map_pick=False,
         note="고덕 공유에서 명칭·주소·좌표 초안을 만들었습니다. 유형만 확인하고 저장하세요.",
+    )
+
+
+def _import_amap_text_fallback(url: str, original: str) -> ShareImportResult:
+    """링크 추적 실패 시: 공유 본문의 제목·주소로 초안 구성, 가능하면 지오코딩."""
+    title, address, price_label, meta = _parse_share_body_lines(original, url)
+    if not title:
+        raise RuntimeError(
+            "고덕 링크에 연결하지 못했고 본문에서 이름도 찾지 못했습니다. "
+            "공유 텍스트 전체(이름·주소 포함)를 붙여넣어 주세요."
+        )
+
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    needs_pick = True
+    note = (
+        "고덕 링크 연결이 안 돼 본문 텍스트로 초안을 만들었습니다. "
+        "지도에서 위치를 탭해 핀을 놓고 저장하세요."
+    )
+    for q in filter(None, [f"{title} 济南", address and f"{address} 济南", address]):
+        try:
+            hits = search_address(q, limit=3)
+        except RuntimeError:
+            hits = []
+        if hits:
+            lat = hits[0]["lat"]
+            lng = hits[0]["lng"]
+            needs_pick = False
+            note = (
+                "고덕 링크 연결이 안 돼 본문 텍스트와 지오코딩으로 초안을 만들었습니다. "
+                "핀 위치가 맞는지 확인한 뒤 저장하세요."
+            )
+            break
+
+    desc_lines: list[str] = []
+    if price_label:
+        desc_lines.append(price_label)
+    elif meta:
+        desc_lines.append(meta)
+    if address:
+        desc_lines.append(address)
+    desc_lines.append(url)
+
+    return ShareImportResult(
+        source="amap",
+        title=title[:200],
+        description="\n".join(desc_lines)[:2000],
+        address=address,
+        source_url=url,
+        lat=lat,
+        lng=lng,
+        category_hint=_category_from_text(title, address, price_label, meta, original),
+        needs_map_pick=needs_pick,
+        note=note,
     )
 
 
