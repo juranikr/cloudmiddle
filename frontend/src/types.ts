@@ -37,6 +37,12 @@ export interface AdminStatus {
   agent_suggested_places?: number;
 }
 
+export interface PlaceEventChange {
+  field: string;
+  before?: unknown;
+  after?: unknown;
+}
+
 export interface PlaceEventItem {
   id: number;
   place_id: number | null;
@@ -45,6 +51,7 @@ export interface PlaceEventItem {
   actor: string;
   action: string;
   summary: string;
+  changes?: PlaceEventChange[];
   groq_read: boolean;
   created_at: string;
 }

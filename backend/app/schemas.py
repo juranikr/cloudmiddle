@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
@@ -161,6 +161,12 @@ class AppealOut(BaseModel):
     resolved_at: Optional[datetime] = None
 
 
+class PlaceEventChange(BaseModel):
+    field: str
+    before: Any = None
+    after: Any = None
+
+
 class PlaceEventOut(BaseModel):
     id: int
     place_id: Optional[int] = None
@@ -169,6 +175,7 @@ class PlaceEventOut(BaseModel):
     actor: str
     action: str
     summary: str
+    changes: list[PlaceEventChange] = []
     groq_read: bool = False
     created_at: datetime
 

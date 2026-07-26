@@ -9,7 +9,14 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.events import ensure_contributor, log_place_event, mark_events_read
+from app.events import (
+    diff_marker_fields,
+    ensure_contributor,
+    log_place_event,
+    mark_events_read,
+    marker_field_snapshot,
+    summary_for_changes,
+)
 from app.geocode import search_address
 from app.knowledge import list_knowledge, upsert_knowledge
 from app.messages import (
@@ -530,10 +537,11 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             target.title = combined[:200]
         if source.agent_context:
             target.agent_context = ((target.agent_context or "") + "\n" + source.agent_context).strip()[:8000]
-        for c in list(source.contributors):
-            ensure_contributor(db, target.id, c.user_id)
+        contributor_ids: set[int] = {c.user_id for c in list(source.contributors)}
         if source.user_id:
-            ensure_contributor(db, target.id, source.user_id)
+            contributor_ids.add(source.user_id)
+        for uid in sorted(contributor_ids):
+            ensure_contributor(db, target.id, uid)
         for img in list(source.images):
             img.place_id = target.id
             img.sort_order = 1000 + img.sort_order
@@ -578,21 +586,26 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
         if not m:
             return {"error": "not_found"}
-        before_ctx = m.agent_context or ""
+        before = marker_field_snapshot(m)
         # 덮어쓰기보다 병합 선호
         if m.agent_context and ctx and ctx not in m.agent_context:
             m.agent_context = (m.agent_context.rstrip() + "\n\n" + ctx).strip()[:8000]
         else:
             m.agent_context = ctx or m.agent_context
+        after = marker_field_snapshot(m)
+        changes = diff_marker_fields(before, after, keys=["agent_context"])
         log_place_event(
             db,
             place_id=pid,
             user=None,
             action=PlaceEventAction.context_update,
-            summary="에이전트 컨텍스트 보완",
+            summary=summary_for_changes("에이전트 컨텍스트 보완", changes),
             payload={
                 "chars": len(m.agent_context or ""),
-                "before": {"agent_context": before_ctx},
+                "before": before,
+                "after": after,
+                "changes": changes,
+                "fields": [c["field"] for c in changes],
             },
             actor="agent",
         )
@@ -604,7 +617,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
         if not m:
             return {"error": "not_found"}
-        before = marker_snapshot(m)
+        before = marker_field_snapshot(m)
         changed: dict[str, Any] = {}
         local_name = str(args.get("local_name") or "").strip()
         if local_name and local_name not in m.title:
@@ -631,13 +644,21 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
                 pass
         if not changed:
             return {"ok": True, "changed": {}}
+        after = marker_field_snapshot(m)
+        changes = diff_marker_fields(before, after)
         log_place_event(
             db,
             place_id=pid,
             user=None,
             action=PlaceEventAction.update,
-            summary="에이전트 정보 보완",
-            payload={**changed, "before": before},
+            summary=summary_for_changes("에이전트 정보 보완", changes),
+            payload={
+                **changed,
+                "before": before,
+                "after": after,
+                "changes": changes,
+                "fields": [c["field"] for c in changes],
+            },
             actor="agent",
         )
         db.commit()
@@ -772,13 +793,21 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
                 gk = groups.get(str(iid)) or groups.get(iid)
                 if gk is not None:
                     by_id[iid].group_key = str(gk)[:100]
+        before_ids = [i.id for i in sorted(images, key=lambda x: x.sort_order)]
+        changes = [{"field": "image_ids", "before": before_ids, "after": ordered}]
         log_place_event(
             db,
             place_id=pid,
             user=None,
             action=PlaceEventAction.image_reorder,
             summary="에이전트 이미지 순서 조정",
-            payload={"ordered_ids": ordered, "before": {"image_orders": before_orders}},
+            payload={
+                "ordered_ids": ordered,
+                "before": {"image_orders": before_orders},
+                "after": {"image_ids": ordered},
+                "changes": changes,
+                "fields": ["image_ids"],
+            },
             actor="agent",
         )
         db.commit()

@@ -872,6 +872,34 @@ textarea {
   word-break: break-word;
 }
 
+.panel__history-changes {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.panel__history-changes li {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 0.78rem;
+}
+
+.panel__history-field {
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.panel__history-diff {
+  color: inherit;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
 .panel__history-list time {
   color: var(--muted);
   font-size: 0.75rem;

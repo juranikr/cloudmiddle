@@ -13,7 +13,14 @@ from app.agent.runner import run_agent
 from app.auth import create_access_token, get_admin_user, get_current_user, verify_password
 from app.config import settings
 from app.db import Base, SessionLocal, engine, get_db
-from app.events import ensure_contributor, log_place_event
+from app.events import (
+    changes_from_payload,
+    diff_marker_fields,
+    ensure_contributor,
+    log_place_event,
+    marker_field_snapshot,
+    summary_for_changes,
+)
 from app.geocode import search_address
 from app.messages import create_appeal
 from app.migrate import ensure_schema
@@ -324,6 +331,22 @@ def list_marker_events(
             actor_name = "시스템"
         else:
             actor_name = names.get(e.user_id or -1, "사용자")
+        try:
+            payload = json.loads(e.payload or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        changes = changes_from_payload(payload)
+        # merge 등: 요약용 힌트만
+        if not changes and e.action == PlaceEventAction.merge:
+            changes = [
+                {
+                    "field": "merge",
+                    "before": payload.get("source_id"),
+                    "after": payload.get("target_id"),
+                }
+            ]
         out.append(
             PlaceEventOut(
                 id=e.id,
@@ -333,6 +356,7 @@ def list_marker_events(
                 actor=e.actor,
                 action=e.action.value if e.action else "",
                 summary=e.summary or "",
+                changes=changes,
                 groq_read=e.groq_read_at is not None,
                 created_at=e.created_at,
             )
@@ -367,9 +391,11 @@ def update_marker(
             data["lat"] = lat
             data["lng"] = lng
 
-    before = {"title": marker.title, "category": marker.category.value}
+    before = marker_field_snapshot(marker)
     for key, value in data.items():
         setattr(marker, key, value)
+    after = marker_field_snapshot(marker)
+    changes = diff_marker_fields(before, after)
 
     ensure_contributor(db, marker.id, current_user.id)
     log_place_event(
@@ -377,8 +403,13 @@ def update_marker(
         place_id=marker.id,
         user=current_user,
         action=PlaceEventAction.update,
-        summary=f"장소 수정: {marker.title}",
-        payload={"before": before, "changes": list(data.keys())},
+        summary=summary_for_changes("장소 수정", changes) if changes else f"장소 수정: {marker.title}",
+        payload={
+            "before": before,
+            "after": after,
+            "changes": changes,
+            "fields": [c["field"] for c in changes],
+        },
     )
     db.commit()
     marker = _load_place(db, marker_id)
@@ -435,13 +466,14 @@ def presign_image(
     db.add(img)
     db.flush()
     ensure_contributor(db, marker_id, current_user.id)
+    changes = [{"field": "image_id", "before": None, "after": img.id}]
     log_place_event(
         db,
         place_id=marker_id,
         user=current_user,
         action=PlaceEventAction.image_add,
         summary="이미지 추가",
-        payload={"image_id": img.id, "s3_key": key},
+        payload={"image_id": img.id, "s3_key": key, "changes": changes, "fields": ["image_id"]},
     )
     db.commit()
     return ImageUploadResponse(
@@ -462,18 +494,26 @@ def reorder_images(
     marker = db.query(Marker).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first()
     if marker is None:
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    before_ids = [i.id for i in sorted(marker.images, key=lambda x: x.sort_order)]
     by_id = {i.id: i for i in marker.images}
     for idx, iid in enumerate(body.image_ids):
         if iid in by_id:
             by_id[iid].sort_order = idx
     ensure_contributor(db, marker_id, current_user.id)
+    changes = [{"field": "image_ids", "before": before_ids, "after": list(body.image_ids)}]
     log_place_event(
         db,
         place_id=marker_id,
         user=current_user,
         action=PlaceEventAction.image_reorder,
         summary="이미지 순서 변경",
-        payload={"image_ids": body.image_ids},
+        payload={
+            "image_ids": body.image_ids,
+            "before": {"image_ids": before_ids},
+            "after": {"image_ids": list(body.image_ids)},
+            "changes": changes,
+            "fields": ["image_ids"],
+        },
     )
     db.commit()
     marker = _load_place(db, marker_id)

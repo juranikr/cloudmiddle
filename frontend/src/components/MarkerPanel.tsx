@@ -27,6 +27,26 @@ const ACTION_LABEL: Record<string, string> = {
   rollback: "롤백",
 };
 
+const FIELD_LABEL: Record<string, string> = {
+  title: "제목",
+  description: "설명",
+  category: "분류",
+  lat: "위도",
+  lng: "경도",
+  polygon: "구역",
+  agent_context: "정리 메모",
+  image_ids: "사진 순서",
+  image_id: "사진",
+  merge: "병합",
+};
+
+function truncVal(v: unknown, max = 80): string {
+  if (v == null) return "—";
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length > max ? `${one.slice(0, max)}…` : one;
+}
+
 export interface CreateDefaults {
   title?: string;
   description?: string;
@@ -302,6 +322,20 @@ export default function MarkerPanel({
                           {!ev.groq_read ? <em>에이전트 미확인</em> : null}
                         </div>
                         <p>{ev.summary}</p>
+                        {ev.changes && ev.changes.length > 0 ? (
+                          <ul className="panel__history-changes">
+                            {ev.changes.map((ch, idx) => (
+                              <li key={`${ev.id}-${ch.field}-${idx}`}>
+                                <span className="panel__history-field">
+                                  {FIELD_LABEL[ch.field] ?? ch.field}
+                                </span>
+                                <span className="panel__history-diff">
+                                  {truncVal(ch.before)} → {truncVal(ch.after)}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
                         <time dateTime={ev.created_at}>
                           {new Date(ev.created_at).toLocaleString("ko-KR")}
                         </time>

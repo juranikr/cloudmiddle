@@ -245,6 +245,10 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                     }
                 )
     except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         detail = str(exc)
         if "model_permission_blocked" in detail or "blocked at the project" in detail:
             detail = (
@@ -253,12 +257,16 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                 "or change Secrets GROQ_MODEL. "
                 f"Detail: {exc}"
             )
+        try:
+            unread_after = count_unread(db)
+        except Exception:
+            unread_after = unread_before
         return {
             "ok": False,
             "steps": steps,
             "message": detail[:1500],
             "unread_before": unread_before,
-            "unread_after": count_unread(db),
+            "unread_after": unread_after,
         }
 
     unread_after = count_unread(db)

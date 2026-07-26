@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 에이전트 작업 큐 전원 처리
+최종 갱신: 2026-07-26 (KST) — 기여 명단 vs 수정 이력 정리
 
 ---
 
@@ -174,6 +174,12 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 기여 명단 vs 수정 이력
+- `place_contributors`: 알림용 distinct 명단(유니크 유지). `place_events`: 반복 기여·수정 이력
+- 에이전트 500 원인: merge 시 동일 (place,user) 중복 INSERT → ensure_contributor pending 가드 + set 병합
+- runner 예외 시 `db.rollback()` 후 unread 집계
+- update/agent 수정 payload에 before/after/changes 기록, API·MarkerPanel 이력에 필드별 diff 표시
 
 ### 2026-07-26 — 에이전트 작업 큐 전원 처리
 - 원인: ReAct가 큐를 안 보고도 종료 가능, 넛지는 KB만, max_steps=12로 조기 종료, 프롬프트에 ID 목록 없음
