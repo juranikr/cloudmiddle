@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Optional
+import threading
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, EmailStr, Field
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.agent.runner import count_unread, run_agent
 from app.auth import get_admin_user, hash_password
 from app.config import settings
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import AgentKnowledge, Marker, PlaceAppeal, PlaceAppealStatus, PlaceEvent, User
 from app.knowledge import list_knowledge
 from app.rollback import is_rollbackable, list_agent_actions, rollback_event
@@ -76,13 +77,77 @@ def admin_status(
     )
 
 
-@router.post("/agent/run", response_model=AgentRunResponse)
+class AgentRunStatusOut(BaseModel):
+    running: bool
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    result: Optional[AgentRunResponse] = None
+
+
+# 게이트웨이(≈60초) 타임아웃 회피: 실행은 백그라운드 스레드, 관리자 UI는 상태 폴링
+_agent_run_lock = threading.Lock()
+_agent_run_state: dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "result": None,
+}
+
+
+def _agent_run_status() -> AgentRunStatusOut:
+    result = _agent_run_state["result"]
+    return AgentRunStatusOut(
+        running=bool(_agent_run_state["running"]),
+        started_at=_agent_run_state["started_at"],
+        finished_at=_agent_run_state["finished_at"],
+        result=AgentRunResponse(**result) if result else None,
+    )
+
+
+def _run_agent_background() -> None:
+    db = SessionLocal()
+    try:
+        result = run_agent(db)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "steps": 0,
+            "message": str(exc)[:1500],
+            "unread_before": 0,
+            "unread_after": 0,
+        }
+    finally:
+        db.close()
+    _agent_run_state["result"] = result
+    _agent_run_state["finished_at"] = datetime.now(timezone.utc)
+    _agent_run_state["running"] = False
+
+
+@router.post("/agent/run", response_model=AgentRunStatusOut)
 def admin_run_agent(
-    db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
-) -> AgentRunResponse:
+) -> AgentRunStatusOut:
     _ = admin
-    return AgentRunResponse(**run_agent(db))
+    with _agent_run_lock:
+        if not _agent_run_state["running"]:
+            _agent_run_state.update(
+                {
+                    "running": True,
+                    "started_at": datetime.now(timezone.utc),
+                    "finished_at": None,
+                    "result": None,
+                }
+            )
+            threading.Thread(target=_run_agent_background, daemon=True).start()
+    return _agent_run_status()
+
+
+@router.get("/agent/run/status", response_model=AgentRunStatusOut)
+def admin_agent_run_status(
+    admin: User = Depends(get_admin_user),
+) -> AgentRunStatusOut:
+    _ = admin
+    return _agent_run_status()
 
 
 @router.get("/knowledge", response_model=list[AgentKnowledgeOut])

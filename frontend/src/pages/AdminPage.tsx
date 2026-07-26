@@ -52,12 +52,26 @@ export default function AdminPage() {
     if (!confirm("에이전트를 지금 실행할까요? (Groq 호출·지도 변경 가능)")) return;
     setBusy(true);
     setError("");
-    setInfo("");
+    setInfo("실행 중… (수 분 걸릴 수 있습니다)");
     try {
-      const r = await api.runAdminAgent(token);
-      setInfo(
-        `${r.ok ? "완료" : "실패"} · steps ${r.steps} · unread ${r.unread_before}→${r.unread_after}\n${r.message}`,
-      );
+      await api.startAdminAgent(token);
+      // 백그라운드 실행 → 끝날 때까지 3초 간격 폴링 (최대 10분)
+      const deadline = Date.now() + 10 * 60 * 1000;
+      let status = await api.fetchAdminAgentStatus(token);
+      while (status.running && Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 3000));
+        status = await api.fetchAdminAgentStatus(token);
+      }
+      const r = status.result;
+      if (r) {
+        setInfo(
+          `${r.ok ? "완료" : "실패"} · steps ${r.steps} · unread ${r.unread_before}→${r.unread_after}\n${r.message}`,
+        );
+      } else if (status.running) {
+        setInfo("아직 실행 중입니다. 잠시 후 새로고침으로 결과를 확인하세요.");
+      } else {
+        setInfo("실행 결과를 확인하지 못했습니다. 새로고침해 주세요.");
+      }
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : "에이전트 실행 실패");

@@ -234,15 +234,31 @@ export async function fetchAdminStatus(token: string): Promise<AdminStatus> {
   return handle<AdminStatus>(res);
 }
 
-export async function runAdminAgent(token: string): Promise<{
+export interface AgentRunResult {
   ok: boolean;
   steps: number;
   message: string;
   unread_before: number;
   unread_after: number;
-}> {
+}
+
+export interface AgentRunStatus {
+  running: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+  result: AgentRunResult | null;
+}
+
+export async function startAdminAgent(token: string): Promise<AgentRunStatus> {
   const res = await request("/api/admin/agent/run", {
     method: "POST",
+    headers: authHeaders(token),
+  });
+  return handle(res);
+}
+
+export async function fetchAdminAgentStatus(token: string): Promise<AgentRunStatus> {
+  const res = await request("/api/admin/agent/run/status", {
     headers: authHeaders(token),
   });
   return handle(res);
