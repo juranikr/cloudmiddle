@@ -40,9 +40,14 @@ function findZoneAt(point: LatLng, zones: MarkerItem[]): MarkerItem | null {
   return null;
 }
 
+function touchCount(e: MouseEvent | TouchEvent): number {
+  return "touches" in e ? e.touches.length : 1;
+}
+
 /**
  * 원인: 지도 dragging이 작은 움직임에도 Leaflet vector click을 취소함.
  * 해결: 탭이면 point-in-polygon으로 구역을 직접 선택.
+ * 멀티터치(핀치 줌)는 그리기로 취급하지 않음.
  */
 export default function ZoneDrawer({ active, zones, onDrawn, onZoneTap }: Props) {
   const map = useMap();
@@ -77,6 +82,18 @@ export default function ZoneDrawer({ active, zones, onDrawn, onZoneTap }: Props)
       map.touchZoom.enable();
       map.doubleClickZoom.enable();
       map.scrollWheelZoom.enable();
+    };
+
+    /** 핀치 줌 등으로 그리기/트래킹 중단 — 구역 생성·탭 선택 없음 */
+    const abortStroke = () => {
+      if (!tracking && !drawing) return;
+      tracking = false;
+      drawing = false;
+      startClient = null;
+      startLatLng = null;
+      points = [];
+      clearLine();
+      restoreMapGestures();
     };
 
     const clientXY = (e: MouseEvent | TouchEvent): { x: number; y: number } | null => {
@@ -115,6 +132,11 @@ export default function ZoneDrawer({ active, zones, onDrawn, onZoneTap }: Props)
 
     const start = (e: MouseEvent | TouchEvent) => {
       if ("button" in e && e.button !== 0) return;
+      // 두 번째 손가락이 내려오면 핀치 줌 — 진행 중 스트로크 취소
+      if (touchCount(e) > 1) {
+        abortStroke();
+        return;
+      }
       const xy = clientXY(e);
       const p = toLatLng(e);
       if (!xy || !p) return;
@@ -133,6 +155,10 @@ export default function ZoneDrawer({ active, zones, onDrawn, onZoneTap }: Props)
 
     const move = (e: MouseEvent | TouchEvent) => {
       if (!tracking || !startClient) return;
+      if (touchCount(e) > 1) {
+        abortStroke();
+        return;
+      }
       const xy = clientXY(e);
       if (!xy) return;
 
@@ -151,6 +177,13 @@ export default function ZoneDrawer({ active, zones, onDrawn, onZoneTap }: Props)
 
     const end = (e: MouseEvent | TouchEvent) => {
       if (!tracking) return;
+
+      // touchend 후 남은 손가락이 있으면 멀티터치 제스처로 보고 취소
+      if ("touches" in e && e.touches.length > 0) {
+        abortStroke();
+        return;
+      }
+
       tracking = false;
 
       if (!drawing) {
