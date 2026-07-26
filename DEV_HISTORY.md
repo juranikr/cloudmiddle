@@ -181,6 +181,8 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 - update_place_fields에 replace_description 추가: agent 장소 또는 한국어 없는 설명만 전면 재작성 허용,
   사용자가 쓴 한국어 설명은 보호(user_content_protected)
 - 연구 사이클에 언어 정비 단계 추가: 기존 중국어/영어 위주 장소를 규칙대로 재작성
+- 운영 정비 완료: 에이전트 3회 실행으로 중국어 설명 전량 한국어화(百花洲·宽厚里 등),
+  영문 브랜드 핀 4곳(MixC·Lixia·HeyTea·Qingguohui)은 API로 한국어 병기 직접 추가 → 위반 0건
 
 ### 2026-07-26 — 웹 스크래핑 조사 필수화 + 조사 이력 기록
 - 새 테이블: agent_search_logs(검색어·시각·새 콘텐츠 수확량), agent_web_visits(열람 URL·횟수, unique)
