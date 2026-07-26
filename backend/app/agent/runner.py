@@ -438,15 +438,19 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     unread_after = count_unread(db)
     ok = unread_after == 0
     summary = final_text or "에이전트 사이클 완료"
+    if tool_counts:
+        stats = ", ".join(f"{t}×{c}" for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]))
+        summary = f"{summary}\n[작업 통계] {stats}"
     if unread_after > 0:
         summary = (
             f"미처리 {unread_after}건 잔존 (시작 {unread_before}건, steps={steps}). "
             f"{summary}"
-        )[:1500]
+        )
     return {
         "ok": ok,
         "steps": steps,
-        "message": summary,
+        "message": summary[:1500],
         "unread_before": unread_before,
         "unread_after": unread_after,
+        "tool_counts": tool_counts,
     }
