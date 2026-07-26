@@ -269,8 +269,9 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             try:
                 extra: dict[str, Any] = {}
                 if "gpt-oss" in model:
-                    # 병합 판단 등 미묘한 결정의 품질을 위해 추론 강도 상향
-                    extra["reasoning_effort"] = "high"
+                    # 병합 판단 등 미묘한 결정의 품질을 위해 추론 강도 상향.
+                    # extra_body 경유: 구버전 groq SDK도 통과시킨다.
+                    extra["extra_body"] = {"reasoning_effort": "high"}
                 resp = client.chat.completions.create(
                     model=model,
                     messages=messages,
