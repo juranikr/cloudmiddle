@@ -116,6 +116,10 @@ class Marker(Base):
         ForeignKey("markers.id", ondelete="SET NULL"), nullable=True, index=True
     )
     is_agent_suggested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 에이전트가 마지막으로 유효성(폐업·이전 여부)을 재검증한 시각
+    last_verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

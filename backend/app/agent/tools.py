@@ -6,7 +6,7 @@ import json
 import math
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session, joinedload
@@ -411,6 +411,57 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["place_id", "image_url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_stale_places",
+            "description": (
+                "추가/수정/재검증된 지 오래된(기본 30일 이상) 활성 장소를 오래된 순으로 반환한다. "
+                "이 장소들은 폐업·이전 가능성이 있으므로 web_search로 유효성을 재확인하고 "
+                "결과를 verify_place로 기록할 것. 사이클당 3~5곳이면 충분하다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "default": 30, "description": "이 일수 이상 미확인 장소만"},
+                    "limit": {"type": "integer", "default": 10},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_place",
+            "description": (
+                "장소 재검증 결과를 기록한다(last_verified_at 갱신 → 재검증 목록에서 제외). "
+                "status: valid(영업·존재 확인) | closed(폐업·소멸 추정) | moved(같은 지점의 이전 확인) "
+                "| uncertain(판단 불가). "
+                "주의 — moved로 판정하기 전에 반드시 한 번 더 검토: 웹에서 찾은 다른 주소가 "
+                "'같은 지점의 이전(搬迁)'인지 '다른 지점(분점)'인지 구분할 것. "
+                "체인점이면 지점명·구(区)·도로명을 대조하고, 다른 지점이면 moved가 아니라 "
+                "valid + note로 기록하고 좌표를 옮기지 말 것. "
+                "같은 지점의 이전이 확실할 때만 geocode_place→update_place_fields로 좌표를 "
+                "갱신한 뒤 moved로 기록한다. closed는 삭제하지 말고 기록만 남긴다. "
+                "closed/moved/uncertain의 note는 agent_context에 자동 병합된다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_id": {"type": "integer"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["valid", "closed", "moved", "uncertain"],
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "판단 근거·출처. closed/moved/uncertain은 필수 권장",
+                    },
+                },
+                "required": ["place_id", "status"],
             },
         },
     },
@@ -1076,5 +1127,76 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         )
         db.commit()
         return {"ok": True, "image_id": img.id, "url": storage.public_url(key)}
+
+    if name == "list_stale_places":
+        days = max(7, int(args.get("days") or 30))
+        limit = max(1, min(int(args.get("limit") or 10), 50))
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=days)
+        rows = db.query(Marker).filter(Marker.merged_into_id.is_(None)).all()
+        stale: list[dict[str, Any]] = []
+        for m in rows:
+            candidates = [t for t in (m.updated_at, m.last_verified_at, m.created_at) if t]
+            if not candidates:
+                continue
+            last_checked = max(
+                t if t.tzinfo else t.replace(tzinfo=timezone.utc) for t in candidates
+            )
+            if last_checked >= cutoff:
+                continue
+            stale.append(
+                {
+                    **_place_brief(m),
+                    "last_checked_at": last_checked.isoformat(),
+                    "days_since_check": (now - last_checked).days,
+                }
+            )
+        stale.sort(key=lambda x: x["days_since_check"], reverse=True)
+        return stale[:limit]
+
+    if name == "verify_place":
+        pid = int(args["place_id"])
+        status = str(args.get("status") or "").strip()
+        note = str(args.get("note") or "").strip()[:1000]
+        if status not in ("valid", "closed", "moved", "uncertain"):
+            return {"error": "bad_status"}
+        m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
+        if not m:
+            return {"error": "not_found"}
+        before = marker_field_snapshot(m)
+        now = datetime.now(timezone.utc)
+        m.last_verified_at = now
+        tag = {
+            "valid": "정보 유효",
+            "closed": "폐업 추정",
+            "moved": "이전 확인",
+            "uncertain": "확인 필요",
+        }[status]
+        if status != "valid" and note:
+            line = f"[재검증 {now.strftime('%Y-%m-%d')} · {tag}] {note}"
+            if line not in (m.agent_context or ""):
+                m.agent_context = ((m.agent_context or "").rstrip() + "\n\n" + line).strip()[
+                    :8000
+                ]
+        after = marker_field_snapshot(m)
+        changes = diff_marker_fields(before, after, keys=["agent_context"])
+        log_place_event(
+            db,
+            place_id=pid,
+            user=None,
+            action=PlaceEventAction.context_update,
+            summary=f"재검증({tag}): {m.title}",
+            payload={
+                "verify_status": status,
+                "note": note,
+                "before": before,
+                "after": after,
+                "changes": changes,
+                "fields": [c["field"] for c in changes],
+            },
+            actor="agent",
+        )
+        db.commit()
+        return {"ok": True, "status": status, "last_verified_at": now.isoformat()}
 
     return {"error": f"unknown_tool:{name}"}

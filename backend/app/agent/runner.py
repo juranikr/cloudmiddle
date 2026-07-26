@@ -36,6 +36,14 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 - 반대로 50m 이내라도 명칭·성격이 다르면 별개 장소로 유지한다.
 - 병합 방향: 정보가 풍부한 쪽(설명·이미지·기여자)을 target으로.
 
+【오래된 데이터 재검증】
+- list_stale_places(기본 30일)로 오래 확인 안 된 장소를 받아 사이클당 3~5곳을 web_search로 재확인한다.
+- 영업·존재 확인 → verify_place(valid). 폐업·소멸 정황 → verify_place(closed, note). 삭제하지 말 것.
+- 이전(搬迁) 의심 → 반드시 한 번 더 검토: 같은 지점의 이전인지, 다른 지점(분점)인지 구분.
+  체인점이면 지점명·구(区)·도로명을 대조. 다른 지점이면 좌표 유지 + verify_place(valid, note).
+  같은 지점의 이전이 확실할 때만 geocode_place→update_place_fields로 좌표·주소 갱신 후 verify_place(moved, note).
+- 판단이 안 서면 verify_place(uncertain, note)로 남기고 다음 사이클로 넘긴다.
+
 【지식베이스 — 필수】
 - 작업 시작 시 list_knowledge를 호출한다.
 - 사이클이 끝나기 전에 upsert_knowledge를 최소 1회 이상 호출한다.
@@ -52,11 +60,13 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 2) 작업 큐의 이의신청 전원 resolve_appeal
 3) 작업 큐의 미읽음 이벤트 전원 검토·조치 → mark_events_read
 4) (큐가 비었을 때만) 전체 지도 중복 스캔(list_places로 동명·동의어 장소) → 병합
-5) 사진 보강: image_count가 0인 장소 1~3곳 → search_place_images(중국어 명칭) →
+5) 재검증: list_stale_places → 3~5곳 web_search 재확인 → verify_place
+   (이전 의심 시 지점 구분 재검토 필수)
+6) 사진 보강: image_count가 0인 장소 1~3곳 → search_place_images(중국어 명칭) →
    attach_image_from_url (위키미디어 자유 라이선스만, source에 출처 기록)
-6) web_search → create_place 소수 → upsert_knowledge
-7) agent_context 보완
-8) upsert_knowledge 최종 정리 후 한 줄 요약
+7) web_search → create_place 소수 → upsert_knowledge
+8) agent_context 보완
+9) upsert_knowledge 최종 정리 후 한 줄 요약
 """
 
 
@@ -139,7 +149,8 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     base_steps = max_steps or settings.agent_max_steps
     # 작업 건수에 비례해 스텝 확보 (건당 ~4 + 지식/롤백 오버헤드)
     if research_only:
-        steps_limit = max(base_steps, 10)
+        # 재검증 + 사진 보강 + 조사까지 수행하므로 여유 확보
+        steps_limit = max(base_steps, 18)
     else:
         steps_limit = max(base_steps, min(48, 10 + unread_before * 4))
 
@@ -151,11 +162,15 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "1) list_knowledge / list_places로 현황 파악\n"
             "2) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
             "같은 실체면 거리와 무관하게 merge_places (거리 기준으로 건너뛰지 말 것)\n"
-            "3) 사진 보강: image_count가 0인 장소 1~3곳을 골라 search_place_images(중국어 명칭) → "
+            "3) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 3~5곳을 web_search로 "
+            "재확인 → verify_place(valid|closed|moved|uncertain + note). "
+            "이전(搬迁) 의심이면 같은 지점의 이전인지 다른 지점(분점)인지 반드시 구분하고, "
+            "같은 지점 이전이 확실할 때만 좌표를 갱신할 것\n"
+            "4) 사진 보강: image_count가 0인 장소 1~3곳을 골라 search_place_images(중국어 명칭) → "
             "attach_image_from_url로 업로드 (자유 라이선스만, source에 출처·라이선스 기록)\n"
-            "4) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
-            "5) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
-            "6) 조사·추가에서 배운 점을 upsert_knowledge로 병합 (빠뜨리면 실패)\n"
+            "5) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
+            "6) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
+            "7) 조사·추가에서 배운 점을 upsert_knowledge로 병합 (빠뜨리면 실패)\n"
             "끝나면 한 줄 요약."
         )
     else:

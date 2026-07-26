@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 에이전트 웹 이미지 보강
+최종 갱신: 2026-07-26 (KST) — 오래된 장소 재검증 로직
 
 ---
 
@@ -174,6 +174,14 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 오래된 장소 재검증 로직
+- markers.last_verified_at 컬럼 추가 (멱등 마이그레이션)
+- 새 툴: list_stale_places(30일 이상 미확인, 오래된 순) / verify_place(valid|closed|moved|uncertain)
+- moved 판정 전 지점(분점) 구분 재검토 강제: 다른 지점이면 좌표 유지 + note, 같은 지점 이전 확실할 때만 좌표 갱신
+- closed는 삭제 금지, note는 agent_context에 자동 병합, 이벤트(context_update)로 이력 기록
+- 연구 사이클에 재검증 단계(3~5곳) 추가, steps_limit 10→18
+- 참고: 07-26 03:00 KST 자동 실행은 uq_place_user 중복 키 버그로 크래시 (같은 날 낮에 수정 배포됨)
 
 ### 2026-07-26 — 에이전트 웹 이미지 보강
 - 새 툴: search_place_images(위키미디어 커먼즈, 자유 라이선스) / attach_image_from_url(S3 업로드)

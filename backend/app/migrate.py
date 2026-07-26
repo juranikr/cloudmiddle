@@ -19,6 +19,13 @@ def ensure_schema() -> None:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN agent_context TEXT DEFAULT '' NOT NULL"))
             if "merged_into_id" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN merged_into_id INTEGER"))
+            if "last_verified_at" not in cols:
+                col_type = (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if engine.dialect.name == "postgresql"
+                    else "TIMESTAMP"
+                )
+                conn.execute(text(f"ALTER TABLE markers ADD COLUMN last_verified_at {col_type}"))
             if "is_agent_suggested" not in cols:
                 # Postgres는 boolean 기본값에 FALSE 필요 (0은 integer로 거부됨)
                 default = "FALSE" if engine.dialect.name == "postgresql" else "0"
