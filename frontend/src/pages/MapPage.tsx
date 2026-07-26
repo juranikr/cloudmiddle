@@ -40,6 +40,7 @@ const INITIAL_VIEW = loadMapView({ center: JINAN_CENTER, zoom: DEFAULT_ZOOM });
 type ToolMode = "pin" | "zone";
 type PanelMode = "create" | "view" | "edit" | null;
 type DraftKind = "point" | "polygon" | null;
+type MobileTab = "map" | "add" | "fav" | "inbox" | "more";
 
 function MapClickHandler({
   enabled,
@@ -60,18 +61,13 @@ function MapClickHandler({
       onPick(e.latlng.lat, e.latlng.lng);
     },
   });
-
   return null;
 }
 
-/** 레이아웃/회전 후 타일 깨짐 방지 + retina 타일 선명도 */
 function MapVisualFix() {
   const map = useMap();
-
   useEffect(() => {
-    const refresh = () => {
-      map.invalidateSize({ animate: false });
-    };
+    const refresh = () => map.invalidateSize({ animate: false });
     refresh();
     window.addEventListener("orientationchange", refresh);
     window.addEventListener("resize", refresh);
@@ -82,7 +78,6 @@ function MapVisualFix() {
       window.clearTimeout(t);
     };
   }, [map]);
-
   return null;
 }
 
@@ -121,12 +116,29 @@ export default function MapPage() {
   const [locateBusy, setLocateBusy] = useState(false);
   const [locateMsg, setLocateMsg] = useState("");
   const [searchPin, setSearchPin] = useState<(LatLng & { label: string }) | null>(null);
+  const [searchHits, setSearchHits] = useState<GeocodeHit[]>([]);
+  const [searchError, setSearchError] = useState("");
+  const [searchSheetOpen, setSearchSheetOpen] = useState(false);
   const [createDefaults, setCreateDefaults] = useState<CreateDefaults | null>(null);
   const [awaitingImportPick, setAwaitingImportPick] = useState(false);
   const pendingImportPick = useRef(false);
   const [flyTarget, setFlyTarget] = useState<LatLng | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [unreadMsg, setUnreadMsg] = useState(0);
+  const [mobileTab, setMobileTab] = useState<MobileTab>("map");
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(() =>
+    typeof window !== "undefined" ? window.matchMedia("(min-width: 860px)").matches : true,
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 860px)");
+    const onChange = () => setIsDesktop(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
   const ignoreNextClick = useRef(false);
   const searchIcon = useMemo(() => getSearchResultIcon(), []);
 
@@ -177,6 +189,13 @@ export default function MapPage() {
     setDraftPolygon(null);
   }
 
+  function clearSearch() {
+    setSearchPin(null);
+    setSearchHits([]);
+    setSearchError("");
+    setSearchSheetOpen(false);
+  }
+
   function placePinDraft(lat: number, lng: number, options?: { openCreate?: boolean }) {
     const forceCreate = Boolean(options?.openCreate || pendingImportPick.current);
     if (panelOpen && !forceCreate) return;
@@ -205,8 +224,10 @@ export default function MapPage() {
   function openView(marker: MarkerItem) {
     ignoreNextClick.current = true;
     clearDraft();
+    setSearchSheetOpen(false);
     setSelected(marker);
     setPanelMode("view");
+    setMobileTab("map");
   }
 
   function closePanel() {
@@ -216,6 +237,7 @@ export default function MapPage() {
     pendingImportPick.current = false;
     setAwaitingImportPick(false);
     clearDraft();
+    clearSearch();
   }
 
   function openCreateForm() {
@@ -253,15 +275,28 @@ export default function MapPage() {
     setCreateDefaults(null);
     pendingImportPick.current = false;
     setAwaitingImportPick(false);
+    setAddOpen(false);
+  }
+
+  function handleSearchResults(hits: GeocodeHit[], err: string) {
+    setSearchHits(hits);
+    setSearchError(err);
+    setSearchSheetOpen(true);
+    setPanelMode(null);
+    setSelected(null);
+    if (hits[0]) {
+      setFlyTarget({ lat: hits[0].lat, lng: hits[0].lng });
+    }
   }
 
   function handleSearchPick(hit: GeocodeHit) {
     const point = { lat: hit.lat, lng: hit.lng };
     setSearchPin({ ...point, label: hit.display_name });
     setFlyTarget(point);
-    if (toolMode === "pin" && !panelOpen) {
-      placePinDraft(hit.lat, hit.lng);
-    }
+    setSearchSheetOpen(false);
+    setSelected(null);
+    setPanelMode(null);
+    clearDraft();
   }
 
   function handleShareImported(result: ShareImportResult) {
@@ -279,6 +314,7 @@ export default function MapPage() {
     setToolMode("pin");
     setSelected(null);
     setError(result.note);
+    setMoreOpen(false);
 
     if (result.lat != null && result.lng != null && !result.needs_map_pick) {
       pendingImportPick.current = false;
@@ -319,9 +355,7 @@ export default function MapPage() {
       setError("");
       return;
     }
-
     const gate = canUseGeolocation();
-    // 아이폰 + http://192.168… : OS가 GPS를 막음 → 개발용 가상 위치로 대체
     if (!gate.ok) {
       setLocateSimulate(true);
       setLocateFollowOnce(false);
@@ -331,7 +365,6 @@ export default function MapPage() {
       setLocateMsg("가상 위치(HTTP 개발용) — 실제 GPS는 HTTPS/localhost에서만 가능");
       return;
     }
-
     setLocateBusy(true);
     setLocateMsg("위치 권한 요청 중…");
     setError("");
@@ -352,128 +385,262 @@ export default function MapPage() {
     }
   }
 
+  function onGnb(tab: MobileTab) {
+    setMobileTab(tab);
+    if (tab === "map") {
+      setAddOpen(false);
+      setMoreOpen(false);
+      setInboxOpen(false);
+      if (favoritesOnly) {
+        setFavoritesOnly(false);
+      }
+    } else if (tab === "add") {
+      setAddOpen(true);
+      setMoreOpen(false);
+      setInboxOpen(false);
+    } else if (tab === "fav") {
+      setFavoritesOnly(true);
+      setAgentSuggestedOnly(false);
+      setCategoryFilter(null);
+      setAddOpen(false);
+      setMoreOpen(false);
+      setInboxOpen(false);
+      setPanelMode(null);
+    } else if (tab === "inbox") {
+      setInboxOpen(true);
+      setAddOpen(false);
+      setMoreOpen(false);
+    } else if (tab === "more") {
+      setMoreOpen(true);
+      setAddOpen(false);
+      setInboxOpen(false);
+    }
+  }
+
   const createShape: MarkerShape = draftKind === "polygon" ? "polygon" : "point";
+  const showSearchList = searchSheetOpen && (searchHits.length > 0 || !!searchError);
+  const showSearchCard = !!searchPin && !panelOpen && !showSearchList;
+
+  const filterChips = (
+    <div className="chips" role="list">
+      <button
+        type="button"
+        className={`chip ${categoryFilter === null && !favoritesOnly && !agentSuggestedOnly ? "is-active" : ""}`}
+        onClick={() => {
+          setCategoryFilter(null);
+          setFavoritesOnly(false);
+          setAgentSuggestedOnly(false);
+          setMobileTab("map");
+        }}
+      >
+        전체
+      </button>
+      <button
+        type="button"
+        className={`chip ${favoritesOnly ? "is-active" : ""}`}
+        onClick={() => {
+          setFavoritesOnly((v) => !v);
+          setAgentSuggestedOnly(false);
+          setMobileTab("fav");
+        }}
+      >
+        즐겨찾기
+      </button>
+      <button
+        type="button"
+        className={`chip ${agentSuggestedOnly ? "is-active" : ""}`}
+        onClick={() => {
+          setAgentSuggestedOnly((v) => !v);
+          setFavoritesOnly(false);
+        }}
+      >
+        추천
+      </button>
+      {CATEGORY_LIST.map((c) => (
+        <button
+          key={c}
+          type="button"
+          className={`chip ${categoryFilter === c ? "is-active" : ""}`}
+          style={{ "--chip-color": CATEGORY_META[c].color } as CSSProperties}
+          onClick={() => {
+            setCategoryFilter(c);
+            setFavoritesOnly(false);
+          }}
+        >
+          <i style={{ background: CATEGORY_META[c].color }} />
+          {CATEGORY_META[c].label}
+        </button>
+      ))}
+    </div>
+  );
+
+  const toolsBlock = (
+    <div className="side-tools">
+      <div className="seg seg--tools">
+        <button type="button" className={toolMode === "pin" ? "is-active" : ""} onClick={() => switchTool("pin")}>
+          핀 찍기
+        </button>
+        <button type="button" className={toolMode === "zone" ? "is-active" : ""} onClick={() => switchTool("zone")}>
+          구역 선택
+        </button>
+      </div>
+      <button
+        type="button"
+        className={`locate-btn ${locateOn ? "is-active" : ""}`}
+        onClick={() => void toggleLocate()}
+        disabled={locateBusy}
+      >
+        {locateBusy ? "요청 중…" : locateOn ? "위치 ON" : "내 위치"}
+      </button>
+      {token ? (
+        <ShareImport token={token} source="amap" placement="main" onImported={handleShareImported} />
+      ) : null}
+    </div>
+  );
+
+  const searchList = showSearchList ? (
+    <div className="result-list">
+      <div className="result-list__head">
+        <strong>검색 결과 {searchHits.length ? `(${searchHits.length})` : ""}</strong>
+        <button type="button" className="result-list__close" onClick={clearSearch} aria-label="검색 닫기">
+          닫기
+        </button>
+      </div>
+      {searchError ? <p className="result-list__empty">{searchError}</p> : null}
+      <ul>
+        {searchHits.map((hit) => (
+          <li key={`${hit.lat},${hit.lng},${hit.display_name}`}>
+            <button type="button" onClick={() => handleSearchPick(hit)}>
+              <strong>{hit.display_name.split(",")[0]}</strong>
+              <span>{hit.display_name}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ) : null;
+
+  const searchCard = showSearchCard ? (
+    <div className="search-card">
+      <div className="search-card__body">
+        <strong>{searchPin.label.split(",")[0]}</strong>
+        <span>{searchPin.label}</span>
+        <span className="search-card__coord">
+          {searchPin.lat.toFixed(5)}, {searchPin.lng.toFixed(5)}
+        </span>
+      </div>
+      <div className="search-card__actions">
+        <button
+          type="button"
+          className="btn btn--primary"
+          onClick={() => {
+            placePinDraft(searchPin.lat, searchPin.lng, { openCreate: true });
+          }}
+        >
+          여기에 등록
+        </button>
+        <button type="button" className="btn btn--ghost" onClick={clearSearch}>
+          닫기
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  const markerPanel = panelMode ? (
+    <MarkerPanel
+      mode={panelMode === "create" ? "create" : panelMode === "edit" ? "edit" : "view"}
+      shape={selected?.shape ?? createShape}
+      latlng={draftLatLng}
+      polygon={draftPolygon}
+      marker={selected}
+      createDefaults={createDefaults}
+      token={token}
+      canEdit={!!selected && !!user}
+      onClose={closePanel}
+      onCreate={handleCreate}
+      onUpdate={handleUpdate}
+      onDelete={handleDelete}
+      onStartEdit={() => setPanelMode("edit")}
+      onMarkerRefresh={(m) => {
+        setSelected(m);
+        setMarkers((prev) => prev.map((x) => (x.id === m.id ? m : x)));
+      }}
+    />
+  ) : null;
 
   return (
-    <div className={`map-app ${toolMode === "zone" ? "map-app--zone" : ""}`}>
-      <header className="topbar">
-        <div className="topbar__brand">
-          <strong>지난 여행 지도</strong>
-          <span>{user?.display_name}</span>
-        </div>
-        <div className="topbar__filters">
-          {user?.is_admin ? (
-            <a className="topbar__inbox" href="/admin">
-              관리
-            </a>
-          ) : null}
-          <button
-            type="button"
-            className={`topbar__inbox ${unreadMsg ? "has-unread" : ""}`}
-            onClick={() => setInboxOpen(true)}
-          >
-            메시지{unreadMsg ? ` (${unreadMsg})` : ""}
-          </button>
-          <button type="button" className="topbar__logout" onClick={logout}>
-            로그아웃
-          </button>
-        </div>
-
-        <div className="topbar__tools-row">
-          <div className="seg seg--tools">
-            <button
-              type="button"
-              className={toolMode === "pin" ? "is-active" : ""}
-              onClick={() => switchTool("pin")}
-            >
-              핀 찍기
-            </button>
-            <button
-              type="button"
-              className={toolMode === "zone" ? "is-active" : ""}
-              onClick={() => switchTool("zone")}
-            >
-              구역 선택
-            </button>
+    <div className={`map-app ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""}`}>
+      <aside className="map-side">
+        <div className="map-side__top">
+          <div className="map-side__brand">
+            <div>
+              <strong>지난 여행 지도</strong>
+              <span>{user?.display_name}</span>
+            </div>
+            <div className="map-side__brand-actions desktop-only">
+              {user?.is_admin ? (
+                <a className="link-btn" href="/admin">
+                  관리
+                </a>
+              ) : null}
+              <button type="button" className="link-btn" onClick={() => setInboxOpen(true)}>
+                메시지{unreadMsg ? ` (${unreadMsg})` : ""}
+              </button>
+              <button type="button" className="link-btn" onClick={logout}>
+                로그아웃
+              </button>
+            </div>
           </div>
-          <button
-            type="button"
-            className={`locate-btn ${locateOn ? "is-active" : ""}`}
-            onClick={() => void toggleLocate()}
-            disabled={locateBusy}
-          >
-            {locateBusy ? "요청 중…" : locateOn ? "위치 ON" : "내 위치"}
-          </button>
+          {token ? <AddressSearch token={token} onResults={handleSearchResults} /> : null}
+          {filterChips}
+          <div className="desktop-only">{toolsBlock}</div>
+          <p className="map-side__hint">
+            {awaitingImportPick
+              ? "위치를 지도에서 탭하세요 (이름·설명은 자동 입력됩니다)"
+              : toolMode === "pin"
+                ? "핀: 지도 탭 → 확인 → 입력"
+                : "구역을 탭하면 수정 · 길게 그리면 새 구역"}
+          </p>
+          {locateOn && locateMsg ? <p className="map-side__status">{locateMsg}</p> : null}
+          {error ? <p className="map-side__error">{error}</p> : null}
+          {loading ? <p className="map-side__status">불러오는 중…</p> : null}
         </div>
 
-        {token ? (
-          <>
-            <AddressSearch token={token} onPick={handleSearchPick} />
-            <ShareImport
-              token={token}
-              source="amap"
-              placement="main"
-              onImported={handleShareImported}
-            />
-          </>
+        {isDesktop ? (
+          <div className="map-side__scroll">
+            {searchList}
+            {searchCard}
+            {markerPanel}
+            {!panelOpen && !showSearchList && !showSearchCard ? (
+              <div className="place-list">
+                <div className="place-list__head">
+                  <strong>장소 {markers.length}</strong>
+                </div>
+                <ul>
+                  {markers.map((m) => (
+                    <li key={m.id}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          openView(m);
+                          setFlyTarget({ lat: m.lat, lng: m.lng });
+                        }}
+                      >
+                        <strong>
+                          {m.title}
+                          {m.is_agent_suggested ? " · 추천" : ""}
+                          {m.is_favorite ? " \u2605" : ""}
+                        </strong>
+                        <span>{CATEGORY_META[m.category].label}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
         ) : null}
-
-        <div className="chips" role="list">
-          <button
-            type="button"
-            className={`chip ${categoryFilter === null && !favoritesOnly && !agentSuggestedOnly ? "is-active" : ""}`}
-            onClick={() => {
-              setCategoryFilter(null);
-              setFavoritesOnly(false);
-              setAgentSuggestedOnly(false);
-            }}
-          >
-            모든 유형
-          </button>
-                    <button
-            type="button"
-            className={`chip ${favoritesOnly ? "is-active" : ""}`}
-            onClick={() => {
-              setFavoritesOnly((v) => !v);
-              setAgentSuggestedOnly(false);
-            }}
-          >
-            즐겨찾기
-          </button>
-          <button
-            type="button"
-            className={`chip ${agentSuggestedOnly ? "is-active" : ""}`}
-            onClick={() => {
-              setAgentSuggestedOnly((v) => !v);
-              setFavoritesOnly(false);
-            }}
-          >
-            에이전트 추천
-          </button>
-{CATEGORY_LIST.map((c) => (
-            <button
-              key={c}
-              type="button"
-              className={`chip ${categoryFilter === c ? "is-active" : ""}`}
-              style={{ "--chip-color": CATEGORY_META[c].color } as CSSProperties}
-              onClick={() => setCategoryFilter(c)}
-            >
-              <i style={{ background: CATEGORY_META[c].color }} />
-              {CATEGORY_META[c].label}
-            </button>
-          ))}
-        </div>
-        <p className="topbar__hint">
-          {awaitingImportPick
-            ? "위치를 지도에서 탭하세요 (이름·설명은 자동 입력됩니다)"
-            : toolMode === "pin"
-              ? "핀: 지도 탭 → 입력. 따종은 등록 화면에서 초안 만들기 · 고덕은 위 버튼"
-              : "구역을 탭하면 내용 수정 · 손가락으로 길게 그리면 새 구역 생성"}
-        </p>
-        {locateOn && locateMsg ? <p className="topbar__status">{locateMsg}</p> : null}
-        {error ? <p className="topbar__error">{error}</p> : null}
-        {loading ? <p className="topbar__status">불러오는 중…</p> : null}
-      </header>
+      </aside>
 
       <div className="map-shell">
         <MapContainer
@@ -510,7 +677,6 @@ export default function MapPage() {
             onDrawn={placeZoneDraft}
             onZoneTap={openView}
           />
-
           {markers.map((m) =>
             m.shape === "polygon" && m.polygon && m.polygon.length >= 3 ? (
               <Polygon
@@ -524,12 +690,7 @@ export default function MapPage() {
                 }}
                 interactive={false}
               >
-                <Tooltip
-                  permanent
-                  direction="center"
-                  className="zone-label"
-                  opacity={1}
-                >
+                <Tooltip permanent direction="center" className="zone-label" opacity={1}>
                   {m.title}
                 </Tooltip>
               </Polygon>
@@ -542,13 +703,8 @@ export default function MapPage() {
               />
             ),
           )}
-
           {searchPin ? (
-            <Marker
-              position={[searchPin.lat, searchPin.lng]}
-              icon={searchIcon}
-              title={searchPin.label}
-            />
+            <Marker position={[searchPin.lat, searchPin.lng]} icon={searchIcon} title={searchPin.label} />
           ) : null}
           {draftKind === "point" && draftLatLng ? (
             <Marker position={[draftLatLng.lat, draftLatLng.lng]} icon={draftIcon} />
@@ -556,23 +712,26 @@ export default function MapPage() {
           {draftKind === "polygon" && draftPolygon ? (
             <Polygon
               positions={draftPolygon.map((p) => [p.lat, p.lng] as [number, number])}
-              pathOptions={{
-                color: "#0f766e",
-                fillColor: "#0f766e",
-                fillOpacity: 0.28,
-                weight: 3,
-              }}
+              pathOptions={{ color: "#0f766e", fillColor: "#0f766e", fillOpacity: 0.28, weight: 3 }}
             />
           ) : null}
         </MapContainer>
       </div>
+
+      {!isDesktop ? (
+        <div className="mobile-sheets">
+          {searchList}
+          {searchCard}
+          {markerPanel}
+        </div>
+      ) : null}
 
       {awaitingConfirm ? (
         <ConfirmBar
           title={draftKind === "polygon" ? "이 구역으로 할까요?" : "이 위치로 할까요?"}
           subtitle={
             draftKind === "polygon"
-              ? `꼭짓점 ${draftPolygon?.length ?? 0}개 · 지도를 가리지 않고 확인 후 입력`
+              ? `꼭짓점 ${draftPolygon?.length ?? 0}개`
               : `${draftLatLng?.lat.toFixed(5)}, ${draftLatLng?.lng.toFixed(5)}`
           }
           onConfirm={openCreateForm}
@@ -580,33 +739,78 @@ export default function MapPage() {
         />
       ) : null}
 
-      {panelMode ? (
-        <MarkerPanel
-          mode={panelMode === "create" ? "create" : panelMode === "edit" ? "edit" : "view"}
-          shape={selected?.shape ?? createShape}
-          latlng={draftLatLng}
-          polygon={draftPolygon}
-          marker={selected}
-          createDefaults={createDefaults}
-          token={token}
-          canEdit={!!selected && !!user}
-          onClose={closePanel}
-          onCreate={handleCreate}
-          onUpdate={handleUpdate}
-          onDelete={handleDelete}
-          onStartEdit={() => setPanelMode("edit")}
-          onMarkerRefresh={(m) => {
-            setSelected(m);
-            setMarkers((prev) => prev.map((x) => (x.id === m.id ? m : x)));
-          }}
-        />
+      {addOpen ? (
+        <div className="sheet-overlay mobile-only" onClick={() => setAddOpen(false)}>
+          <div className="sheet-menu" onClick={(e) => e.stopPropagation()}>
+            <strong>지도에 추가</strong>
+            <button type="button" onClick={() => switchTool("pin")}>
+              핀 찍기
+            </button>
+            <button type="button" onClick={() => switchTool("zone")}>
+              구역 선택
+            </button>
+            <button type="button" className="btn btn--ghost" onClick={() => setAddOpen(false)}>
+              닫기
+            </button>
+          </div>
+        </div>
       ) : null}
+
+      {moreOpen ? (
+        <div className="sheet-overlay mobile-only" onClick={() => setMoreOpen(false)}>
+          <div className="sheet-menu" onClick={(e) => e.stopPropagation()}>
+            <strong>더보기</strong>
+            <button type="button" onClick={() => void toggleLocate()} disabled={locateBusy}>
+              {locateOn ? "내 위치 끄기" : "내 위치"}
+            </button>
+            {token ? (
+              <ShareImport token={token} source="amap" placement="main" onImported={handleShareImported} />
+            ) : null}
+            {user?.is_admin ? (
+              <a className="sheet-menu__link" href="/admin">
+                관리자
+              </a>
+            ) : null}
+            <button type="button" onClick={logout}>
+              로그아웃
+            </button>
+            <button type="button" className="btn btn--ghost" onClick={() => setMoreOpen(false)}>
+              닫기
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <nav className="gnb mobile-only" aria-label="하단 메뉴">
+        <button type="button" className={mobileTab === "map" && !favoritesOnly ? "is-active" : ""} onClick={() => onGnb("map")}>
+          <span>지도</span>
+        </button>
+        <button type="button" className={mobileTab === "add" || addOpen ? "is-active" : ""} onClick={() => onGnb("add")}>
+          <span>추가</span>
+        </button>
+        <button type="button" className={favoritesOnly || mobileTab === "fav" ? "is-active" : ""} onClick={() => onGnb("fav")}>
+          <span>즐겨찾기</span>
+        </button>
+        <button
+          type="button"
+          className={`gnb__msg ${mobileTab === "inbox" || inboxOpen ? "is-active" : ""} ${unreadMsg ? "has-unread" : ""}`}
+          onClick={() => onGnb("inbox")}
+        >
+          <span>메시지{unreadMsg ? ` ${unreadMsg}` : ""}</span>
+        </button>
+        <button type="button" className={mobileTab === "more" || moreOpen ? "is-active" : ""} onClick={() => onGnb("more")}>
+          <span>더보기</span>
+        </button>
+      </nav>
 
       {token ? (
         <MessageInbox
           token={token}
           open={inboxOpen}
-          onClose={() => setInboxOpen(false)}
+          onClose={() => {
+            setInboxOpen(false);
+            setMobileTab("map");
+          }}
           onUnreadChange={setUnreadMsg}
           onOpenPlace={(placeId) => {
             const m = markers.find((x) => x.id === placeId);
