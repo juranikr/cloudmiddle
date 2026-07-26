@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 고덕 공유 가져오기 504 수정 (텍스트 폴백)
+최종 갱신: 2026-07-27 (KST) — 에이전트 추론 강도 high 적용
 
 ---
 
@@ -174,6 +174,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-27 — 에이전트 추론 강도 high 적용
+- gpt-oss 계열 모델 사용 시 reasoning_effort="high" 전달 (기존 기본값 medium)
+- 병합 판단 등 미묘한 결정 품질 향상 목적, 비용은 출력 토큰 소폭 증가 수준
+- 다른 모델(GROQ_MODEL 교체 시)에는 옵션을 넘기지 않아 호환성 유지
 
 ### 2026-07-26 — 고덕 공유 가져오기 504 수정
 - 증상: surl.amap.com 리다이렉트 추적이 ECS(AWS IP)에서 매달려 CloudFront 30초 초과 → 504

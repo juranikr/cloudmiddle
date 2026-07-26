@@ -267,12 +267,17 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         for _ in range(steps_limit):
             steps += 1
             try:
+                extra: dict[str, Any] = {}
+                if "gpt-oss" in model:
+                    # 병합 판단 등 미묘한 결정의 품질을 위해 추론 강도 상향
+                    extra["reasoning_effort"] = "high"
                 resp = client.chat.completions.create(
                     model=model,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto",
                     temperature=0.2,
+                    **extra,
                 )
             except Exception as exc:
                 # 모델이 스키마에 안 맞는 인자(null 등)를 생성한 경우: 사이클을 죽이지 않고 교정 재시도
