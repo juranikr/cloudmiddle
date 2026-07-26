@@ -1555,15 +1555,20 @@ textarea {
     grid-column: 1;
     height: 100%;
     max-height: 100%;
+    min-height: 0;
+    overflow: hidden;
     border-bottom: 0;
     border-right: 1px solid var(--line);
     padding: 16px;
     gap: 12px;
   }
+  .map-side__top {
+    flex: 0 0 auto;
+  }
   .map-side__scroll {
-    flex: 1;
+    flex: 1 1 0;
     min-height: 0;
-    overflow: auto;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -1593,7 +1598,9 @@ textarea {
     transform: none;
     width: 100%;
     max-height: none;
-    flex: 1;
+    /* 내용만큼 늘어나고, 화면을 넘으면 .map-side__scroll이 스크롤 */
+    flex: 0 0 auto;
+    overflow: visible;
     border-radius: 16px;
     box-shadow: none;
     border: 1px solid var(--line);

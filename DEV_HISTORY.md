@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 기여 명단 vs 수정 이력 정리
+최종 갱신: 2026-07-26 (KST) — PC 사이드바 스크롤 수정
 
 ---
 
@@ -174,6 +174,12 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — PC 사이드바 스크롤 수정
+- 증상: 왼쪽 패널 내용이 화면을 넘어가면 잘리고 스크롤 불가
+- 원인: `.map-side .panel { flex: 1 }` + `overflow: auto`로 패널이 남은 공간에 축소 고정
+- 수정: 패널 `flex: 0 0 auto; overflow: visible` → 내용만큼 늘어나고 `.map-side__scroll`이 스크롤 담당
+- 검증: 관리자 에이전트 실행 ok=true (uq_place_user 500 재발 없음)
 
 ### 2026-07-26 — 기여 명단 vs 수정 이력
 - `place_contributors`: 알림용 distinct 명단(유니크 유지). `place_events`: 반복 기여·수정 이력
