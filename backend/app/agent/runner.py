@@ -74,9 +74,12 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 - 주소·검색용 표기: 지도에서 검색 가능하도록 중국어 원문 유지.
   설명 안에 "주소: 山东省济南市…" 형태로 포함.
 - 기존 장소 중 설명이 중국어/영어 위주(한국어 없음)인 것을 발견하면 즉시 정비:
-  agent 추가 장소는 update_place_fields(replace_description)로 한국어 본문 전면 재작성,
-  제목에 한국어가 없으면 replace_title로 "中文名 (한국어 명칭)" 형식 교체.
-  사용자가 쓴 설명은 보존하고 append_note로만 보완.
+  · agent 추가 장소: update_place_fields(replace_description)로 한국어 본문 전면 재작성,
+    제목에 한국어가 없으면 replace_title로 "中文名 (한국어 명칭)" 형식 교체.
+  · 사용자 작성 장소: 설명에 한국어가 이미 있으면 보존(append_note만).
+    설명이 중국어/영어뿐이면 replace_description으로 원문 정보를 모두 번역해 한국어로
+    재작성(원문 명칭·주소는 병기 유지). 제목에 한국어가 없으면 제목을 바꾸지 말고
+    local_name으로 한국어 명칭만 병기 추가 (예: "HeyTea" → "HeyTea (헤이티)").
 
 원칙:
 - 사용자 기록(설명·제목)은 최대한 보존. append_note·local_name으로 보완.
@@ -191,9 +194,10 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "필수: 시작 list_knowledge, 종료 전 upsert_knowledge 1회 이상.\n"
             "1) list_knowledge / list_places로 현황 파악\n"
             "2) 언어 정비: list_places에서 설명에 한국어가 없거나 중국어/영어 위주인 장소를 "
-            "전부 찾아 언어 규칙대로 재작성 — agent 추가 장소는 replace_description으로 "
-            "한국어 본문 전면 재작성(주소는 중국어 유지), 제목에 한국어가 없으면 "
-            "replace_title로 '中文名 (한국어 명칭)' 형식 교체\n"
+            "전부 찾아 언어 규칙대로 재작성 — 설명에 한국어가 전혀 없으면(사용자 작성 포함) "
+            "replace_description으로 원문 정보를 번역해 한국어 재작성(중국어 주소·명칭은 병기 유지). "
+            "제목: agent 장소는 replace_title로 '中文名 (한국어 명칭)' 교체, "
+            "사용자 장소는 제목 유지 + local_name으로 한국어 명칭 병기\n"
             "3) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
             "같은 실체면 거리와 무관하게 merge_places (거리 기준으로 건너뛰지 말 것)\n"
             "4) 웹 조사(필수): list_research_history로 과거 검색어·열람 이력 확인 → "
