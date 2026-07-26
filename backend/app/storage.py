@@ -38,6 +38,15 @@ def presign_put(key: str, content_type: str, expires: int = 900) -> str:
     )
 
 
+def put_object_bytes(key: str, data: bytes, content_type: str) -> None:
+    _client().put_object(
+        Bucket=settings.s3_bucket,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )
+
+
 def public_url(key: str) -> str:
     if settings.s3_public_base_url:
         return f"{settings.s3_public_base_url.rstrip('/')}/{key}"

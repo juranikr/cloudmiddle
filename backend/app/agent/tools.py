@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session, joinedload
+
+from app import storage
 
 from app.events import (
     diff_marker_fields,
@@ -367,6 +371,49 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_place_images",
+            "description": (
+                "위키미디어 커먼즈에서 자유 라이선스 장소 사진을 검색한다. "
+                "image_count가 0인 장소의 사진 보강용. "
+                "중국어 명칭(예: 千佛山, 大明湖)으로 검색하면 결과가 좋다. "
+                "결과의 image_url을 attach_image_from_url에 넘겨 업로드한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "장소 명칭 (중국어 권장)"},
+                    "limit": {"type": "integer", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attach_image_from_url",
+            "description": (
+                "이미지 URL을 다운로드해 해당 장소의 사진으로 업로드한다(S3). "
+                "search_place_images 결과의 image_url만 사용할 것(자유 라이선스 보장). "
+                "source에는 출처 페이지와 라이선스를 기록한다. 장소당 1~2장이면 충분."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_id": {"type": "integer"},
+                    "image_url": {"type": "string"},
+                    "source": {
+                        "type": "string",
+                        "description": "출처·라이선스 메모 (예: Wikimedia Commons, CC BY-SA 4.0, page_url)",
+                    },
+                },
+                "required": ["place_id", "image_url"],
+            },
+        },
+    },
 ]
 
 
@@ -391,7 +438,57 @@ def _place_brief(m: Marker) -> dict[str, Any]:
         "agent_context": (m.agent_context or "")[:800],
         "merged_into_id": m.merged_into_id,
         "is_agent_suggested": m.is_agent_suggested,
+        "image_count": len(m.images or []),
     }
+
+
+_WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
+_IMAGE_UA = "JinanTravelMap/0.1 (shared travel map; image enrichment)"
+_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _wikimedia_image_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode(
+        {
+            "action": "query",
+            "format": "json",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": 6,
+            "gsrlimit": max(1, min(limit, 10)),
+            "prop": "imageinfo",
+            "iiprop": "url|size|extmetadata",
+            "iiurlwidth": 1280,
+        }
+    )
+    req = urllib.request.Request(
+        f"{_WIKIMEDIA_API}?{params}", headers={"User-Agent": _IMAGE_UA}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    out: list[dict[str, Any]] = []
+    for page in (data.get("query", {}).get("pages") or {}).values():
+        infos = page.get("imageinfo") or []
+        if not infos:
+            continue
+        ii = infos[0]
+        thumb = ii.get("thumburl") or ii.get("url") or ""
+        if not str(thumb).lower().rsplit("?", 1)[0].endswith((".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        meta = ii.get("extmetadata") or {}
+        license_name = ((meta.get("LicenseShortName") or {}).get("value") or "")[:100]
+        out.append(
+            {
+                "title": page.get("title", ""),
+                "image_url": thumb,
+                "width": ii.get("thumbwidth") or ii.get("width"),
+                "height": ii.get("thumbheight") or ii.get("height"),
+                "license": license_name,
+                "page_url": ii.get("descriptionurl") or "",
+            }
+        )
+    return out
 
 
 def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
@@ -905,5 +1002,79 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             }
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc), "results": []}
+
+    if name == "search_place_images":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return {"results": []}
+        try:
+            return {"results": _wikimedia_image_search(query, limit=int(args.get("limit") or 5))}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:300], "results": []}
+
+    if name == "attach_image_from_url":
+        pid = int(args["place_id"])
+        url = str(args.get("image_url") or "").strip()
+        source = str(args.get("source") or "")[:500]
+        if not url.lower().startswith("https://"):
+            return {"error": "bad_url"}
+        if not storage.s3_enabled():
+            return {"error": "s3_disabled"}
+        m = (
+            db.query(Marker)
+            .options(joinedload(Marker.images))
+            .filter(Marker.id == pid, Marker.merged_into_id.is_(None))
+            .first()
+        )
+        if not m:
+            return {"error": "not_found"}
+        if len(m.images) >= 8:
+            return {"error": "too_many_images"}
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_UA})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype not in _IMAGE_TYPES:
+                    return {"error": f"unsupported_type:{ctype}"}
+                data = resp.read(_IMAGE_MAX_BYTES + 1)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"download_failed: {exc}"[:300]}
+        if len(data) > _IMAGE_MAX_BYTES:
+            return {"error": "too_large"}
+        if len(data) < 1024:
+            return {"error": "too_small"}
+        key = storage.build_object_key(pid, "web-image", ctype)
+        try:
+            storage.put_object_bytes(key, data, ctype)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"upload_failed: {exc}"[:300]}
+        max_order = max([i.sort_order for i in m.images], default=-1)
+        img = PlaceImage(
+            place_id=pid,
+            s3_key=key,
+            content_type=ctype,
+            sort_order=max_order + 1,
+            uploaded_by_user_id=None,
+        )
+        db.add(img)
+        db.flush()
+        log_place_event(
+            db,
+            place_id=pid,
+            user=None,
+            action=PlaceEventAction.image_add,
+            summary=f"웹 이미지 추가: {m.title}",
+            payload={
+                "image_id": img.id,
+                "s3_key": key,
+                "source_url": url[:500],
+                "source": source,
+                "changes": [{"field": "image_id", "before": None, "after": img.id}],
+                "fields": ["image_id"],
+            },
+            actor="agent",
+        )
+        db.commit()
+        return {"ok": True, "image_id": img.id, "url": storage.public_url(key)}
 
     return {"error": f"unknown_tool:{name}"}

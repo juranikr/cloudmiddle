@@ -52,9 +52,11 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 2) 작업 큐의 이의신청 전원 resolve_appeal
 3) 작업 큐의 미읽음 이벤트 전원 검토·조치 → mark_events_read
 4) (큐가 비었을 때만) 전체 지도 중복 스캔(list_places로 동명·동의어 장소) → 병합
-5) web_search → create_place 소수 → upsert_knowledge
-6) agent_context 보완
-7) upsert_knowledge 최종 정리 후 한 줄 요약
+5) 사진 보강: image_count가 0인 장소 1~3곳 → search_place_images(중국어 명칭) →
+   attach_image_from_url (위키미디어 자유 라이선스만, source에 출처 기록)
+6) web_search → create_place 소수 → upsert_knowledge
+7) agent_context 보완
+8) upsert_knowledge 최종 정리 후 한 줄 요약
 """
 
 
@@ -149,9 +151,11 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "1) list_knowledge / list_places로 현황 파악\n"
             "2) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
             "같은 실체면 거리와 무관하게 merge_places (거리 기준으로 건너뛰지 말 것)\n"
-            "3) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
-            "4) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
-            "5) 조사·추가에서 배운 점을 upsert_knowledge로 병합 (빠뜨리면 실패)\n"
+            "3) 사진 보강: image_count가 0인 장소 1~3곳을 골라 search_place_images(중국어 명칭) → "
+            "attach_image_from_url로 업로드 (자유 라이선스만, source에 출처·라이선스 기록)\n"
+            "4) web_search로 '济南 旅游 景点' '济南 美食 推荐' 등 조사\n"
+            "5) 지도에 없는 유용한 장소를 geocode_place 후 create_place 1~5개\n"
+            "6) 조사·추가에서 배운 점을 upsert_knowledge로 병합 (빠뜨리면 실패)\n"
             "끝나면 한 줄 요약."
         )
     else:

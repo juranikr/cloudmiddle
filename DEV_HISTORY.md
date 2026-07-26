@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 병합 판단 유연화 (거리는 참고 신호)
+최종 갱신: 2026-07-26 (KST) — 에이전트 웹 이미지 보강
 
 ---
 
@@ -174,6 +174,13 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 에이전트 웹 이미지 보강
+- 새 툴: search_place_images(위키미디어 커먼즈, 자유 라이선스) / attach_image_from_url(S3 업로드)
+- 제한: https만, jpeg/png/webp, 5MB 이하, 장소당 최대 8장, 출처·라이선스 event payload 기록
+- list_places 등 brief에 image_count 추가 → 사진 없는 장소 탐색 가능
+- 연구 사이클에 사진 보강 단계(1~3곳) 추가
+- storage.put_object_bytes 추가 (ECS task role에 s3:PutObject 이미 있음)
 
 ### 2026-07-26 — 관리자 에이전트 실행 비동기화
 - 증상: 사이클이 60초 넘으면 CloudFront 504 → UI에 "실패"로 표시 (실제는 성공)
