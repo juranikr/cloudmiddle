@@ -36,7 +36,10 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_unread_events",
-            "description": "Groq가 아직 읽지 않은 장소 이력 이벤트를 최신순으로 가져온다.",
+            "description": (
+                "아직 처리하지 않은 장소 이력(생성·수정·병합·이의 기록 등)을 오래된 순으로 가져온다. "
+                "작업 큐의 핵심. 반환된 id를 빠짐없이 검토·조치한 뒤 mark_events_read 할 것."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "default": 30}},
@@ -47,7 +50,10 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "mark_events_read",
-            "description": "처리 완료한 이벤트 ID들을 읽음 처리한다.",
+            "description": (
+                "검토·조치를 끝낸 이벤트 ID만 읽음 처리한다. "
+                "아직 안 본 ID를 한꺼번에 표시하지 말 것. 잔여 미읽음이 0이 될 때까지 반복."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"event_ids": {"type": "array", "items": {"type": "integer"}}},
@@ -220,7 +226,10 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_open_appeals",
-            "description": "사용자가 낸 미처리 이의신청 목록. 다음 주기 재고려 대상.",
+            "description": (
+                "미종결(open) 이의신청 목록. 각 id마다 resolve_appeal로 반드시 종결해야 한다. "
+                "읽음 표시만으로 넘기면 안 된다."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "default": 30}},
@@ -232,8 +241,9 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "resolve_appeal",
             "description": (
-                "이의신청을 검토한 뒤 반영/기각하고 신청자에게 결과 메시지를 보낸다. "
-                "잘못된 병합이면 설명을 보완하거나 별도 장소를 create_place로 복원하는 식으로 조치."
+                "이의신청을 검토한 뒤 반영(resolved)/기각(dismissed)하고 신청자에게 결과 메시지를 보낸다. "
+                "open 이의를 끝내는 유일한 정상 경로. "
+                "잘못된 병합이면 설명 보완·별도 create_place 등으로 조치한 뒤 호출."
             ),
             "parameters": {
                 "type": "object",
@@ -250,7 +260,10 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "mark_appeals_read",
-            "description": "검토를 마친 이의신청 ID를 읽음 처리한다.",
+            "description": (
+                "이미 resolve_appeal로 종결된 이의만 읽음 처리할 때 사용. "
+                "status=open 이의 ID는 거부된다 — 반드시 resolve_appeal을 먼저 호출."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"appeal_ids": {"type": "array", "items": {"type": "integer"}}},
@@ -726,6 +739,20 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
 
     if name == "mark_appeals_read":
         ids = [int(x) for x in (args.get("appeal_ids") or [])]
+        if not ids:
+            return {"marked": 0}
+        open_ids = [
+            a.id
+            for a in db.query(PlaceAppeal)
+            .filter(PlaceAppeal.id.in_(ids), PlaceAppeal.status == PlaceAppealStatus.open)
+            .all()
+        ]
+        if open_ids:
+            return {
+                "error": "open_appeals_must_resolve",
+                "open_ids": open_ids,
+                "hint": "resolve_appeal(resolved|dismissed)로 종결한 뒤 읽음 처리하세요.",
+            }
         n = mark_appeals_read(db, ids)
         db.commit()
         return {"marked": n}

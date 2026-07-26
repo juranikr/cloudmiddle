@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 구역 그리기 멀티터치(핀치 줌) 무시
+최종 갱신: 2026-07-26 (KST) — 에이전트 작업 큐 전원 처리
 
 ---
 
@@ -174,6 +174,14 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 에이전트 작업 큐 전원 처리
+- 원인: ReAct가 큐를 안 보고도 종료 가능, 넛지는 KB만, max_steps=12로 조기 종료, 프롬프트에 ID 목록 없음
+- 시작 시 미읽음 이벤트·이의 ID를 유저 메시지에 주입
+- 종료 시 unread>0이면 잔여 큐를 최대 4회 재주입해 계속 처리
+- 스텝 예산: `min(48, 10+unread*4)`
+- open 이의는 mark_appeals_read 거부 → resolve_appeal 필수
+- unread 잔존 시 ok=false
 
 ### 2026-07-26 — 에이전트 지식필수·장소 쿼리
 - ReAct 유지: upsert_knowledge 미호출 시 추가 턴으로 강제 유도
