@@ -57,8 +57,10 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 - 이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·꿀팁·교통·현지 표기·별칭 등)가
   나오면 버리지 말고 update_place_fields(append_note·local_name)나
   update_place_context로 해당 장소를 보완한다. 사용자 원문은 보존하고 덧붙이기만 할 것.
-- 끝나면 upsert_knowledge(topic 'research_strategy')에 어떤 검색어·소스가 효과적이었는지,
-  다음에 팔 키워드는 무엇인지 전략을 갱신한다.
+- 조사 묶음의 마지막 동작은 반드시 upsert_knowledge(topic 'research_strategy')다:
+  어떤 검색어·소스가 효과적이었는지, 무엇을 추가·보완했는지, 다음에 팔 키워드를 기록.
+  재검증·사진 보강 등 다른 작업으로 넘어가기 전에 먼저 호출한다 (마지막으로 미루면
+  스텝 부족으로 누락된다 — 실제로 반복된 실패 패턴이다).
 
 【지식베이스 — 필수】
 - 작업 시작 시 list_knowledge를 호출한다.
@@ -167,7 +169,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     # 작업 건수에 비례해 스텝 확보 (건당 ~4 + 지식/롤백 오버헤드)
     if research_only:
         # 스크래핑 조사 + 재검증 + 사진 보강까지 수행하므로 여유 확보
-        steps_limit = max(base_steps, 30)
+        steps_limit = max(base_steps, 36)
     else:
         # 큐 처리 후 필수 웹 조사 분량(~8스텝) 포함
         steps_limit = max(base_steps, min(56, 18 + unread_before * 4))
@@ -187,7 +189,8 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "geocode_place → create_place 1~5개. 이미 등록된 장소와 겹치는 유용한 정보"
             "(영업시간·가격·팁·교통·별칭)는 update_place_fields/update_place_context로 보완\n"
             "5) 조사 전략(효과적 검색어·소스·다음 키워드)을 upsert_knowledge"
-            "(topic 'research_strategy')로 병합 (빠뜨리면 실패)\n"
+            "(topic 'research_strategy')로 병합. 6)·7)보다 먼저, 조사 직후 바로 호출할 것 "
+            "(빠뜨리면 실패)\n"
             "6) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 3~5곳을 web_search로 "
             "재확인 → verify_place(valid|closed|moved|uncertain + note). "
             "이전(搬迁) 의심이면 같은 지점의 이전인지 다른 지점(분점)인지 반드시 구분하고, "
