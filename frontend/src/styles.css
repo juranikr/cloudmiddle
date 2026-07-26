@@ -1588,3 +1588,23 @@ textarea {
   }
 }
 
+
+.mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mode-toggle__label {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+.locate-btn--compact {
+  padding: 7px 10px;
+  font-size: 0.78rem;
+}
+.gnb {
+  grid-template-columns: repeat(3, 1fr) !important;
+}
+

@@ -40,7 +40,7 @@ const INITIAL_VIEW = loadMapView({ center: JINAN_CENTER, zoom: DEFAULT_ZOOM });
 type ToolMode = "pin" | "zone";
 type PanelMode = "create" | "view" | "edit" | null;
 type DraftKind = "point" | "polygon" | null;
-type MobileTab = "map" | "add" | "fav" | "inbox" | "more";
+type MobileTab = "map" | "inbox" | "more";
 
 function MapClickHandler({
   enabled,
@@ -127,7 +127,6 @@ export default function MapPage() {
   const [unreadMsg, setUnreadMsg] = useState(0);
   const [mobileTab, setMobileTab] = useState<MobileTab>("map");
   const [moreOpen, setMoreOpen] = useState(false);
-  const [addOpen, setAddOpen] = useState(false);
   const [isDesktop, setIsDesktop] = useState(() =>
     typeof window !== "undefined" ? window.matchMedia("(min-width: 860px)").matches : true,
   );
@@ -275,7 +274,6 @@ export default function MapPage() {
     setCreateDefaults(null);
     pendingImportPick.current = false;
     setAwaitingImportPick(false);
-    setAddOpen(false);
   }
 
   function handleSearchResults(hits: GeocodeHit[], err: string) {
@@ -388,38 +386,43 @@ export default function MapPage() {
   function onGnb(tab: MobileTab) {
     setMobileTab(tab);
     if (tab === "map") {
-      setAddOpen(false);
       setMoreOpen(false);
       setInboxOpen(false);
-      if (favoritesOnly) {
-        setFavoritesOnly(false);
-      }
-    } else if (tab === "add") {
-      setAddOpen(true);
-      setMoreOpen(false);
-      setInboxOpen(false);
-    } else if (tab === "fav") {
-      setFavoritesOnly(true);
-      setAgentSuggestedOnly(false);
-      setCategoryFilter(null);
-      setAddOpen(false);
-      setMoreOpen(false);
-      setInboxOpen(false);
-      setPanelMode(null);
     } else if (tab === "inbox") {
       setInboxOpen(true);
-      setAddOpen(false);
       setMoreOpen(false);
     } else if (tab === "more") {
       setMoreOpen(true);
-      setAddOpen(false);
       setInboxOpen(false);
     }
   }
 
+
   const createShape: MarkerShape = draftKind === "polygon" ? "polygon" : "point";
   const showSearchList = searchSheetOpen && (searchHits.length > 0 || !!searchError);
   const showSearchCard = !!searchPin && !panelOpen && !showSearchList;
+
+  const modeToggle = (
+    <div className="mode-toggle" role="group" aria-label="지도 모드">
+      <span className="mode-toggle__label">모드</span>
+      <div className="seg seg--tools">
+        <button type="button" className={toolMode === "pin" ? "is-active" : ""} onClick={() => switchTool("pin")}>
+          핀
+        </button>
+        <button type="button" className={toolMode === "zone" ? "is-active" : ""} onClick={() => switchTool("zone")}>
+          구역
+        </button>
+      </div>
+      <button
+        type="button"
+        className={`locate-btn locate-btn--compact ${locateOn ? "is-active" : ""}`}
+        onClick={() => void toggleLocate()}
+        disabled={locateBusy}
+      >
+        {locateBusy ? "…" : locateOn ? "위치ON" : "내 위치"}
+      </button>
+    </div>
+  );
 
   const filterChips = (
     <div className="chips" role="list">
@@ -441,7 +444,6 @@ export default function MapPage() {
         onClick={() => {
           setFavoritesOnly((v) => !v);
           setAgentSuggestedOnly(false);
-          setMobileTab("fav");
         }}
       >
         즐겨찾기
@@ -476,22 +478,6 @@ export default function MapPage() {
 
   const toolsBlock = (
     <div className="side-tools">
-      <div className="seg seg--tools">
-        <button type="button" className={toolMode === "pin" ? "is-active" : ""} onClick={() => switchTool("pin")}>
-          핀 찍기
-        </button>
-        <button type="button" className={toolMode === "zone" ? "is-active" : ""} onClick={() => switchTool("zone")}>
-          구역 선택
-        </button>
-      </div>
-      <button
-        type="button"
-        className={`locate-btn ${locateOn ? "is-active" : ""}`}
-        onClick={() => void toggleLocate()}
-        disabled={locateBusy}
-      >
-        {locateBusy ? "요청 중…" : locateOn ? "위치 ON" : "내 위치"}
-      </button>
       {token ? (
         <ShareImport token={token} source="amap" placement="main" onImported={handleShareImported} />
       ) : null}
@@ -593,6 +579,7 @@ export default function MapPage() {
           </div>
           {token ? <AddressSearch token={token} onResults={handleSearchResults} /> : null}
           {filterChips}
+          {modeToggle}
           <div className="desktop-only">{toolsBlock}</div>
           <p className="map-side__hint">
             {awaitingImportPick
@@ -739,22 +726,6 @@ export default function MapPage() {
         />
       ) : null}
 
-      {addOpen ? (
-        <div className="sheet-overlay mobile-only" onClick={() => setAddOpen(false)}>
-          <div className="sheet-menu" onClick={(e) => e.stopPropagation()}>
-            <strong>지도에 추가</strong>
-            <button type="button" onClick={() => switchTool("pin")}>
-              핀 찍기
-            </button>
-            <button type="button" onClick={() => switchTool("zone")}>
-              구역 선택
-            </button>
-            <button type="button" className="btn btn--ghost" onClick={() => setAddOpen(false)}>
-              닫기
-            </button>
-          </div>
-        </div>
-      ) : null}
 
       {moreOpen ? (
         <div className="sheet-overlay mobile-only" onClick={() => setMoreOpen(false)}>
@@ -782,14 +753,12 @@ export default function MapPage() {
       ) : null}
 
       <nav className="gnb mobile-only" aria-label="하단 메뉴">
-        <button type="button" className={mobileTab === "map" && !favoritesOnly ? "is-active" : ""} onClick={() => onGnb("map")}>
+        <button
+          type="button"
+          className={mobileTab === "map" && !inboxOpen && !moreOpen ? "is-active" : ""}
+          onClick={() => onGnb("map")}
+        >
           <span>지도</span>
-        </button>
-        <button type="button" className={mobileTab === "add" || addOpen ? "is-active" : ""} onClick={() => onGnb("add")}>
-          <span>추가</span>
-        </button>
-        <button type="button" className={favoritesOnly || mobileTab === "fav" ? "is-active" : ""} onClick={() => onGnb("fav")}>
-          <span>즐겨찾기</span>
         </button>
         <button
           type="button"
@@ -798,7 +767,11 @@ export default function MapPage() {
         >
           <span>메시지{unreadMsg ? ` ${unreadMsg}` : ""}</span>
         </button>
-        <button type="button" className={mobileTab === "more" || moreOpen ? "is-active" : ""} onClick={() => onGnb("more")}>
+        <button
+          type="button"
+          className={mobileTab === "more" || moreOpen ? "is-active" : ""}
+          onClick={() => onGnb("more")}
+        >
           <span>더보기</span>
         </button>
       </nav>
