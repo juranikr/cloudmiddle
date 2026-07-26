@@ -318,7 +318,10 @@ TOOLS: list[dict[str, Any]] = [
                     "topic": {"type": "string", "description": "영문/숫자 slug, 예: appeal_lessons, jinan_food"},
                     "title": {"type": "string"},
                     "content": {"type": "string", "description": "한국어로 정리된 지식 본문"},
-                    "place_id": {"type": "integer"},
+                    "place_id": {
+                        "type": ["integer", "null"],
+                        "description": "특정 장소와 연관된 지식일 때만. 없으면 생략하거나 null",
+                    },
                     "merge": {"type": "boolean", "default": True},
                 },
                 "required": ["topic", "title", "content"],

@@ -167,16 +167,36 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     used_tools: set[str] = set()
     work_nudges = 0
     kb_nudges = 0
+    schema_retries = 0
     try:
         for _ in range(steps_limit):
             steps += 1
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.2,
-            )
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0.2,
+                )
+            except Exception as exc:
+                # 모델이 스키마에 안 맞는 인자(null 등)를 생성한 경우: 사이클을 죽이지 않고 교정 재시도
+                detail = str(exc)
+                if "tool_use_failed" in detail and schema_retries < 3:
+                    schema_retries += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "직전 툴 호출 인자가 스키마 검증에 실패했습니다. "
+                                "값이 없는 선택 필드는 null을 넣지 말고 아예 생략한 뒤 "
+                                "같은 툴을 다시 호출하세요. "
+                                f"오류: {detail[:600]}"
+                            ),
+                        }
+                    )
+                    continue
+                raise
             msg = resp.choices[0].message
             tool_calls = msg.tool_calls or []
             if not tool_calls:

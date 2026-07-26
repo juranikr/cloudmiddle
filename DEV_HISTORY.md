@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — PC 사이드바 스크롤 수정
+최종 갱신: 2026-07-26 (KST) — 툴 인자 스키마 오류 내성
 
 ---
 
@@ -174,6 +174,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 툴 인자 스키마 오류 내성
+- 증상: 모델이 upsert_knowledge에 place_id:null → Groq 400 tool_use_failed로 사이클 중단
+- upsert_knowledge.place_id 스키마 `["integer","null"]` 허용
+- 러너: tool_use_failed 시 교정 지시 후 최대 3회 재시도 (사이클 유지)
 
 ### 2026-07-26 — PC 사이드바 스크롤 수정
 - 증상: 왼쪽 패널 내용이 화면을 넘어가면 잘리고 스크롤 불가
