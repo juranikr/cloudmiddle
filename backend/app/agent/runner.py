@@ -67,9 +67,19 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 - 사이클이 끝나기 전에 upsert_knowledge를 최소 1회 이상 호출한다.
 - 지식 갱신 없이 텍스트 요약만 하고 끝내면 실패다.
 
+【언어 규칙 — 필수, 위반 시 툴이 거부】
+- 설명(description)·append_note·agent_context·안내·이의 답변·지식베이스: 무조건 한국어.
+  중국어 원문 정보는 한국어로 번역·요약해 적는다.
+- 명칭(title): 중국어+한국어 병기 — 형식 "中文名 (한국어 명칭)", 예: "泉城广场 (취안청 광장)".
+- 주소·검색용 표기: 지도에서 검색 가능하도록 중국어 원문 유지.
+  설명 안에 "주소: 山东省济南市…" 형태로 포함.
+- 기존 장소 중 설명이 중국어/영어 위주(한국어 없음)인 것을 발견하면 즉시 정비:
+  agent 추가 장소는 update_place_fields(replace_description)로 한국어 본문 전면 재작성,
+  제목에 한국어가 없으면 replace_title로 "中文名 (한국어 명칭)" 형식 교체.
+  사용자가 쓴 설명은 보존하고 append_note로만 보완.
+
 원칙:
 - 사용자 기록(설명·제목)은 최대한 보존. append_note·local_name으로 보완.
-- 안내·agent_context·이의 답변·지식베이스는 한국어. 명칭·주소는 현지 표기 병기.
 - 좌표 WGS84. 새 장소는 geocode_place 후 create_place.
 - list_recent_rollbacks를 보고 롤백된 방향은 반복하지 말 것.
 
@@ -180,22 +190,27 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             f"기존 지식베이스 요약: {kb_hint}\n"
             "필수: 시작 list_knowledge, 종료 전 upsert_knowledge 1회 이상.\n"
             "1) list_knowledge / list_places로 현황 파악\n"
-            "2) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
+            "2) 언어 정비: list_places에서 설명에 한국어가 없거나 중국어/영어 위주인 장소를 "
+            "전부 찾아 언어 규칙대로 재작성 — agent 추가 장소는 replace_description으로 "
+            "한국어 본문 전면 재작성(주소는 중국어 유지), 제목에 한국어가 없으면 "
+            "replace_title로 '中文名 (한국어 명칭)' 형식 교체\n"
+            "3) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
             "같은 실체면 거리와 무관하게 merge_places (거리 기준으로 건너뛰지 말 것)\n"
-            "3) 웹 조사(최우선·필수): list_research_history로 과거 검색어·열람 이력 확인 → "
+            "4) 웹 조사(필수): list_research_history로 과거 검색어·열람 이력 확인 → "
             "덜 판 검색어 심화 + 새 테마 키워드 조사 → web_search에서 seen=false 결과 위주로 "
             "fetch_page 2~4개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
-            "4) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
-            "geocode_place → create_place 1~5개. 이미 등록된 장소와 겹치는 유용한 정보"
-            "(영업시간·가격·팁·교통·별칭)는 update_place_fields/update_place_context로 보완\n"
-            "5) 조사 전략(효과적 검색어·소스·다음 키워드)을 upsert_knowledge"
-            "(topic 'research_strategy')로 병합. 6)·7)보다 먼저, 조사 직후 바로 호출할 것 "
+            "5) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
+            "geocode_place → create_place 1~5개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
+            "이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·별칭)는 "
+            "update_place_fields/update_place_context로 보완\n"
+            "6) 조사 전략(효과적 검색어·소스·다음 키워드)을 upsert_knowledge"
+            "(topic 'research_strategy')로 병합. 7)·8)보다 먼저, 조사 직후 바로 호출할 것 "
             "(빠뜨리면 실패)\n"
-            "6) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 3~5곳을 web_search로 "
+            "7) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 3~5곳을 web_search로 "
             "재확인 → verify_place(valid|closed|moved|uncertain + note). "
             "이전(搬迁) 의심이면 같은 지점의 이전인지 다른 지점(분점)인지 반드시 구분하고, "
             "같은 지점 이전이 확실할 때만 좌표를 갱신할 것\n"
-            "7) 사진 보강: image_count가 0인 장소 1~2곳을 골라 search_place_images(중국어 명칭) → "
+            "8) 사진 보강: image_count가 0인 장소 1~2곳을 골라 search_place_images(중국어 명칭) → "
             "attach_image_from_url로 업로드 (자유 라이선스만, source에 출처·라이선스 기록)\n"
             "끝나면 한 줄 요약."
         )

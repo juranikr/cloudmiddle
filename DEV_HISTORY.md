@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-26 (KST) — 웹 스크래핑 조사 필수화 + 조사 이력 기록
+최종 갱신: 2026-07-26 (KST) — 언어 규칙 강제 (설명 한국어, 명칭 中韓 병기)
 
 ---
 
@@ -174,6 +174,13 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-07-26 — 언어 규칙 강제 (설명 한국어, 명칭 中韓 병기)
+- create_place/update_place_fields에 하드 검증: 제목·append_note·설명에 한국어 없으면 거부(korean_required)
+- 제목 형식 '中文名 (한국어 명칭)', 설명 본문 한국어, 주소는 지도 검색용으로 중국어 원문 유지
+- update_place_fields에 replace_description 추가: agent 장소 또는 한국어 없는 설명만 전면 재작성 허용,
+  사용자가 쓴 한국어 설명은 보호(user_content_protected)
+- 연구 사이클에 언어 정비 단계 추가: 기존 중국어/영어 위주 장소를 규칙대로 재작성
 
 ### 2026-07-26 — 웹 스크래핑 조사 필수화 + 조사 이력 기록
 - 새 테이블: agent_search_logs(검색어·시각·새 콘텐츠 수확량), agent_web_visits(열람 URL·횟수, unique)

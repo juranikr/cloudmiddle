@@ -192,16 +192,30 @@ TOOLS: list[dict[str, Any]] = [
             "name": "update_place_fields",
             "description": (
                 "기존 기록을 최대한 보존하며 보완한다. "
-                "설명은 append_note로만 추가. 제목은 local_name(현지 명칭)을 병기하거나, "
-                "정말 필요할 때만 replace_title로 교체."
+                "언어 규칙: 설명 본문은 무조건 한국어(중국어 정보는 번역), "
+                "명칭은 중국어+한국어 병기('中文名 (한국어 명칭)'), 주소는 중국어 원문. "
+                "사용자가 쓴 설명은 append_note로만 보완. "
+                "설명이 중국어/영어 위주로 잘못 작성된 장소(주로 agent 추가분)는 "
+                "replace_description으로 한국어 본문으로 전면 재작성 "
+                "(주소는 '주소: 山东省济南市…' 형태로 중국어 유지)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "place_id": {"type": "integer"},
-                    "append_note": {"type": "string", "description": "설명 끝에 덧붙일 한국어 보완 정보"},
+                    "append_note": {"type": "string", "description": "설명 끝에 덧붙일 보완 정보. 반드시 한국어"},
                     "local_name": {"type": "string", "description": "현지(중국어 등) 공식 명칭·주소 병기"},
-                    "replace_title": {"type": "string", "description": "기존 제목을 꼭 바꿔야 할 때만"},
+                    "replace_title": {
+                        "type": "string",
+                        "description": "제목 교체. 반드시 '中文名 (한국어 명칭)' 병기 형식",
+                    },
+                    "replace_description": {
+                        "type": "string",
+                        "description": (
+                            "설명 전면 재작성(한국어 본문 필수). agent 추가 장소이거나 "
+                            "기존 설명에 한국어가 전혀 없을 때만 허용. 기존 유용 정보는 번역해 포함"
+                        ),
+                    },
                     "category": {"type": "string"},
                 },
                 "required": ["place_id"],
@@ -212,12 +226,19 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_place",
-            "description": "웹 조사·지오코딩 후 지도에 없는 유용한 지난 장소를 추천 추가한다. 매 사이클 소수를 적극 등록. 제목에 현지 명칭 병기.",
+            "description": (
+                "웹 조사·지오코딩 후 지도에 없는 유용한 지난 장소를 추천 추가한다. "
+                "매 사이클 소수를 적극 등록. "
+                "언어 규칙(위반 시 거부됨): title은 '中文名 (한국어 명칭)' 형식으로 "
+                "중국어+한국어 병기 (예: '泉城广场 (취안청 광장)'). "
+                "description 본문은 무조건 한국어로 작성하고, 지도 검색용 주소는 "
+                "'주소: 山东省济南市…' 형태로 중국어 원문을 포함할 것."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
+                    "title": {"type": "string", "description": "'中文名 (한국어 명칭)' 병기 필수"},
+                    "description": {"type": "string", "description": "한국어 본문 + 중국어 주소 포함"},
                     "category": {"type": "string"},
                     "lat": {"type": "number"},
                     "lng": {"type": "number"},
@@ -539,6 +560,14 @@ def _place_brief(m: Marker) -> dict[str, Any]:
         "is_agent_suggested": m.is_agent_suggested,
         "image_count": len(m.images or []),
     }
+
+
+def _has_hangul(s: str) -> bool:
+    return any("\uac00" <= ch <= "\ud7a3" for ch in s)
+
+
+def _has_cjk(s: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in s)
 
 
 class _TextExtractor(HTMLParser):
@@ -904,6 +933,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         if not m:
             return {"error": "not_found"}
         before = marker_field_snapshot(m)
+        original_description = m.description or ""
         changed: dict[str, Any] = {}
         local_name = str(args.get("local_name") or "").strip()
         if local_name and local_name not in m.title:
@@ -911,6 +941,11 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             changed["local_name"] = local_name
         replace_title = str(args.get("replace_title") or "").strip()
         if replace_title:
+            if not _has_hangul(replace_title):
+                return {
+                    "error": "korean_required",
+                    "detail": "제목은 '中文名 (한국어 명칭)' 형식으로 한국어를 병기해 다시 호출하세요.",
+                }
             # 기존 제목은 설명에 보존
             if m.title and m.title not in (m.description or ""):
                 note = f"[이전 제목 보존] {m.title}"
@@ -919,9 +954,28 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             changed["replace_title"] = m.title
         append_note = str(args.get("append_note") or "").strip()
         if append_note:
+            if not _has_hangul(append_note):
+                return {
+                    "error": "korean_required",
+                    "detail": "append_note는 한국어로 작성해야 합니다. 중국어 정보는 번역해 다시 호출하세요.",
+                }
             if append_note not in (m.description or ""):
                 m.description = ((m.description or "").rstrip() + "\n\n" + append_note).strip()[:2000]
             changed["append_note"] = True
+        replace_description = str(args.get("replace_description") or "").strip()
+        if replace_description:
+            if not _has_hangul(replace_description):
+                return {
+                    "error": "korean_required",
+                    "detail": "replace_description 본문은 한국어여야 합니다 (주소만 중국어 유지).",
+                }
+            if not m.is_agent_suggested and _has_hangul(original_description):
+                return {
+                    "error": "user_content_protected",
+                    "detail": "사용자가 작성한 한국어 설명은 전면 교체 불가. append_note로 보완하세요.",
+                }
+            m.description = replace_description[:2000]
+            changed["replace_description"] = True
         if args.get("category"):
             try:
                 m.category = MarkerCategory(str(args["category"]))
@@ -952,6 +1006,23 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
 
     if name == "create_place":
         title = str(args.get("title") or "추천 장소")[:200]
+        desc = str(args.get("description") or "")[:2000]
+        if not _has_hangul(title):
+            return {
+                "error": "korean_required",
+                "detail": (
+                    "title은 '中文名 (한국어 명칭)' 형식으로 중국어+한국어를 병기해야 합니다. "
+                    "예: '泉城广场 (취안청 광장)'. 수정해 다시 호출하세요."
+                ),
+            }
+        if desc and not _has_hangul(desc):
+            return {
+                "error": "korean_required",
+                "detail": (
+                    "description 본문은 무조건 한국어로 작성해야 합니다. "
+                    "중국어 정보는 번역하고, 주소만 '주소: 山东省济南市…' 형태로 중국어를 유지하세요."
+                ),
+            }
         cat_raw = str(args.get("category") or "other")
         try:
             cat = MarkerCategory(cat_raw)
@@ -962,7 +1033,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             category=cat,
             shape=MarkerShape.point,
             title=title,
-            description=str(args.get("description") or "")[:2000],
+            description=desc,
             lat=float(args["lat"]),
             lng=float(args["lng"]),
             agent_context=str(args.get("context") or "")[:8000],
