@@ -50,7 +50,7 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
   upsert_knowledge로 이 규칙에 맞게 수정하라.
 
 【오래된 데이터 재검증】
-- list_stale_places(기본 30일)로 오래 확인 안 된 장소를 받아 사이클당 3~5곳을 web_search로 재확인한다.
+- list_stale_places(기본 30일)로 오래 확인 안 된 장소를 받아 사이클당 8~12곳을 web_search로 재확인한다.
 - 영업·존재 확인 → verify_place(valid). 폐업·소멸 정황 → verify_place(closed, note). 삭제하지 말 것.
 - 이전(搬迁) 의심 → 반드시 한 번 더 검토: 같은 지점의 이전인지, 다른 지점(분점)인지 구분.
   체인점이면 지점명·구(区)·도로명을 대조. 다른 지점이면 좌표 유지 + verify_place(valid, note).
@@ -63,10 +63,10 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
   ① 수확이 있었는데 덜 판 검색어는 심화, ② 소진된 검색어는 회피,
   ③ 안 해본 테마의 새 키워드 1개 이상 (예: 济南 小吃街 / 夜景 / 免费 景点 / 芙蓉街 美食 /
   지난 여행 코스 / 济南 网红 打卡 / 계절 행사)
-- web_search 결과에서 seen=false 페이지 위주로 fetch_page 2~4개 정독.
+- web_search 결과에서 seen=false 페이지 위주로 fetch_page 4~8개 정독 (키워드 2~3개 조사).
   seen=true·already_visited=true 페이지는 다시 열지 않는다.
 - 여러 글에서 반복 추천되는데 지도에 없는 장소를 골라
-  list_places로 중복 확인 → geocode_place → create_place (사이클당 1~5개).
+  list_places로 중복 확인 → geocode_place → create_place (사이클당 5~12개, 근거가 있으면 많을수록 좋다).
 - 이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·꿀팁·교통·현지 표기·별칭 등)가
   나오면 버리지 말고 update_place_fields(append_note·local_name)나
   update_place_context로 해당 장소를 보완한다. 사용자 원문은 보존하고 덧붙이기만 할 것.
@@ -105,10 +105,10 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 3) 작업 큐의 미읽음 이벤트 전원 검토·조치 → mark_events_read
 4) (큐가 비었을 때만) 전체 지도 중복 스캔(list_places로 동명·동의어 장소) → 병합
 5) 웹 조사 필수 1회 (사진 보강보다 먼저): list_research_history → 키워드 선정 → web_search →
-   fetch_page(미열람 글 2~4개) → 반복 추천 미등록 장소 create_place, 기존 장소 정보 보완
-6) 재검증: list_stale_places → 3~5곳 web_search 재확인 → verify_place
+   fetch_page(미열람 글 4~8개) → 반복 추천 미등록 장소 create_place, 기존 장소 정보 보완
+6) 재검증: list_stale_places → 8~12곳 web_search 재확인 → verify_place
    (이전 의심 시 지점 구분 재검토 필수)
-7) 사진 보강: image_count가 0인 장소 1~2곳 → search_place_images(중국어 명칭) →
+7) 사진 보강: image_count가 0인 장소 3~6곳 → search_place_images(중국어 명칭) →
    attach_image_from_url (위키미디어 자유 라이선스만, source에 출처 기록)
 8) agent_context 보완
 9) upsert_knowledge 최종 정리(research_strategy 포함) 후 한 줄 요약
@@ -195,10 +195,10 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
     # 작업 건수에 비례해 스텝 확보 (건당 ~4 + 지식/롤백 오버헤드)
     if research_only:
         # 스크래핑 조사 + 재검증 + 사진 보강까지 수행하므로 여유 확보
-        steps_limit = max(base_steps, 45)
+        steps_limit = max(base_steps, 110)
     else:
-        # 큐 처리 후 필수 웹 조사 분량(~8스텝) 포함
-        steps_limit = max(base_steps, min(56, 18 + unread_before * 4))
+        # 큐 처리 후 필수 웹 조사 분량(~30스텝) 포함
+        steps_limit = max(base_steps, min(140, 40 + unread_before * 4))
 
     if research_only:
         user_msg = (
@@ -214,20 +214,20 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "3) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
             "같은 실체면 거리와 무관하게 merge_places (거리 기준으로 건너뛰지 말 것)\n"
             "4) 웹 조사(필수): list_research_history로 과거 검색어·열람 이력 확인 → "
-            "덜 판 검색어 심화 + 새 테마 키워드 조사 → web_search에서 seen=false 결과 위주로 "
-            "fetch_page 2~4개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
+            "덜 판 검색어 심화 + 새 테마 키워드 2~3개 조사 → web_search에서 seen=false 결과 위주로 "
+            "fetch_page 4~8개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
             "5) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
-            "geocode_place → create_place 1~5개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
+            "geocode_place → create_place 5~12개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
             "이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·별칭)는 "
             "update_place_fields/update_place_context로 보완\n"
             "6) 조사 전략(효과적 검색어·소스·다음 키워드)을 upsert_knowledge"
             "(topic 'research_strategy')로 병합. 7)·8)보다 먼저, 조사 직후 바로 호출할 것 "
             "(빠뜨리면 실패)\n"
-            "7) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 3~5곳을 web_search로 "
+            "7) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 8~12곳을 web_search로 "
             "재확인 → verify_place(valid|closed|moved|uncertain + note). "
             "이전(搬迁) 의심이면 같은 지점의 이전인지 다른 지점(분점)인지 반드시 구분하고, "
             "같은 지점 이전이 확실할 때만 좌표를 갱신할 것\n"
-            "8) 사진 보강: image_count가 0인 장소 1~2곳을 골라 search_place_images(중국어 명칭) → "
+            "8) 사진 보강: image_count가 0인 장소 3~6곳을 골라 search_place_images(중국어 명칭) → "
             "attach_image_from_url로 업로드 (자유 라이선스만, source에 출처·라이선스 기록)\n"
             "끝나면 한 줄 요약."
         )
@@ -245,9 +245,11 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "이미 병합됐으면 undo_merge로 분리 (거리·이름 유사만으로 기각 금지)\n"
             "4) count상 미처리가 0인지 list_open_appeals·list_unread_events로 재확인\n"
             "5) 큐를 비운 뒤 웹 조사 1회 필수: list_research_history → 키워드 선정(심화+새 테마) → "
-            "web_search → seen=false 글 2~3개 fetch_page → 반복 추천 미등록 장소 create_place, "
+            "web_search → seen=false 글 3~6개 fetch_page → 반복 추천 미등록 장소 create_place 3~8개, "
             "기존 장소와 겹치는 유용한 정보는 update_place_fields/context로 보완\n"
-            "6) upsert_knowledge(research_strategy 포함) 후 한 줄 요약\n"
+            "6) 여유 스텝이 남으면 재검증(list_stale_places → verify_place 3~5곳)과 "
+            "사진 보강(image_count 0인 장소 2~3곳)도 수행\n"
+            "7) upsert_knowledge(research_strategy 포함) 후 한 줄 요약\n"
             "일부만 처리하고 끝내면 실패다."
         )
 
