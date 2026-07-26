@@ -175,6 +175,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 
 ## 10) 세션 로그 (최신 위)
 
+### 2026-07-26 — 에이전트 지식필수·장소 쿼리
+- ReAct 유지: upsert_knowledge 미호출 시 추가 턴으로 강제 유도
+- list_places에 q/category/near_*/exclude_ids 필터
+- find_nearby_candidates: 전체 활성 장소 비교임을 툴 설명에 명시
+
 ### 2026-07-26 — 구역 그리기 멀티터치 무시
 - `ZoneDrawer`: 터치 2개 이상이면 스트로크 취소·무시 (핀치 줌이 구역으로 저장되지 않음)
 - 한 손가락 탭 선택·드래그 그리기는 유지

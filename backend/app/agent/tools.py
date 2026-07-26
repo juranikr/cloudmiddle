@@ -59,10 +59,37 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_places",
-            "description": "활성 장소 목록(병합되지 않은 것만).",
+            "description": (
+                "활성 장소(병합되지 않은 것)를 조건으로 조회한다. "
+                "병합 후보를 찾을 때 미읽음/이의 대상뿐 아니라 수정되지 않은 기존 장소까지 "
+                "이 툴로 전체 지도에서 쿼리한다. "
+                "q·category·near_lat/near_lng/radius_m를 조합해 필요한 범위만 가져올 것."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"limit": {"type": "integer", "default": 80}},
+                "properties": {
+                    "q": {
+                        "type": "string",
+                        "description": "제목·설명·agent_context 부분 일치 검색(한국어/중국어/영문)",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "tourist|lodging|restaurant|transport|shopping|drink|convenience|other",
+                    },
+                    "near_lat": {"type": "number", "description": "이 좌표 근처만 (WGS84)"},
+                    "near_lng": {"type": "number", "description": "이 좌표 근처만 (WGS84)"},
+                    "radius_m": {
+                        "type": "number",
+                        "default": 150,
+                        "description": "near_lat/lng와 함께 쓸 반경(미터). 기본 150",
+                    },
+                    "exclude_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "결과에서 제외할 place_id (자기 자신 등)",
+                    },
+                    "limit": {"type": "integer", "default": 80},
+                },
             },
         },
     },
@@ -82,12 +109,16 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "find_nearby_candidates",
-            "description": "같은 장소로 의심되는 가까운 핀들을 찾는다 (미터 단위).",
+            "description": (
+                "기준 place_id 주변의 활성 장소를 거리순으로 반환한다. "
+                "수정/이의가 없는 기존 핀도 모두 포함되므로, 병합 후보 탐색의 1순위 툴이다. "
+                "반경을 넓혀(예: 120~250m) 이름 유사 후보를 놓치지 말 것."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "place_id": {"type": "integer"},
-                    "radius_m": {"type": "number", "default": 80},
+                    "place_id": {"type": "integer", "description": "미읽음/이의로 주목 중인 기준 장소"},
+                    "radius_m": {"type": "number", "default": 120},
                 },
                 "required": ["place_id"],
             },
@@ -246,7 +277,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_knowledge",
-            "description": "에이전트 장기 지식/교훈 목록. 작업 전에 반드시 확인한다.",
+            "description": "【필수·시작】에이전트 장기 지식/교훈. 다른 툴보다 먼저 호출한다.",
             "parameters": {
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "default": 30}},
@@ -258,8 +289,8 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "upsert_knowledge",
             "description": (
-                "교훈·조사 결과를 주제(topic)별로 저장/병합한다. "
-                "기존 내용과 모순되면 정리해 하나의 완성된 content로 넘긴다."
+                "【필수】교훈·조사·병합 정책을 주제(topic)별로 저장/병합한다. "
+                "매 사이클 종료 전 최소 1회 호출. 기존 content와 모순되면 완성본으로 재작성."
             ),
             "parameters": {
                 "type": "object",
@@ -361,10 +392,50 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
 
     if name == "list_places":
         limit = int(args.get("limit") or 80)
+        q = str(args.get("q") or "").strip()
+        cat_raw = str(args.get("category") or "").strip()
+        exclude = args.get("exclude_ids") or []
+        try:
+            exclude_ids = {int(x) for x in exclude}
+        except (TypeError, ValueError):
+            exclude_ids = set()
+        near_lat = args.get("near_lat")
+        near_lng = args.get("near_lng")
+        radius = float(args.get("radius_m") or 150)
+
+        query = db.query(Marker).filter(Marker.merged_into_id.is_(None))
+        if cat_raw:
+            try:
+                query = query.filter(Marker.category == MarkerCategory(cat_raw))
+            except ValueError:
+                pass
+        if q:
+            like = f"%{q}%"
+            query = query.filter(
+                (Marker.title.ilike(like))
+                | (Marker.description.ilike(like))
+                | (Marker.agent_context.ilike(like))
+            )
+        if exclude_ids:
+            query = query.filter(~Marker.id.in_(exclude_ids))
+
+        # Geo filter needs all candidates then haversine (dataset is small)
+        if near_lat is not None and near_lng is not None:
+            nlat, nlng = float(near_lat), float(near_lng)
+            rows = query.all()
+            scored = []
+            for m in rows:
+                dist = _haversine_m(nlat, nlng, m.lat, m.lng)
+                if dist <= radius:
+                    scored.append((dist, m))
+            scored.sort(key=lambda x: x[0])
+            return [
+                {**_place_brief(m), "distance_m": round(dist, 1)}
+                for dist, m in scored[: max(1, min(limit, 200))]
+            ]
+
         rows = (
-            db.query(Marker)
-            .filter(Marker.merged_into_id.is_(None))
-            .order_by(Marker.updated_at.desc())
+            query.order_by(Marker.updated_at.desc())
             .limit(max(1, min(limit, 200)))
             .all()
         )
@@ -401,7 +472,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
 
     if name == "find_nearby_candidates":
         pid = int(args["place_id"])
-        radius = float(args.get("radius_m") or 80)
+        radius = float(args.get("radius_m") or 120)
         m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
         if not m:
             return {"error": "not_found"}
