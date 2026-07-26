@@ -184,7 +184,11 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 - 매 사이클 웹 조사 1회 필수(큐 처리 후): 이력 확인 → 덜 판/새 키워드 → 미열람 글 2~4개 정독 →
   반복 추천 미등록 장소 create_place, 기존 장소와 겹치는 유용 정보는 update_place_fields/context로 보완
 - 조사 전략은 upsert_knowledge(topic 'research_strategy')에 축적, fetch_page 미사용 시 넛지
-- steps_limit: research 22, 큐 사이클 18+unread*4(최대 56)
+- steps_limit: research 36, 큐 사이클 18+unread*4(최대 56)
+- 순서 조정: 웹 조사를 사진 보강보다 먼저, 전략 저장(upsert_knowledge)은 조사 직후 즉시
+  (스텝 소진으로 지식 저장이 누락되던 실패 패턴 수정)
+- 운영 검증: 泉城广场·百花洲·宽厚里 신규 등록, 黑虎泉 무료입장 정보 보완,
+  research_strategy 지식에 소진/미개척 키워드 전략 축적 확인
 
 ### 2026-07-26 — 오래된 장소 재검증 로직
 - markers.last_verified_at 컬럼 추가 (멱등 마이그레이션)
