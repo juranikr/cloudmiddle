@@ -123,30 +123,34 @@ def seed_data(db: Session) -> None:
             db.add(AgentKnowledge(**item))
             changed = True
 
-    if db.query(Marker.id).filter(
-        Marker.city_id == 2,
-        Marker.shape == MarkerShape.polygon,
-        Marker.merged_into_id.is_(None),
-    ).first() is None:
-        zone_specs = [
-            ("中街·故宫 (중제·고궁권)", "선양고궁·장씨수부·중제를 도보로 잇는 핵심 역사 구역", 41.785, 41.810, 123.425, 123.475),
-            ("西塔·沈阳站 (서탑·선양역권)", "서탑 음식문화와 선양역 주변을 묶는 서부 도심 구역", 41.790, 41.815, 123.375, 123.425),
-            ("北陵·皇姑 (북릉·황구권)", "북릉공원과 청 소릉을 중심으로 한 북부 역사 구역", 41.815, 41.865, 123.405, 123.465),
-            ("九一八·大东 (9·18·다둥권)", "9·18 역사박물관과 동북 근현대사를 살피는 북동부 구역", 41.840, 41.890, 123.455, 123.505),
-            ("铁西工业 (톄시 공업권)", "중국공업박물관과 톄시 현대문화 공간을 잇는 공업사 구역", 41.780, 41.830, 123.300, 123.380),
+    zone_specs = [
+        ("中街·故宫 (중제·고궁권)", "선양고궁·장씨수부·중제를 도보로 잇는 핵심 역사 구역", 41.785, 41.810, 123.425, 123.475),
+        ("西塔·沈阳站 (서탑·선양역권)", "서탑 음식문화와 선양역 주변을 묶는 서부 도심 구역", 41.790, 41.815, 123.375, 123.425),
+        ("北陵·皇姑 (북릉·황구권)", "북릉공원과 청 소릉을 중심으로 한 북부 역사 구역", 41.815, 41.865, 123.405, 123.465),
+        ("九一八·大东 (9·18·다둥권)", "9·18 역사박물관과 동북 근현대사를 살피는 북동부 구역", 41.830, 41.890, 123.445, 123.505),
+        ("铁西工业 (톄시 공업권)", "중국공업박물관과 톄시 현대문화 공간을 잇는 공업사 구역", 41.780, 41.830, 123.300, 123.380),
+        ("浑南·省博 (훈난·성박권)", "랴오닝성박물관과 훈난 신도시 문화시설을 묶는 남부 박물관 구역", 41.630, 41.720, 123.380, 123.520),
+    ]
+    for title, description, south, north, west, east in zone_specs:
+        exists = db.query(Marker.id).filter(
+            Marker.city_id == 2,
+            Marker.shape == MarkerShape.polygon,
+            Marker.title == title,
+            Marker.merged_into_id.is_(None),
+        ).first()
+        if exists is not None:
+            continue
+        polygon = [
+            {"lat": south, "lng": west}, {"lat": south, "lng": east},
+            {"lat": north, "lng": east}, {"lat": north, "lng": west},
         ]
-        for title, description, south, north, west, east in zone_specs:
-            polygon = [
-                {"lat": south, "lng": west}, {"lat": south, "lng": east},
-                {"lat": north, "lng": east}, {"lat": north, "lng": west},
-            ]
-            db.add(Marker(
-                user_id=None, city_id=2, category=MarkerCategory.tourist,
-                shape=MarkerShape.polygon, title=title, description=description,
-                lat=(south + north) / 2, lng=(west + east) / 2,
-                polygon=json.dumps(polygon), coordinate_source="curated_zone",
-                coordinate_crs="WGS84", agent_context="관광 동선용 운영 구역",
-            ))
+        db.add(Marker(
+            user_id=None, city_id=2, category=MarkerCategory.tourist,
+            shape=MarkerShape.polygon, title=title, description=description,
+            lat=(south + north) / 2, lng=(west + east) / 2,
+            polygon=json.dumps(polygon), coordinate_source="curated_zone",
+            coordinate_crs="WGS84", agent_context="관광 동선용 운영 구역",
+        ))
         changed = True
 
     if changed:

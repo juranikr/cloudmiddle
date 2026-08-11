@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.admin_api import router as admin_router
 from app.agent.runner import run_agent
+from app.agent.tools import reconcile_proposal_tasks
 from app.auth import create_access_token, get_admin_user, get_current_user, verify_password
 from app.config import settings
 from app.db import Base, SessionLocal, engine, get_db
@@ -97,6 +98,8 @@ def on_startup() -> None:
     db = SessionLocal()
     try:
         seed_data(db)
+        for city_id, in db.query(City.id).filter(City.status == "active").all():
+            reconcile_proposal_tasks(db, city_id=city_id)
     finally:
         db.close()
 

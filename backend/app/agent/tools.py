@@ -768,6 +768,37 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _containing_zone(db: Session, *, city_id: int, lat: float, lng: float) -> Optional[Marker]:
+    """Return the smallest active polygon zone containing a WGS84 point."""
+    matches: list[tuple[float, Marker]] = []
+    zones = db.query(Marker).filter(
+        Marker.city_id == city_id,
+        Marker.shape == MarkerShape.polygon,
+        Marker.merged_into_id.is_(None),
+    ).all()
+    for zone in zones:
+        try:
+            points = json.loads(zone.polygon or "[]")
+            vertices = [(float(item["lat"]), float(item["lng"])) for item in points]
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+        if len(vertices) < 3:
+            continue
+        inside = False
+        j = len(vertices) - 1
+        for i, (yi, xi) in enumerate(vertices):
+            yj, xj = vertices[j]
+            crosses = (yi > lat) != (yj > lat)
+            if crosses and lng < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+                inside = not inside
+            j = i
+        if inside:
+            lats = [item[0] for item in vertices]
+            lngs = [item[1] for item in vertices]
+            matches.append(((max(lats) - min(lats)) * (max(lngs) - min(lngs)), zone))
+    return min(matches, key=lambda item: item[0])[1] if matches else None
+
+
 def _place_brief(m: Marker) -> dict[str, Any]:
     return {
         "id": m.id,
@@ -1610,6 +1641,15 @@ def run_tool(
             ).first()
             if zone is not None:
                 m.zone_id = zone.id
+        else:
+            inferred_zone = _containing_zone(
+                db,
+                city_id=city_id,
+                lat=payload["lat"],
+                lng=payload["lng"],
+            )
+            if inferred_zone is not None:
+                m.zone_id = inferred_zone.id
         if payload["chain_name_local"]:
             chain = db.query(PlaceChain).filter(
                 PlaceChain.name_local.ilike(payload["chain_name_local"])

@@ -330,6 +330,40 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertIsNone(place.merged_into_id)
         self.assertEqual(self.db.query(PlaceChain).count(), 1)
 
+    def test_approved_place_without_zone_is_inferred_from_polygon(self) -> None:
+        zone = Marker(
+            city_id=2,
+            category=MarkerCategory.tourist,
+            shape=MarkerShape.polygon,
+            title="중제·고궁권",
+            description="도보 관광 구역",
+            lat=41.795,
+            lng=123.45,
+            polygon=json.dumps([
+                {"lat": 41.78, "lng": 123.43},
+                {"lat": 41.78, "lng": 123.47},
+                {"lat": 41.81, "lng": 123.47},
+                {"lat": 41.81, "lng": 123.43},
+            ]),
+        )
+        self.db.add(zone)
+        self.db.commit()
+        applied = run_tool(
+            self.db,
+            "create_place",
+            {
+                "title": "张氏帅府 (장씨수부)",
+                "description": "근대 동북 역사를 이해하는 장소입니다.",
+                "category": "tourist",
+                "lat": 41.793,
+                "lng": 123.449,
+            },
+            city_id=2,
+            approved=True,
+        )
+        created = self.db.get(Marker, applied["place_id"])
+        self.assertEqual(created.zone_id, zone.id)
+
     def test_description_append_is_rejected_in_favor_of_insights(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
         before = place.description
