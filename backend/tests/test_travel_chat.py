@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from app.agent.tools import TOOLS
 from app.config import settings
 from app.db import Base
-from app.models import City, TravelChatMessage
+from app.models import City, Marker, MarkerCategory, TravelChatMessage
 from app.travel_chat import (
     RESEARCH_TOOLS,
     WRITE_TOOLS,
@@ -319,6 +319,45 @@ class TravelChatLoopTests(unittest.TestCase):
             {"type": "function", "function": {"name": "propose_place"}},
         )
         self.assertNotIn("tools", completions.requests[-1])
+
+    def test_existing_brand_places_skip_duplicate_research_and_proposals(self) -> None:
+        self.db.add_all([
+            Marker(
+                city_id=1,
+                category=MarkerCategory.drink,
+                title="喜茶沈阳大悦城店 (헤이티 선양 다웨청점)",
+                lat=41.8007,
+                lng=123.4637,
+            ),
+            Marker(
+                city_id=1,
+                category=MarkerCategory.drink,
+                title="茉酸奶沈阳大悦城旗舰店 (모어요거트 선양 다웨청 플래그십점)",
+                lat=41.8007,
+                lng=123.4637,
+            ),
+        ])
+        self.db.commit()
+        completions = _FakeCompletions(tool_rounds=0)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat.run_tool") as tool,
+        ):
+            result = answer_travel_chat(
+                self.db,
+                user_id=1,
+                city_id=1,
+                message="헤이티와 모어요거트를 지도에 추가해줘",
+            )
+
+        tool.assert_not_called()
+        self.assertIn("이미 지도에 등록", result["row"].content)
+        self.assertEqual(len(result["place_ids"]), 2)
 
     def test_final_model_tool_error_never_becomes_http_500(self) -> None:
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FailingCompletions()))

@@ -278,6 +278,15 @@ def answer_travel_chat(
     resolved_message = _resolve_context_message(message, prior)
     write_intent, allowed = _chat_capabilities(message, context_message=resolved_message)
     brand_targets = _brand_targets(resolved_message)
+    existing_target_places: dict[str, Marker] = {}
+    for target in brand_targets:
+        for marker in markers:
+            searchable = f"{marker.title} {marker.description or ''}".casefold()
+            if any(alias.casefold() in searchable for alias in BRAND_ANSWER_ALIASES[target]):
+                existing_target_places[target] = marker
+                break
+    if write_intent and brand_targets and set(brand_targets).issubset(existing_target_places):
+        allowed = set()
     system = f"""당신은 WONRAE(遠來)의 {city.name_ko}({city.name_local}) 여행 설계자다.
 목표는 많이 나열하는 것이 아니라 실제 이틀 여행에서 좋은 선택과 동선을 주는 것이다.
 
@@ -339,8 +348,8 @@ def answer_travel_chat(
     tool_results: list[dict[str, Any]] = []
     proposal_ids: list[int] = []
     write_attempted = False
-    write_succeeded = False
-    successful_write_targets: set[str] = set()
+    write_succeeded = bool(existing_target_places)
+    successful_write_targets: set[str] = set(existing_target_places)
     actionable_targets: set[str] = set()
     verified_coordinates: list[tuple[float, float]] = []
     target_business_sources: dict[str, list[str]] = {}
@@ -805,6 +814,13 @@ def answer_travel_chat(
                     f"{target_text}을 관리자 승인 대기 제안 #{', #'.join(map(str, sorted(set(proposal_ids))))}로 실제 저장했습니다. "
                     "관리자가 승인하면 지도에 반영됩니다."
                 )
+            elif existing_target_places:
+                existing_refs = ", ".join(
+                    f"{target} 장소 #{existing_target_places[target].id}"
+                    for target in brand_targets
+                    if target in existing_target_places
+                )
+                final_text = f"{existing_refs}로 이미 지도에 등록되어 있습니다. 중복 제안은 만들지 않았습니다."
             elif "실제" not in final_text:
                 final_text = f"{target_text}의 확인된 정보를 기존 지도 장소에 실제 반영했습니다.\n\n{final_text}"
         else:
