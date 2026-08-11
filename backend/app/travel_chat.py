@@ -321,6 +321,7 @@ def answer_travel_chat(
     successful_write_targets: set[str] = set()
     actionable_targets: set[str] = set()
     verified_coordinates: list[tuple[float, float]] = []
+    target_business_sources: dict[str, set[str]] = {}
 
     def writes_complete() -> bool:
         return write_succeeded and (
@@ -398,8 +399,16 @@ def answer_travel_chat(
             enrichment: list[dict[str, Any]] = []
             chinese_names = {"모어요거트": "茉酸奶", "헤이티": "喜茶 HEYTEA"}
             geo_queries = {
-                "모어요거트": f"{city.name_local}大悦城 茉酸奶旗舰店",
-                "헤이티": f"{city.name_local}大悦城 喜茶",
+                "모어요거트": [
+                    f"{city.name_local}大悦城 茉酸奶旗舰店",
+                    f"{city.name_local}大悦城C区",
+                    f"{city.name_local}大悦城",
+                ],
+                "헤이티": [
+                    f"{city.name_local}大悦城 喜茶",
+                    f"{city.name_local}大悦城C区",
+                    f"{city.name_local}大悦城",
+                ],
             }
             for target in brand_targets:
                 related_seed = next(
@@ -415,6 +424,12 @@ def answer_travel_chat(
                     if related_seed
                     else []
                 )
+                target_business_sources[target] = {
+                    str(item.get("href"))
+                    for item in search_items
+                    if isinstance(item, dict)
+                    and str(item.get("href") or "").startswith(("http://", "https://"))
+                }
                 fetched: list[dict[str, Any]] = []
                 for item in search_items[:2]:
                     url = str(item.get("href") or "") if isinstance(item, dict) else ""
@@ -426,14 +441,26 @@ def answer_travel_chat(
                     fetched.append(fetch_result)
                     if isinstance(fetch_result, dict) and fetch_result.get("text"):
                         break
-                geo_args = {
-                    "query": geo_queries[target],
-                    "limit": 5,
-                }
-                geo_result = run_tool(db, "geocode_place", geo_args, city_id=city_id)
-                _collect_tool_sources("geocode_place", geo_result, sources)
-                tool_results.append({"name": "geocode_place", "args": geo_args, "result": geo_result})
-                geo_hits = geo_result.get("results") or [] if isinstance(geo_result, dict) else []
+                geo_result: dict[str, Any] = {"results": []}
+                geo_hits: list[dict[str, Any]] = []
+                geo_attempts: list[dict[str, Any]] = []
+                for geo_query in geo_queries[target]:
+                    geo_args = {"query": geo_query, "limit": 5}
+                    candidate_result = run_tool(db, "geocode_place", geo_args, city_id=city_id)
+                    if not isinstance(candidate_result, dict):
+                        candidate_result = {"results": [], "error": "invalid_geocode_result"}
+                    _collect_tool_sources("geocode_place", candidate_result, sources)
+                    tool_results.append({
+                        "name": "geocode_place",
+                        "args": geo_args,
+                        "result": candidate_result,
+                    })
+                    geo_attempts.append({"query": geo_query, "result": candidate_result})
+                    candidate_hits = candidate_result.get("results") or []
+                    if candidate_hits:
+                        geo_result = candidate_result
+                        geo_hits = candidate_hits
+                        break
                 for hit in geo_hits:
                     if isinstance(hit, dict) and hit.get("storage_allowed") is not False:
                         try:
@@ -447,13 +474,16 @@ def answer_travel_chat(
                     "search_results": search_items[:5],
                     "fetched_pages": fetched,
                     "geocode": geo_result,
+                    "geocode_attempts": geo_attempts,
                     "actionable": target in actionable_targets,
                 })
             messages.append({
                 "role": "system",
                 "content": (
                     "서버가 저장 요청 대상을 각각 페이지 열람·다중 지오코딩까지 실행한 결과다. actionable=true인 대상만 "
-                    "실제 지점명·근거 URL·좌표 후보가 준비된 것이다. false인 대상은 추측해 저장하지 마라:\n"
+                    "실제 지점명·근거 URL·좌표 후보가 준비된 것이다. false인 대상은 추측해 저장하지 마라. "
+                    "Each proposal source_urls must include at least one business-specific URL from that target's "
+                    "search_results. OpenStreetMap alone proves coordinates, not that the business exists:\n"
                     + json.dumps(enrichment, ensure_ascii=False, default=str)[:24000]
                 ),
             })
@@ -562,6 +592,7 @@ def answer_travel_chat(
                 result = {"error": "이 대화에서 허용되지 않은 작업입니다"}
             else:
                 unsupported_evidence: list[str] = []
+                missing_business_evidence = False
                 coordinate_mismatch = False
                 if name == "propose_place":
                     supplied_urls = [str(url) for url in (args.get("source_urls") or [])]
@@ -576,6 +607,20 @@ def answer_travel_chat(
                     unsupported_evidence = [
                         url for url in supplied_urls if url and url not in sources
                     ]
+                    serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
+                    proposed_targets = [
+                        target
+                        for target in brand_targets
+                        if any(
+                            alias.casefold() in serialized_args
+                            for alias in BRAND_ANSWER_ALIASES[target]
+                        )
+                    ]
+                    missing_business_evidence = bool(proposed_targets) and not any(
+                        url in target_business_sources.get(target, set())
+                        for target in proposed_targets
+                        for url in supplied_urls
+                    )
                     if verified_coordinates:
                         try:
                             proposed_lat = float(args["lat"])
@@ -592,6 +637,14 @@ def answer_travel_chat(
                         "error": "unsupported_source_urls",
                         "detail": "검색·페이지·지오코딩 결과에 실제로 있던 URL만 사용해 다시 호출하세요.",
                         "unsupported": unsupported_evidence[:6],
+                    }
+                elif missing_business_evidence:
+                    result = {
+                        "error": "business_evidence_required",
+                        "detail": (
+                            "source_urls에 이 대상의 search_results에서 받은 영업점 근거 URL을 "
+                            "1개 이상 넣으세요. OpenStreetMap만으로는 매장 존재를 입증할 수 없습니다."
+                        ),
                     }
                 elif coordinate_mismatch:
                     result = {

@@ -145,7 +145,12 @@ class _ForcedWriteCompletions:
                     function=SimpleNamespace(
                         name="propose_place",
                         arguments=json.dumps(
-                            {"title": "喜茶中街店 (헤이티 중제점)", "lat": 41.8, "lng": 123.45},
+                            {
+                                "title": "喜茶中街店 (헤이티 중제점)",
+                                "lat": 41.8,
+                                "lng": 123.45,
+                                "source_urls": ["https://example.com/branch"],
+                            },
                             ensure_ascii=False,
                         ),
                     ),
@@ -155,7 +160,12 @@ class _ForcedWriteCompletions:
                     function=SimpleNamespace(
                         name="propose_place",
                         arguments=json.dumps(
-                            {"title": "茉酸奶中街店 (모어요거트 중제점)", "lat": 41.8, "lng": 123.45},
+                            {
+                                "title": "茉酸奶中街店 (모어요거트 중제점)",
+                                "lat": 41.8,
+                                "lng": 123.45,
+                                "source_urls": ["https://example.com/branch"],
+                            },
                             ensure_ascii=False,
                         ),
                     ),
@@ -268,6 +278,8 @@ class TravelChatLoopTests(unittest.TestCase):
             if name == "fetch_page":
                 return {"url": "https://example.com/branch", "title": "branch", "text": "verified"}
             if name == "geocode_place":
+                if "茉酸奶" in _args["query"] or "喜茶" in _args["query"]:
+                    return {"results": []}
                 return {"results": [{"lat": 41.8, "lng": 123.45, "source": "osm"}]}
             if name == "propose_place":
                 return {"ok": True, "proposal_created": True, "proposal_id": 31}
@@ -282,6 +294,10 @@ class TravelChatLoopTests(unittest.TestCase):
 
         self.assertIn("실제 저장", result["row"].content)
         self.assertTrue(any(call.args[1] == "propose_place" for call in tool.call_args_list))
+        self.assertTrue(any(
+            call.args[1] == "geocode_place" and "大悦城C区" in call.args[2]["query"]
+            for call in tool.call_args_list
+        ))
         self.assertEqual(completions.requests[0]["tools"][0]["function"]["name"], "propose_place")
         self.assertEqual(
             completions.requests[0]["tool_choice"],
