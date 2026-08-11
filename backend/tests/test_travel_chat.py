@@ -15,6 +15,7 @@ from app.models import City, TravelChatMessage
 from app.travel_chat import (
     RESEARCH_TOOLS,
     WRITE_TOOLS,
+    _brand_source_urls,
     _chat_capabilities,
     _missing_brand_targets,
     _needs_answer_retry,
@@ -93,6 +94,14 @@ class TravelChatRoutingTests(unittest.TestCase):
             _missing_brand_targets("모어요거트와 헤이티", "喜茶 지점만 확인했습니다."),
             ["모어요거트"],
         )
+
+    def test_brand_sources_exclude_unrelated_search_results(self) -> None:
+        items = [
+            {"title": "喜茶(沈阳大悦城店)", "body": "沈阳门店", "href": "https://example.com/heytea"},
+            {"title": "沈阳酒店", "body": "住宿", "href": "https://example.com/hotel"},
+        ]
+
+        self.assertEqual(_brand_source_urls("헤이티", items), ["https://example.com/heytea"])
         self.assertNotIn(
             "https://fake.example/123",
             _strip_unsupported_urls(
@@ -274,7 +283,13 @@ class TravelChatLoopTests(unittest.TestCase):
         def fake_tool(_db, name, _args, *, city_id):
             self.assertEqual(city_id, 1)
             if name == "web_search":
-                return {"results": [{"href": "https://example.com/branch", "title": "branch"}]}
+                return {
+                    "results": [{
+                        "href": "https://example.com/branch",
+                        "title": _args["query"],
+                        "body": _args["query"],
+                    }]
+                }
             if name == "fetch_page":
                 return {"url": "https://example.com/branch", "title": "branch", "text": "verified"}
             if name == "geocode_place":

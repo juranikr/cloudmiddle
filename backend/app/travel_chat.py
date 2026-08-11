@@ -105,6 +105,28 @@ def _brand_targets(message: str) -> list[str]:
     return targets
 
 
+def _brand_source_urls(target: str, search_items: list[dict[str, Any]]) -> list[str]:
+    """Keep URLs whose result text actually names the requested brand."""
+    aliases = [
+        re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", alias.casefold())
+        for alias in BRAND_ANSWER_ALIASES[target]
+    ]
+    urls: list[str] = []
+    for item in search_items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("href") or "")
+        if not url.startswith(("http://", "https://")):
+            continue
+        haystack = " ".join(
+            str(item.get(field) or "") for field in ("title", "body", "href")
+        ).casefold()
+        normalized = re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", haystack)
+        if any(alias and alias in normalized for alias in aliases):
+            urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
 def _missing_brand_targets(message: str, content: str) -> list[str]:
     folded = (content or "").casefold()
     return [
@@ -321,7 +343,7 @@ def answer_travel_chat(
     successful_write_targets: set[str] = set()
     actionable_targets: set[str] = set()
     verified_coordinates: list[tuple[float, float]] = []
-    target_business_sources: dict[str, set[str]] = {}
+    target_business_sources: dict[str, list[str]] = {}
 
     def writes_complete() -> bool:
         return write_succeeded and (
@@ -424,12 +446,7 @@ def answer_travel_chat(
                     if related_seed
                     else []
                 )
-                target_business_sources[target] = {
-                    str(item.get("href"))
-                    for item in search_items
-                    if isinstance(item, dict)
-                    and str(item.get("href") or "").startswith(("http://", "https://"))
-                }
+                target_business_sources[target] = _brand_source_urls(target, search_items)
                 fetched: list[dict[str, Any]] = []
                 for item in search_items[:2]:
                     url = str(item.get("href") or "") if isinstance(item, dict) else ""
@@ -467,7 +484,7 @@ def answer_travel_chat(
                             verified_coordinates.append((float(hit["lat"]), float(hit["lng"])))
                         except (KeyError, TypeError, ValueError):
                             continue
-                if search_items and geo_hits:
+                if target_business_sources[target] and geo_hits:
                     actionable_targets.add(target)
                 enrichment.append({
                     "target": target,
@@ -595,6 +612,25 @@ def answer_travel_chat(
                 missing_business_evidence = False
                 coordinate_mismatch = False
                 if name == "propose_place":
+                    serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
+                    proposed_targets = [
+                        target
+                        for target in brand_targets
+                        if any(
+                            alias.casefold() in serialized_args
+                            for alias in BRAND_ANSWER_ALIASES[target]
+                        )
+                    ]
+                    selected_business_urls = list(dict.fromkeys(
+                        url
+                        for target in proposed_targets
+                        for url in target_business_sources.get(target, [])
+                    ))[:3]
+                    args["source_urls"] = list(dict.fromkeys([
+                        str(url)
+                        for url in (args.get("source_urls") or [])
+                        if str(url) in sources
+                    ] + selected_business_urls))
                     supplied_urls = [str(url) for url in (args.get("source_urls") or [])]
                     supplied_urls.extend(
                         str(item.get("source_url") or "")
@@ -607,17 +643,8 @@ def answer_travel_chat(
                     unsupported_evidence = [
                         url for url in supplied_urls if url and url not in sources
                     ]
-                    serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
-                    proposed_targets = [
-                        target
-                        for target in brand_targets
-                        if any(
-                            alias.casefold() in serialized_args
-                            for alias in BRAND_ANSWER_ALIASES[target]
-                        )
-                    ]
                     missing_business_evidence = bool(proposed_targets) and not any(
-                        url in target_business_sources.get(target, set())
+                        url in target_business_sources.get(target, [])
                         for target in proposed_targets
                         for url in supplied_urls
                     )
