@@ -809,7 +809,7 @@ export default function MapPage() {
             {!panelOpen && !showSearchList && !showSearchCard ? (
               <div className="place-list">
                 <div className="place-list__head">
-                  <strong>장소 {markers.length}</strong>
+                  <strong>장소 {markers.filter((item) => item.shape === "point").length} · 구역 {markers.filter((item) => item.shape === "polygon").length}</strong>
                 </div>
                 <ul>
                   {markers.map((m) => (
@@ -924,7 +924,10 @@ export default function MapPage() {
           </header>
           <div className="city-guide__days">
             {[1, 2].map((day) => {
-              const dayZones = zones.filter((_zone, index) => index % 2 === day - 1);
+              const dayZones = zones.filter((zone) => {
+                const isOldTown = /中街|西塔/.test(zone.title);
+                return day === 1 ? isOldTown : !isOldTown;
+              });
               return (
                 <article key={day}>
                   <span>DAY {day}</span>

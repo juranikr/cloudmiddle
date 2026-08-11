@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import math
@@ -739,6 +740,23 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+# The model repeatedly interpreted ``create_place`` as an unsafe direct write even
+# though the handler creates an admin proposal when auto-create is disabled.  Keep
+# the internal/approval action name for compatibility, but expose an unambiguous
+# research-facing alias so a successful research cycle produces reviewable data.
+_create_place_tool = next(
+    tool for tool in TOOLS if tool.get("function", {}).get("name") == "create_place"
+)
+_propose_place_tool = copy.deepcopy(_create_place_tool)
+_propose_place_tool["function"]["name"] = "propose_place"
+_propose_place_tool["function"]["description"] = (
+    "조사한 신규 장소를 관리자 승인 대기 제안으로 저장한다. 지도에 즉시 생성하지 않는다. "
+    "장소 후보를 upsert_agent_task에 적는 것은 성과가 아니며, 근거·좌표·구조화 정보가 "
+    "준비되면 반드시 이 도구를 호출한다. "
+    + _propose_place_tool["function"]["description"]
+)
+TOOLS.append(_propose_place_tool)
+
 
 def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     r = 6371000.0
@@ -1391,7 +1409,7 @@ def run_tool(
         db.commit()
         return {"ok": True, "changed": changed}
 
-    if name == "create_place":
+    if name in {"create_place", "propose_place"}:
         title = str(args.get("title") or "추천 장소")[:200]
         desc = str(args.get("description") or "")[:2000]
         if not _has_hangul(title):
@@ -1929,6 +1947,31 @@ def run_tool(
         row = db.query(AgentTask).filter(AgentTask.id == task_id, AgentTask.city_id == city_id).first() if task_id else None
         if row is None:
             title = str(args.get("title") or "").strip()[:240]
+            task_text = " ".join(
+                [
+                    title,
+                    str(args.get("kind") or ""),
+                    str(args.get("detail") or ""),
+                    str(args.get("success_metric") or ""),
+                ]
+            ).lower()
+            if any(
+                marker in task_text
+                for marker in (
+                    "승인 제안",
+                    "신규 장소 추가",
+                    "장소 등록 제안",
+                    "place proposal",
+                    "new place proposal",
+                )
+            ):
+                return {
+                    "error": "proposal_masquerading_as_task",
+                    "detail": (
+                        "신규 장소 후보는 백로그 성과가 아닙니다. 근거와 좌표를 보강한 뒤 "
+                        "propose_place로 관리자 승인 대기 제안을 저장하세요."
+                    ),
+                }
             row = db.query(AgentTask).filter(
                 AgentTask.city_id == city_id,
                 AgentTask.title == title,
@@ -1971,6 +2014,28 @@ def run_tool(
 
     if name == "upsert_knowledge":
         scope = str(args.get("scope") or "city")
+        category = str(args.get("category") or "playbook").strip().lower()
+        topic = str(args.get("topic") or "general").strip()
+        title = str(args.get("title") or "교훈").strip()
+        content = str(args.get("content") or "").strip()
+        journal_text = f"{topic} {title} {content}".lower()
+        if category == "workflow" or any(
+            marker in journal_text
+            for marker in ("사이클 요약", "승인 제안 요약", "작업 완료", "cycle summary", "run summary")
+        ):
+            return {
+                "error": "run_history_forbidden_in_knowledge",
+                "detail": (
+                    "실행 요약·처리 건수·완료 보고는 AgentRunStep에 이미 기록됩니다. "
+                    "지식에는 재사용 가능한 출처 전략·도시 맥락·편집 원칙만 저장하고, "
+                    "후속 일은 upsert_agent_task로 분리하세요."
+                ),
+            }
+        if category not in {"quality", "city", "source", "data_model", "playbook"}:
+            return {
+                "error": "invalid_knowledge_category",
+                "detail": "category는 quality|city|source|data_model|playbook 중 하나여야 합니다.",
+            }
         requested_place_id = int(args["place_id"]) if args.get("place_id") is not None else None
         if requested_place_id is not None and db.query(Marker.id).filter(
             Marker.id == requested_place_id, Marker.city_id == city_id
@@ -1979,14 +2044,14 @@ def run_tool(
         knowledge_city_id = None if scope == "global" else city_id
         row = upsert_knowledge(
             db,
-            topic=str(args.get("topic") or "general"),
-            title=str(args.get("title") or "교훈"),
-            content=str(args.get("content") or ""),
+            topic=topic,
+            title=title,
+            content=content,
             scope=scope,
             city_id=knowledge_city_id,
             place_id=requested_place_id,
             merge=bool(args.get("merge", False)),
-            category=str(args.get("category") or "playbook"),
+            category=category,
             summary=str(args.get("summary") or ""),
             principles=[str(item) for item in (args.get("principles") or [])],
             next_actions=[str(item) for item in (args.get("next_actions") or [])],

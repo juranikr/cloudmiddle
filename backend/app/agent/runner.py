@@ -31,7 +31,7 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 
 【작업 큐 — 최우선·전원 처리 필수】
 - 유저 메시지에 실린 미처리 이벤트·이의신청 ID 목록이 "작업 큐"다.
-- 큐가 비기 전에는 web_search / create_place / 연구성 탐색을 하지 않는다.
+- 큐가 비기 전에는 web_search / propose_place / 연구성 탐색을 하지 않는다.
 - 이의신청: 각 ID마다 resolve_appeal(resolved|dismissed + agent_note)로 반드시 종결.
   mark_appeals_read만으로 open 이의를 넘기지 말 것 (툴이 거부한다).
 - 미읽음 이벤트: 각 ID를 검토 → 필요 시 병합/보완/무시 판단 → mark_events_read.
@@ -78,7 +78,9 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 - web_search 결과에서 seen=false 페이지 위주로 fetch_page 4~8개 정독 (키워드 2~3개 조사).
   seen=true·already_visited=true 페이지는 다시 열지 않는다.
 - 여러 글에서 반복 추천되는데 지도에 없는 장소를 골라
-  list_places로 중복 확인 → geocode_place → create_place (사이클당 5~12개, 근거가 있으면 많을수록 좋다).
+  list_places로 중복 확인 → geocode_place → propose_place (사이클당 5~12개, 근거가 있으면 많을수록 좋다).
+  propose_place는 즉시 지도에 쓰지 않고 관리자 승인 대기 제안을 만든다. 신규 장소 후보를
+  upsert_agent_task에 '승인 제안'으로 적는 것은 성과가 아니며 도구가 거부한다.
 - 이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·역사 등)는
   upsert_place_insights로 출처·신뢰도와 함께 보완한다. description에는 실행 로그·이전 제목·조사 과정을 누적하지 않는다.
 - 조사 묶음의 마지막 동작은 반드시 upsert_knowledge(topic 'research_strategy')다:
@@ -108,7 +110,7 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 원칙:
 - 사용자 기록(설명·제목)은 최대한 보존. 세부 정보는 upsert_place_insights, 체인은 assign_place_chain,
   관광 권역은 assign_place_zone으로 보완.
-- 좌표 WGS84. 새 장소는 geocode_place 후 create_place.
+- 좌표 WGS84. 새 장소는 geocode_place 후 propose_place.
 - list_recent_rollbacks를 보고 롤백된 방향은 반복하지 말 것.
 
 우선순위:
@@ -117,7 +119,7 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 3) 작업 큐의 미읽음 이벤트 전원 검토·조치 → mark_events_read
 4) (큐가 비었을 때만) 전체 지도 중복 스캔(list_places로 동명·동의어 장소) → 병합
 5) 웹 조사 필수 1회 (사진 보강보다 먼저): list_research_history → 키워드 선정 → web_search →
-   fetch_page(미열람 글 4~8개) → 반복 추천 미등록 장소 create_place, 기존 장소 정보 보완
+   fetch_page(미열람 글 4~8개) → 반복 추천 미등록 장소 propose_place, 기존 장소 정보 보완
 6) 재검증: list_stale_places → 8~12곳 web_search 재확인 → verify_place
    (이전 의심 시 지점 구분 재검토 필수)
 7) 사진 보강: image_count가 0인 장소 3~6곳 → search_place_images(중국어 명칭) →
@@ -389,12 +391,15 @@ def run_agent(
             "덜 판 검색어 심화 + 새 테마 키워드 2~3개 조사 → web_search에서 seen=false 결과 위주로 "
             "fetch_page 4~8개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
             "5) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
-            "geocode_place → create_place 승인 제안 6~12개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
+            "geocode_place → propose_place 승인 제안 6~12개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
+            "propose_place는 즉시 생성이 아니라 승인 대기 저장이므로 망설이지 말 것. 신규 장소 후보를 "
+            "upsert_agent_task에 '승인 제안'으로 대신 적으면 실패이며 도구도 거부한다. "
             "이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·별칭)는 "
             "upsert_place_insights로 위치·역사·방문정보를 분리해 보완하고, 모든 항목에 출처 URL과 "
             "confidence를 기록. description은 간단한 소개만 유지\n"
             "6) 기존 장소는 실제 지점이면 assign_place_chain으로 묶고(지점끼리 병합 금지), list_zones의 구역에 "
-            "assign_place_zone으로 배정. 효과적 소스·판단 원칙은 upsert_knowledge 최신 합성본으로 저장하고, "
+            "assign_place_zone으로 배정. 효과적 소스·판단 원칙만 category=source 또는 city인 "
+            "upsert_knowledge 최신 합성본으로 저장하고(실행 요약·처리 건수·완료 보고 저장 금지), "
             "미완료 후속 조사는 upsert_agent_task로 분리. 7)·8)보다 먼저 호출할 것 "
             "(빠뜨리면 실패)\n"
             "7) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 8~12곳을 web_search로 "
@@ -420,7 +425,7 @@ def run_agent(
             "이미 병합됐으면 undo_merge로 분리 (거리·이름 유사만으로 기각 금지)\n"
             "4) count상 미처리가 0인지 list_open_appeals·list_unread_events로 재확인\n"
             "5) 큐를 비운 뒤 웹 조사 1회 필수: list_research_history → 키워드 선정(심화+새 테마) → "
-            "web_search → seen=false 글 3~6개 fetch_page → 반복 추천 미등록 장소 create_place 3~8개, "
+            "web_search → seen=false 글 3~6개 fetch_page → 반복 추천 미등록 장소 propose_place 3~8개, "
             "기존 장소와 겹치는 유용한 정보는 update_place_fields/context로 보완\n"
             "6) 여유 스텝이 남으면 재검증(list_stale_places → verify_place 3~5곳)과 "
             "사진 보강(image_count 0인 장소 2~3곳)도 수행\n"
@@ -434,7 +439,7 @@ def run_agent(
             "\n\n【현재 운영 안전 모드 — 위의 연구 할당보다 우선】\n"
             "- 사용자 작업 큐만 처리한다. 자율 웹 조사, 신규 장소 발굴, 사진 보강, 작업량 채우기를 하지 않는다.\n"
             "- 자동 장소 생성과 자동 병합은 비활성화되어 있다. 해당 조치가 필요하면 "
-            "create_place/merge_places를 호출해 근거·출처·신뢰도가 있는 관리자 승인 제안으로 남긴다.\n"
+            "propose_place/merge_places를 호출해 근거·출처·신뢰도가 있는 관리자 승인 제안으로 남긴다.\n"
             "- 큐가 비면 즉시 종료한다. 스텝을 채우는 것은 목표가 아니다.\n"
         )
     messages: list[dict[str, Any]] = [
@@ -520,7 +525,9 @@ def run_agent(
                                 f"성과 게이트가 아직 충족되지 않았습니다(현재 점수 {current_score}). "
                                 f"남은 결과: {', '.join(gaps)}. 스텝 수가 아니라 실제 결과를 만들고 다시 측정하세요. "
                                 "같은 검색을 반복하지 말고 구역별 정보 공백·기존 백로그를 활용하세요. "
-                                "실패한 후속 작업은 지식 본문이 아니라 upsert_agent_task에 구체적으로 남기세요."
+                                "신규 장소 후보는 geocode_place 직후 propose_place로 승인 대기에 저장하세요. "
+                                "그 후보를 upsert_agent_task에 승인 제안으로 적는 것은 금지됩니다. "
+                                "실패한 후속 조사만 지식 본문이 아니라 upsert_agent_task에 구체적으로 남기세요."
                             ),
                         }
                     )

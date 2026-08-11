@@ -7,13 +7,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.agent.runner import count_unread
-from app.agent.tools import run_tool
+from app.agent.tools import TOOLS, run_tool
 from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
 from app.models import (
     AgentKnowledge,
     AgentKnowledgeArchive,
     AgentProposal,
+    AgentTask,
     City,
     Marker,
     MarkerCategory,
@@ -137,6 +138,71 @@ class AgentCityScopeTests(unittest.TestCase):
         created = self.db.query(Marker).filter(Marker.id == applied["place_id"]).one()
         self.assertEqual(created.city_id, 2)
         self.assertEqual(self.db.query(PlaceInsight).filter(PlaceInsight.place_id == created.id).count(), 2)
+
+    def test_propose_place_alias_creates_reviewable_proposal(self) -> None:
+        tool_names = {tool["function"]["name"] for tool in TOOLS}
+        self.assertIn("propose_place", tool_names)
+        result = run_tool(
+            self.db,
+            "propose_place",
+            {
+                "title": "北陵公园 (베이링 공원)",
+                "description": "청 황실 능원과 공원을 함께 보는 장소입니다.",
+                "category": "tourist",
+                "lat": 41.85,
+                "lng": 123.43,
+                "evidence": "공식 안내와 위치 자료를 교차 확인했습니다.",
+                "source_urls": ["https://example.org/beiling"],
+                "confidence": 0.9,
+                "insights": [
+                    {
+                        "kind": "location",
+                        "title": "북릉권 중심",
+                        "content": "선양 북부의 대표적인 역사 관광 구역입니다.",
+                        "source_url": "https://example.org/beiling",
+                    },
+                    {
+                        "kind": "history",
+                        "title": "청 황실 능원",
+                        "content": "청 초기 황실사를 이해할 수 있는 능원입니다.",
+                        "source_url": "https://example.org/beiling",
+                    },
+                ],
+            },
+            city_id=2,
+        )
+        self.assertTrue(result["proposal_created"])
+        self.assertEqual(self.db.query(AgentProposal).count(), 1)
+
+    def test_place_proposal_cannot_masquerade_as_backlog_task(self) -> None:
+        result = run_tool(
+            self.db,
+            "upsert_agent_task",
+            {
+                "kind": "research",
+                "title": "승인 제안: 신규 장소 추가",
+                "detail": "후보를 나중에 지도에 등록",
+                "status": "pending",
+            },
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "proposal_masquerading_as_task")
+        self.assertEqual(self.db.query(AgentTask).count(), 0)
+
+    def test_run_summary_cannot_pollute_knowledge(self) -> None:
+        result = run_tool(
+            self.db,
+            "upsert_knowledge",
+            {
+                "topic": "cycle_summary",
+                "title": "선양 지도 정리 사이클 요약",
+                "content": "7개의 신규 장소 승인 제안 생성 완료",
+                "category": "workflow",
+            },
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "run_history_forbidden_in_knowledge")
+        self.assertEqual(self.db.query(AgentKnowledge).count(), 0)
 
     def test_same_topic_is_namespaced_per_city(self) -> None:
         first = upsert_knowledge(
