@@ -79,6 +79,7 @@ from app.schemas import (
     TravelChatMessageOut,
     TravelChatRequest,
     TravelChatResponse,
+    TravelProfileOut,
     TravelPlanItemCreate,
     TravelPlanItemOut,
     TravelPlanItemUpdate,
@@ -1249,6 +1250,20 @@ def list_travel_chat(
     )
     rows.reverse()
     return [_chat_message_to_out(row) for row in rows]
+
+
+@app.get("/api/travel-profile", response_model=TravelProfileOut)
+def get_travel_profile(
+    city_id: int = Query(..., gt=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TravelProfileOut:
+    from app.personalization import build_user_travel_profile
+
+    city_exists = db.query(City.id).filter(City.id == city_id, City.status == "active").first()
+    if city_exists is None:
+        raise HTTPException(status_code=404, detail="활성 도시를 찾을 수 없습니다")
+    return TravelProfileOut(**build_user_travel_profile(db, user_id=current_user.id, city_id=city_id))
 
 
 @app.delete("/api/travel-chat", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)

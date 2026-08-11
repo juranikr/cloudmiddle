@@ -26,6 +26,7 @@ from app.models import (
     PlaceImage,
     PlaceInsight,
 )
+from app.personalization import city_personalization_brief
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
 목표: 미읽음 이력·이의신청·롤백·웹조사를 바탕으로 지도를 정리하고,
@@ -599,6 +600,7 @@ def run_agent(
     research_only = unread_before == 0
     kb = knowledge_brief(db, limit=12, city_id=city_id)
     kb_hint = json.dumps(kb, ensure_ascii=False)[:4000] if kb else "[]"
+    personalization_hint = city_personalization_brief(db, city_id=city_id)[:7000]
     primary_task = None
     if allow_research:
         primary_task = (
@@ -738,6 +740,16 @@ def run_agent(
             "7. 기존 지식과 다른 재사용 원칙이 실제로 확인된 경우에만 upsert_knowledge로 합성합니다. 실행 요약은 지식에 "
             "넣지 않습니다. 마지막에는 완료한 변화, 근거, 검증 결과, 남은 공백을 간결하게 보고하세요."
         )
+
+    user_msg += (
+        "\n\n【사용자 행동 기반 개인화 관찰】\n"
+        f"{personalization_hint or '[]'}\n"
+        "이 데이터는 대화·즐겨찾기·직접 추가·일정·이의제기에서 계산한 여행 행동 신호다. 민감한 속성이나 "
+        "확정 취향으로 확대 해석하지 말고, 실제 추천 근거로만 사용한다. 반복된 음료 브랜드는 같은 브랜드의 "
+        "다른 지점과 검증된 유사 음료 브랜드 발굴로 연결하고, lodging anchor는 가까운 음식점·접근성 좋은 관광지 "
+        "조사의 거점으로 사용한다. 이의제기는 거부 취향이 아니라 교정 조건이다. 이미 추천된 place_id는 중복 신규 "
+        "제안하지 말고, 외부 후보는 기존과 동일하게 출처·좌표·중복을 검증한 뒤 propose_place로 남긴다."
+    )
 
     runtime_policy = ""
     if not allow_research:

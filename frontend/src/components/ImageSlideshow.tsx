@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import type { PlaceImage } from "../types";
 
 interface Props {
@@ -15,8 +16,25 @@ export default function ImageSlideshow({ images, onUpload, canUpload }: Props) {
   const [idx, setIdx] = useState(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [lightboxOpen, setLightboxOpen] = useState(false);
 
   const current = sorted[Math.min(idx, Math.max(sorted.length - 1, 0))];
+
+  useEffect(() => {
+    if (!lightboxOpen) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLightboxOpen(false);
+      if (event.key === "ArrowLeft") setIdx((i) => (i - 1 + sorted.length) % sorted.length);
+      if (event.key === "ArrowRight") setIdx((i) => (i + 1) % sorted.length);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [lightboxOpen, sorted.length]);
 
   async function handleFile(file: File | undefined) {
     if (!file || !onUpload) return;
@@ -36,7 +54,9 @@ export default function ImageSlideshow({ images, onUpload, canUpload }: Props) {
     <div className="slideshow">
       {current ? (
         <div className="slideshow__frame">
-          <img src={current.url} alt="" className="slideshow__img" />
+          <button type="button" className="slideshow__open" onClick={() => setLightboxOpen(true)} aria-label={`사진 크게 보기, ${idx + 1}/${sorted.length}`}>
+            <img src={current.url} alt={`장소 사진 ${idx + 1}`} className="slideshow__img" />
+          </button>
           {sorted.length > 1 ? (
             <>
               <button
@@ -85,6 +105,14 @@ export default function ImageSlideshow({ images, onUpload, canUpload }: Props) {
         </label>
       ) : null}
       {err ? <p className="panel__error">{err}</p> : null}
+      {lightboxOpen && current ? createPortal(
+        <div className="image-lightbox" role="dialog" aria-modal="true" aria-label="장소 사진 전체 화면" onMouseDown={(event) => { if (event.target === event.currentTarget) setLightboxOpen(false); }}>
+          <header><span>{idx + 1} / {sorted.length}</span><button type="button" onClick={() => setLightboxOpen(false)} aria-label="사진 닫기">×</button></header>
+          <figure><img src={current.url} alt={`장소 사진 ${idx + 1}`} /></figure>
+          {sorted.length > 1 ? <><button type="button" className="image-lightbox__nav image-lightbox__nav--prev" onClick={() => setIdx((i) => (i - 1 + sorted.length) % sorted.length)} aria-label="이전 사진">‹</button><button type="button" className="image-lightbox__nav image-lightbox__nav--next" onClick={() => setIdx((i) => (i + 1) % sorted.length)} aria-label="다음 사진">›</button><nav aria-label="사진 선택">{sorted.map((image, imageIndex) => <button key={image.id} type="button" className={imageIndex === idx ? "is-active" : ""} onClick={() => setIdx(imageIndex)} aria-label={`${imageIndex + 1}번 사진`} />)}</nav></> : null}
+        </div>,
+        document.body,
+      ) : null}
     </div>
   );
 }

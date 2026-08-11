@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
 from app.models import City, Marker, MarkerShape, TravelChatMessage, TravelPlanItem
+from app.personalization import build_user_travel_profile, profile_prompt_context
 
 
 RESEARCH_TOOLS = {"web_search", "fetch_page", "geocode_place"}
@@ -15,12 +16,16 @@ WRITE_TOOLS = {"propose_place", "upsert_place_insights"}
 URL_RE = re.compile(r"https?://[^\s<>\])}]+")
 PLACE_ID_RE = re.compile(r"(?:장소|place)[_ ]?(?:id)?\s*[:#]?\s*(\d+)", re.IGNORECASE)
 WRITE_INTENT_RE = re.compile(
-    r"지도에\s*(?:넣|찍)(?:어|어줘|어주세요)?|"
-    r"(?:추가|저장|등록|보강|갱신)(?:해(?:줘|주세요)?|하(?:자|고|라|여줘)?|시켜줘)?(?![가-힣])"
+    r"지도(?:에|에다가).{0,24}(?:넣|찍|추가|저장|등록)|"
+    r"(?:추가|저장|등록|보강|갱신)(?:해|하|시켜|해달|해줬|해주|했으면|하고\s*싶)"
 )
 WEB_INTENT_RE = re.compile(
     r"찾아|검색|확인|최신|오늘|지금|영업|운영|휴무|예약|가격|요금|"
     r"지점|체인|가까운|근처|어디|주소|전화|메뉴"
+)
+FOOD_DISCOVERY_RE = re.compile(
+    r"먹어야|먹을\s*(?:것|거|음식)|음식\s*종류|향토\s*음식|대표\s*음식|현지\s*음식|"
+    r"맛집|식당|餐厅|美食|小吃|名菜"
 )
 BRAND_SEARCH_ALIASES = {
     "헤이티": "喜茶 HEYTEA",
@@ -152,6 +157,11 @@ def _research_seed_queries(city: City, message: str) -> list[str]:
         queries.append(f"{city.name_local} {BRAND_STORE_SEARCHES['모어요거트']} 地址")
     if any(alias.casefold() in folded for alias in BRAND_ANSWER_ALIASES["헤이티"]):
         queries.append(f"{city.name_local} {BRAND_STORE_SEARCHES['헤이티']} 地址")
+    if not queries and FOOD_DISCOVERY_RE.search(message):
+        queries.extend([
+            f"{city.name_local} 必吃 特色美食 传统小吃",
+            f"{city.name_local} 老字号 特色餐厅 推荐",
+        ])
     general = _research_seed_query(city, message)
     if not queries:
         queries.append(general)
@@ -277,7 +287,9 @@ def answer_travel_chat(
     prior.reverse()
     resolved_message = _resolve_context_message(message, prior)
     write_intent, allowed = _chat_capabilities(message, context_message=resolved_message)
+    food_discovery = bool(FOOD_DISCOVERY_RE.search(resolved_message))
     brand_targets = _brand_targets(resolved_message)
+    travel_profile = build_user_travel_profile(db, user_id=user_id, city_id=city_id)
     existing_target_places: dict[str, Marker] = {}
     for target in brand_targets:
         for marker in markers:
@@ -295,6 +307,9 @@ def answer_travel_chat(
 - 답은 보통 250~600자, 복잡한 일정도 1,000자를 넘기지 않는다. 마크다운 표·별표 문자(*)·해시 제목·구분선을 쓰지 말고 짧은 문단과 번호 목록만 쓴다.
 - 아래 운영 지도 DB를 최우선 사실로 사용하고, 언급한 등록 장소에는 반드시 `장소 #ID`를 붙인다.
 - 저장 장소의 위치·구역·역사·방문 팁을 서로 연결한다. 일정이 있으면 이동 부담과 시간대까지 고려한다.
+- 사용자 여행 행동 프로필은 반복 대화·즐겨찾기·직접 추가·일정·이의제기에서 계산된 개인화 힌트다. 확정된 취향처럼 단정하지 말고 추천 이유를 설명한다.
+- 반복 요청한 브랜드가 있으면 같은 브랜드의 다른 유용한 지점과 비슷한 현지 음료 브랜드를, 숙소 거점이 있으면 반경과 구역을 고려한 음식·관광 후보를 우선한다.
+- 이의제기는 싫어함이 아니라 기존 판단에 대한 교정 조건이다. corrections_not_dislikes를 다음 답변과 행동에서 존중한다.
 - DB의 위도·경도는 동선의 상대적 가까움만 판단하는 데 쓰고, 라우팅 도구 없이 정확한 이동 분수나 교통편을 지어내지 않는다.
 - 현재 지도에 있는 정보와 방금 웹에서 찾은 정보를 명확히 구분한다.
 - 영업시간·휴무·예약·가격처럼 변하는 정보는 web_search 후 가능하면 fetch_page로 확인하고 URL을 답에 붙인다.
@@ -310,6 +325,7 @@ def answer_travel_chat(
 
 현재 지도 DB: {map_context}
 현재 사용자 일정: {_plan_context(db, user_id=user_id, city_id=city_id)}
+현재 사용자 여행 행동 프로필: {profile_prompt_context(travel_profile)}
 현재 선택 장소 ID: {selected_place_id or '없음'}
 """
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
@@ -355,6 +371,8 @@ def answer_travel_chat(
     target_business_sources: dict[str, list[str]] = {}
 
     def writes_complete() -> bool:
+        if food_discovery and write_intent and not brand_targets:
+            return len(set(proposal_ids)) >= 2
         return write_succeeded and (
             not brand_targets or set(brand_targets).issubset(successful_write_targets)
         )
@@ -426,6 +444,16 @@ def answer_travel_chat(
                 + json.dumps(seed_results, ensure_ascii=False, default=str)[:18000]
             ),
         })
+        if food_discovery:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "이번 요청은 음식 발견 작업이다. 1) 선양을 대표하는 음식 유형을 먼저 2~4개로 좁히고, "
+                    "2) 각 유형을 실제로 파는 구체적인 식당/지점을 찾고, 3) 페이지 근거와 지오코딩 좌표를 "
+                    "검증한 뒤, 저장 요청이면 서로 다른 식당을 최소 2건 propose_place로 승인 대기에 저장하라. "
+                    "검색 결과 제목만으로 주소나 지점을 만들어내지 말고, 검증이 안 된 후보는 저장하지 마라."
+                ),
+            })
         if write_intent and brand_targets:
             enrichment: list[dict[str, Any]] = []
             chinese_names = {"모어요거트": "茉酸奶", "헤이티": "喜茶 HEYTEA"}
@@ -743,18 +771,28 @@ def answer_travel_chat(
         messages.append({
             "role": "system",
             "content": (
-                "도구 조사를 종료한다. 현재 DB와 도구 결과만으로 최종 답을 작성하라. 검색 결과에 없던 URL·주소·좌표·"
+                "도구 조사를 종료한다. 이제 도구를 절대 호출하지 말고 일반 텍스트로만 답하라. "
+                "현재 DB와 도구 결과만으로 최종 답을 작성하라. 검색 결과에 없던 URL·주소·좌표·"
                 "영업시간을 만들지 말고, 핵심 조사 대상을 각각 언급한다. 내부 과정 대신 사용자에게 필요한 결론을 준다."
                 + action_state
             ),
         })
-        final_fallback = (
-            "요청한 모든 대상의 저장을 완료했습니다."
-            if writes_complete()
-            else "요청을 전부 완료하지 못했습니다. 실제 저장이 확인된 대상만 완료로 처리했습니다."
-            if write_intent
-            else "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다."
-        )
+        if food_discovery and write_intent and not writes_complete():
+            saved_count = len(set(proposal_ids))
+            final_fallback = (
+                "선양의 대표 음식 유형과 식당 후보를 조사했지만, 정확한 지점 근거와 좌표를 모두 검증해 "
+                f"저장한 후보는 {saved_count}건입니다. 최소 2건의 승인 대기 제안을 만들지 못했으므로 완료로 처리하지 않았습니다."
+            )
+        elif food_discovery and not write_intent:
+            final_fallback = "선양의 대표 음식과 식당 후보를 조사했지만, 확인된 결과를 안전하게 요약하는 마지막 단계가 실패했습니다."
+        else:
+            final_fallback = (
+                "요청한 모든 대상의 저장을 완료했습니다."
+                if writes_complete()
+                else "요청을 전부 완료하지 못했습니다. 실제 저장이 확인된 대상만 완료로 처리했습니다."
+                if write_intent
+                else "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다."
+            )
         final_text = complete_text(final_fallback)
 
     missing_targets = _missing_brand_targets(resolved_message, final_text)
@@ -838,8 +876,12 @@ def answer_travel_chat(
                 parts.append(f"{', '.join(unverified)}은 정확한 지점 좌표와 출처가 확인되지 않아 저장하지 않았습니다.")
             if failed:
                 parts.append(f"{', '.join(failed)}은 근거가 있었지만 저장 도구가 성공하지 않아 DB 제안이 생성되지 않았습니다.")
-            if not brand_targets:
+            if food_discovery and proposal_ids:
+                parts.append(f"식당 후보 {len(set(proposal_ids))}건은 승인 대기 제안으로 실제 저장했습니다.")
+            elif not brand_targets:
                 parts.append("성공한 저장 도구가 없어 DB 변경은 발생하지 않았습니다.")
+            if food_discovery:
+                parts.append("음식 유형 → 실제 식당 → 지점 근거·좌표 순으로 검증했지만 최소 2개 식당 저장 기준을 충족하지 못했습니다.")
             parts.append("말로만 ‘추가하겠다’고 한 상태는 완료로 처리하지 않습니다.")
             final_text = " ".join(parts)
 

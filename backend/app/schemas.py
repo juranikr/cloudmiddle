@@ -374,3 +374,46 @@ class TravelChatResponse(BaseModel):
     message: TravelChatMessageOut
     model: str
     grounded_place_ids: list[int] = Field(default_factory=list)
+
+
+class TravelPreferenceSignalOut(BaseModel):
+    key: str
+    label: str
+    score: float = 0.0
+    evidence_count: int = 0
+
+
+class TravelAnchorOut(BaseModel):
+    place_id: int
+    title: str
+    lat: float
+    lng: float
+    zone: str = ""
+    sources: list[str] = Field(default_factory=list)
+
+
+class PersonalizedPlaceRecommendationOut(BaseModel):
+    place_id: int
+    title: str
+    category: str
+    travel_role: str = "general"
+    zone: str = ""
+    score: float
+    reason: str
+    distance_km: Optional[float] = None
+
+
+class TravelProfileOut(BaseModel):
+    user_id: int
+    city_id: int
+    signals: list[TravelPreferenceSignalOut] = Field(default_factory=list)
+    anchors: list[TravelAnchorOut] = Field(default_factory=list)
+    recommendations: list[PersonalizedPlaceRecommendationOut] = Field(default_factory=list)
+    category_scores: dict[str, float] = Field(default_factory=dict)
+    role_scores: dict[str, float] = Field(default_factory=dict)
+    brand_scores: dict[str, float] = Field(default_factory=dict)
+    favorite_place_ids: list[int] = Field(default_factory=list)
+    created_place_ids: list[int] = Field(default_factory=list)
+    direct_source_counts: dict[str, int] = Field(default_factory=dict)
+    corrections: list[dict[str, Any]] = Field(default_factory=list)
+    evidence: dict[str, int] = Field(default_factory=dict)

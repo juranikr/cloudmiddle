@@ -315,3 +315,46 @@ export interface TravelChatMessage {
   place_ids: number[];
   created_at: string;
 }
+
+export interface TravelPreferenceSignal {
+  key: string;
+  label: string;
+  score: number;
+  evidence_count: number;
+}
+
+export interface TravelAnchor {
+  place_id: number;
+  title: string;
+  lat: number;
+  lng: number;
+  zone: string;
+  sources: string[];
+}
+
+export interface PersonalizedPlaceRecommendation {
+  place_id: number;
+  title: string;
+  category: string;
+  travel_role: string;
+  zone: string;
+  score: number;
+  reason: string;
+  distance_km: number | null;
+}
+
+export interface TravelProfile {
+  user_id: number;
+  city_id: number;
+  signals: TravelPreferenceSignal[];
+  anchors: TravelAnchor[];
+  recommendations: PersonalizedPlaceRecommendation[];
+  category_scores: Record<string, number>;
+  role_scores: Record<string, number>;
+  brand_scores: Record<string, number>;
+  favorite_place_ids: number[];
+  created_place_ids: number[];
+  direct_source_counts: Record<string, number>;
+  corrections: Array<Record<string, unknown>>;
+  evidence: Record<string, number>;
+}

@@ -89,6 +89,18 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertIn("沈阳 喜茶 大悦城店 中街益田假日世界店 地址", queries)
         self.assertTrue(all("海蒂" not in query for query in queries))
 
+    def test_food_registration_wish_is_write_intent_with_short_chinese_seeds(self) -> None:
+        city = City(name_local="沈阳")
+        message = "선양에서 먹어야 되는 음식 종류를 찾고 식당을 지도에 등록해줬으면 좋겠어"
+
+        write_intent, tools = _chat_capabilities(message)
+        queries = _research_seed_queries(city, message)
+
+        self.assertTrue(write_intent)
+        self.assertEqual(tools, RESEARCH_TOOLS | WRITE_TOOLS)
+        self.assertEqual(queries, ["沈阳 必吃 特色美食 传统小吃", "沈阳 老字号 特色餐厅 推荐"])
+        self.assertTrue(all("등록해줬으면" not in query for query in queries))
+
     def test_answer_validation_requires_each_brand_and_removes_fake_urls(self) -> None:
         self.assertEqual(
             _missing_brand_targets("모어요거트와 헤이티", "喜茶 지점만 확인했습니다."),

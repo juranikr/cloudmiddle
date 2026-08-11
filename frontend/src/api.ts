@@ -15,6 +15,7 @@ import type {
   User,
   UserMessage,
   TravelChatMessage,
+  TravelProfile,
   TravelPlanItem,
 } from "./types";
 
@@ -503,6 +504,11 @@ export async function deleteTravelPlanItem(token: string, itemId: number): Promi
 export async function fetchTravelChat(token: string, cityId: number): Promise<TravelChatMessage[]> {
   const res = await request(`/api/travel-chat?city_id=${cityId}`, { headers: authHeaders(token) });
   return handle<TravelChatMessage[]>(res);
+}
+
+export async function fetchTravelProfile(token: string, cityId: number): Promise<TravelProfile> {
+  const res = await request(`/api/travel-profile?city_id=${cityId}`, { headers: authHeaders(token) });
+  return handle<TravelProfile>(res);
 }
 
 export async function clearTravelChat(token: string, cityId: number): Promise<void> {
