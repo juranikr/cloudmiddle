@@ -143,11 +143,19 @@ export default function MarkerPanel({
     setAppealDone(false);
     setEvents([]);
     setEventsOpen(false);
+    setNewChainName("");
+  }, [marker, mode, latlng, polygon, createDefaults]);
+
+  // A note/favorite update replaces the marker object in MapPage while the
+  // user is still looking at the same place. Reset note UI only when the
+  // actual place (or panel mode) changes, otherwise the freshly created note
+  // disappears immediately and the fetch effect below does not rerun because
+  // marker.id stayed the same.
+  useEffect(() => {
     setNotes([]);
     setNoteDraft("");
     setNotePrivate(false);
-    setNewChainName("");
-  }, [marker, mode, latlng, polygon, createDefaults]);
+  }, [marker?.id, mode]);
 
   useEffect(() => {
     if (!token || !marker || mode !== "view") return;
