@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import hashlib
+import logging
 import math
 import re
 import urllib.parse
@@ -55,6 +56,8 @@ from app.models import (
     UserMessageKind,
 )
 from app.rollback import _rollback_merge, marker_snapshot
+
+logger = logging.getLogger(__name__)
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -2394,6 +2397,21 @@ def run_tool(
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
         except Exception as exc:  # noqa: BLE001
+            db.add(
+                AgentSearchLog(
+                    query=query[:300],
+                    city_id=city_id,
+                    results_count=0,
+                    new_count=0,
+                )
+            )
+            db.commit()
+            logger.warning(
+                "web_search failed city=%s query=%r error=%s",
+                city_id,
+                query[:120],
+                str(exc)[:240],
+            )
             return {"error": str(exc), "results": []}
 
         hrefs = [r.get("href") or "" for r in results]
