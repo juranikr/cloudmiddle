@@ -6,6 +6,7 @@ import copy
 import json
 import hashlib
 import math
+import re
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -793,6 +794,53 @@ def _place_brief(m: Marker) -> dict[str, Any]:
     }
 
 
+def _candidate_title_key(value: str) -> str:
+    """Stable local-name key used only for pending-proposal/task reconciliation."""
+    local_name = value.split("(", 1)[0]
+    return re.sub(r"[^\w]+", "", local_name, flags=re.UNICODE).casefold()
+
+
+def _complete_matching_proposal_tasks(
+    db: Session, *, city_id: int, proposal_title: str, proposal_id: int
+) -> int:
+    key = _candidate_title_key(proposal_title)
+    if not key:
+        return 0
+    matched = 0
+    rows = db.query(AgentTask).filter(
+        AgentTask.city_id == city_id,
+        AgentTask.status == "pending",
+    ).all()
+    for row in rows:
+        if key not in _candidate_title_key(row.title):
+            continue
+        row.status = "completed"
+        row.result = f"관리자 승인 대기 제안 #{proposal_id}로 전환"
+        row.completed_at = datetime.now(timezone.utc)
+        matched += 1
+    return matched
+
+
+def reconcile_proposal_tasks(db: Session, *, city_id: int) -> int:
+    """Self-heal legacy candidate tasks once an equivalent proposal exists."""
+    matched = 0
+    proposals = db.query(AgentProposal).filter(
+        AgentProposal.city_id == city_id,
+        AgentProposal.action == "create_place",
+        AgentProposal.status.in_(["pending", "approved"]),
+    ).all()
+    for proposal in proposals:
+        matched += _complete_matching_proposal_tasks(
+            db,
+            city_id=city_id,
+            proposal_title=proposal.title,
+            proposal_id=proposal.id,
+        )
+    if matched:
+        db.commit()
+    return matched
+
+
 def _pending_proposal(
     db: Session,
     *,
@@ -821,8 +869,30 @@ def _pending_proposal(
         .order_by(AgentProposal.id.desc())
         .first()
     )
+    if existing is None:
+        title_key = _candidate_title_key(title)
+        same_action = db.query(AgentProposal).filter(
+            AgentProposal.city_id == city_id,
+            AgentProposal.action == action,
+            AgentProposal.status == "pending",
+        ).all()
+        existing = next(
+            (row for row in same_action if _candidate_title_key(row.title) == title_key),
+            None,
+        )
     if existing:
-        return {"ok": True, "proposal_created": False, "proposal_id": existing.id}
+        completed_tasks = _complete_matching_proposal_tasks(
+            db, city_id=city_id, proposal_title=existing.title, proposal_id=existing.id
+        )
+        if completed_tasks:
+            db.commit()
+        return {
+            "ok": True,
+            "proposal_created": False,
+            "proposal_id": existing.id,
+            "duplicate": True,
+            "completed_tasks": completed_tasks,
+        }
     row = AgentProposal(
         city_id=city_id,
         place_id=place_id,
@@ -836,8 +906,17 @@ def _pending_proposal(
         status="pending",
     )
     db.add(row)
+    db.flush()
+    completed_tasks = _complete_matching_proposal_tasks(
+        db, city_id=city_id, proposal_title=row.title, proposal_id=row.id
+    )
     db.commit()
-    return {"ok": True, "proposal_created": True, "proposal_id": row.id}
+    return {
+        "ok": True,
+        "proposal_created": True,
+        "proposal_id": row.id,
+        "completed_tasks": completed_tasks,
+    }
 
 
 def _has_hangul(s: str) -> bool:
@@ -1920,6 +1999,7 @@ def run_tool(
         return {"ok": True, "changed": bool(changes), "chain_id": chain.id}
 
     if name == "list_agent_tasks":
+        reconcile_proposal_tasks(db, city_id=city_id)
         limit = max(1, min(int(args.get("limit") or 12), 50))
         rows = (
             db.query(AgentTask)

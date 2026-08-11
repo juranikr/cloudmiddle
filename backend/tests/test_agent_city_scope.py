@@ -174,6 +174,52 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertTrue(result["proposal_created"])
         self.assertEqual(self.db.query(AgentProposal).count(), 1)
 
+    def test_same_pending_place_title_is_deduplicated_and_completes_legacy_task(self) -> None:
+        legacy_task = AgentTask(
+            city_id=2,
+            title="승인 제안: '北陵公园 (Beiling Park)' 신규 장소 추가",
+            status="pending",
+        )
+        self.db.add(legacy_task)
+        self.db.commit()
+        base = {
+            "title": "北陵公园 (베이링 공원)",
+            "description": "청 황실 능원과 공원을 함께 보는 장소입니다.",
+            "category": "tourist",
+            "lat": 41.85,
+            "lng": 123.43,
+            "evidence": "공식 안내와 위치 자료를 교차 확인했습니다.",
+            "source_urls": ["https://example.org/beiling"],
+            "confidence": 0.9,
+            "insights": [
+                {
+                    "kind": "location",
+                    "title": "북릉권 중심",
+                    "content": "선양 북부의 대표적인 역사 관광 구역입니다.",
+                    "source_url": "https://example.org/beiling",
+                },
+                {
+                    "kind": "history",
+                    "title": "청 황실 능원",
+                    "content": "청 초기 황실사를 이해할 수 있는 능원입니다.",
+                    "source_url": "https://example.org/beiling",
+                },
+            ],
+        }
+        first = run_tool(self.db, "propose_place", base, city_id=2)
+        second = run_tool(
+            self.db,
+            "propose_place",
+            {**base, "lat": 41.851, "evidence": "다른 출처에서도 재확인했습니다."},
+            city_id=2,
+        )
+        self.db.refresh(legacy_task)
+        self.assertTrue(first["proposal_created"])
+        self.assertFalse(second["proposal_created"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(self.db.query(AgentProposal).count(), 1)
+        self.assertEqual(legacy_task.status, "completed")
+
     def test_place_proposal_cannot_masquerade_as_backlog_task(self) -> None:
         result = run_tool(
             self.db,
