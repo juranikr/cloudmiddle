@@ -47,6 +47,16 @@ ROLE_TERMS: dict[str, tuple[str, ...]] = {
     "rest": ("휴식", "카페", "음료", "커피", "차 ", "요거트"),
     "practical": ("교통", "지하철", "접근성", "예약", "결제"),
 }
+CATEGORY_LABELS = {
+    "drink": "음료",
+    "restaurant": "음식점",
+    "lodging": "숙소",
+    "shopping": "쇼핑",
+    "tourist": "관광",
+    "transport": "교통",
+    "convenience": "편의",
+    "other": "기타",
+}
 
 
 def _contains(text: str, terms: tuple[str, ...]) -> bool:
@@ -208,7 +218,7 @@ def build_user_travel_profile(db: Session, *, user_id: int, city_id: int) -> dic
         category_score = category_scores[marker.category.value]
         if category_score:
             score += min(4.0, category_score * 0.35)
-            reasons.append(f"{marker.category.value} 관심")
+            reasons.append(f"{CATEGORY_LABELS.get(marker.category.value, marker.category.value)} 관심")
         if marker.travel_role and role_scores[marker.travel_role]:
             score += min(2.5, role_scores[marker.travel_role] * 0.25)
         marker_brand = _marker_brand(marker)
@@ -274,7 +284,7 @@ def build_user_travel_profile(db: Session, *, user_id: int, city_id: int) -> dic
         top_category, top_score = category_scores.most_common(1)[0]
         signals.append({
             "key": f"category:{top_category}",
-            "label": f"대화와 일정에서 {top_category} 관심이 보여 추천에 반영",
+            "label": f"대화와 일정에서 {CATEGORY_LABELS.get(top_category, top_category)} 관심이 보여 추천에 반영",
             "score": round(top_score, 1),
             "evidence_count": len(chat_rows) + len(plan_rows),
         })
