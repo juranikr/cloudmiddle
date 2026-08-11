@@ -498,6 +498,11 @@ export async function fetchTravelChat(token: string, cityId: number): Promise<Tr
   return handle<TravelChatMessage[]>(res);
 }
 
+export async function clearTravelChat(token: string, cityId: number): Promise<void> {
+  const res = await request(`/api/travel-chat?city_id=${cityId}`, { method: "DELETE", headers: authHeaders(token) });
+  await handle<void>(res);
+}
+
 export async function sendTravelChat(
   token: string,
   body: { city_id: number; message: string; selected_place_id?: number | null },

@@ -1251,6 +1251,20 @@ def list_travel_chat(
     return [_chat_message_to_out(row) for row in rows]
 
 
+@app.delete("/api/travel-chat", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+def clear_travel_chat(
+    city_id: int = Query(..., gt=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    db.query(TravelChatMessage).filter(
+        TravelChatMessage.user_id == current_user.id,
+        TravelChatMessage.city_id == city_id,
+    ).delete(synchronize_session=False)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @app.post("/api/travel-chat", response_model=TravelChatResponse)
 def post_travel_chat(
     body: TravelChatRequest,

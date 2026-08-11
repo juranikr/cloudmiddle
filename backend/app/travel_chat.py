@@ -119,7 +119,7 @@ def answer_travel_chat(
 
 규칙:
 - 답은 자연스러운 한국어로, 먼저 결론을 짧게 말한다.
-- 답은 보통 250~600자, 복잡한 일정도 1,000자를 넘기지 않는다. 마크다운 표·굵은 별표·과도한 구분선을 쓰지 말고 짧은 문단과 번호 목록만 쓴다.
+- 답은 보통 250~600자, 복잡한 일정도 1,000자를 넘기지 않는다. 마크다운 표·별표 문자(*)·해시 제목·구분선을 쓰지 말고 짧은 문단과 번호 목록만 쓴다.
 - 아래 운영 지도 DB를 최우선 사실로 사용하고, 언급한 등록 장소에는 반드시 `장소 #ID`를 붙인다.
 - 저장 장소의 위치·구역·역사·방문 팁을 서로 연결한다. 일정이 있으면 이동 부담과 시간대까지 고려한다.
 - 현재 지도에 있는 정보와 방금 웹에서 찾은 정보를 명확히 구분한다.
@@ -137,7 +137,14 @@ def answer_travel_chat(
 현재 선택 장소 ID: {selected_place_id or '없음'}
 """
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
-    messages.extend({"role": row.role, "content": row.content} for row in prior)
+    # Very long earlier replies can anchor the model on stale or unverified details.
+    # Keep conversational continuity, but do not feed verbose assistant output back forever.
+    safe_prior = [row for row in prior if row.role == "user" or len(row.content) <= 1800][-6:]
+    messages.extend({"role": row.role, "content": row.content} for row in safe_prior)
+    messages.append({
+        "role": "system",
+        "content": "이전 대화의 assistant 문장도 근거가 아니다. 현재 DB나 이번 도구 결과로 확인되지 않은 수치·교통·정책 설명은 반복하지 말고 바로잡아라.",
+    })
     messages.append({"role": "user", "content": message})
 
     from groq import Groq
