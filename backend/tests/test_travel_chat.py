@@ -16,6 +16,7 @@ from app.travel_chat import (
     WRITE_TOOLS,
     _chat_capabilities,
     _needs_answer_retry,
+    _research_seed_query,
     answer_travel_chat,
 )
 
@@ -24,6 +25,10 @@ class TravelChatRoutingTests(unittest.TestCase):
     def test_simple_map_question_skips_web_tools(self) -> None:
         write_intent, tools = _chat_capabilities("내 일정의 이동 동선을 줄여줘")
 
+        self.assertFalse(write_intent)
+        self.assertEqual(tools, set())
+
+        write_intent, tools = _chat_capabilities("박물관 말고 현재 지도 장소로 반나절을 짜줘")
         self.assertFalse(write_intent)
         self.assertEqual(tools, set())
 
@@ -43,6 +48,14 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertTrue(_needs_answer_retry("죄송합니다, 요청 내용을 파악하지 못했습니다."))
         self.assertTrue(_needs_answer_retry("죄송합니다. 어떤 정보를 원하시는지 구체적으로 알려주세요."))
         self.assertFalse(_needs_answer_retry("현재 지도에는 음식 장소가 비어 있습니다."))
+
+    def test_china_chain_names_expand_in_seed_search(self) -> None:
+        city = City(name_local="沈阳")
+        query = _research_seed_query(city, "호텔 근처 헤이티와 모어요거트 지점을 찾아줘")
+
+        self.assertIn("沈阳", query)
+        self.assertIn("喜茶 HEYTEA", query)
+        self.assertIn("茉酸奶 More Yogurt", query)
 
 
 class _FakeCompletions:

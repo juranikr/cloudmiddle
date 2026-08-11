@@ -18,9 +18,14 @@ WRITE_INTENT_RE = re.compile(
     r"(?:(?:넣|추가|저장|등록|보강|갱신).{0,20}(?:지도|장소|정보|후보))"
 )
 WEB_INTENT_RE = re.compile(
-    r"찾아|검색|확인|최신|오늘|지금|현재|영업|운영|휴무|예약|가격|요금|"
+    r"찾아|검색|확인|최신|오늘|지금|영업|운영|휴무|예약|가격|요금|"
     r"지점|체인|가까운|근처|어디|주소|전화|메뉴"
 )
+BRAND_SEARCH_ALIASES = {
+    "헤이티": "喜茶 HEYTEA",
+    "희차": "喜茶 HEYTEA",
+    "모어요거트": "茉酸奶 More Yogurt",
+}
 FAILED_RESEARCH_REPLY = "조사가 길어져 여기서 멈췄습니다. 질문을 한 장소나 한 주제로 좁혀 다시 물어봐 주세요."
 GENERIC_CLARIFICATION_RE = re.compile(
     r"요청 (?:내용|의도)을? 파악하지 못|구체적으로 어떤 정보를 원|질문을 이해하지 못|"
@@ -46,6 +51,14 @@ def _chat_capabilities(message: str) -> tuple[bool, set[str]]:
 
 def _needs_answer_retry(content: str) -> bool:
     return bool(GENERIC_CLARIFICATION_RE.search(content or ""))
+
+
+def _research_seed_query(city: City, message: str) -> str:
+    query = message
+    for name, alias in BRAND_SEARCH_ALIASES.items():
+        if name in query and alias not in query:
+            query = query.replace(name, f"{name} {alias}")
+    return query if city.name_local in query else f"{city.name_local} {query}"
 
 
 def _earlier_user_context(rows: list[TravelChatMessage], recent: list[TravelChatMessage]) -> str:
@@ -241,7 +254,7 @@ def answer_travel_chat(
             raise
 
     if allowed:
-        seed_query = message if city.name_local in message else f"{city.name_local} {message}"
+        seed_query = _research_seed_query(city, message)
         seed_args = {"query": seed_query, "max_results": 8}
         seed_result = run_tool(db, "web_search", seed_args, city_id=city_id)
         _collect_sources(seed_result, sources)
