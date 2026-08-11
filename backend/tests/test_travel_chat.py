@@ -8,6 +8,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.agent.tools import TOOLS
 from app.config import settings
 from app.db import Base
 from app.models import City, TravelChatMessage
@@ -99,6 +100,13 @@ class TravelChatRoutingTests(unittest.TestCase):
                 {"https://real.example/place"},
             ),
         )
+
+    def test_optional_proposal_fields_accept_model_nulls(self) -> None:
+        proposal = next(tool for tool in TOOLS if tool["function"]["name"] == "propose_place")
+        properties = proposal["function"]["parameters"]["properties"]
+
+        for field in ("zone_id", "branch_name", "coordinate_external_id", "coordinate_source_url"):
+            self.assertIn("null", properties[field]["type"])
 
 
 class _FakeCompletions:
