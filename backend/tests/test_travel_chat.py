@@ -83,8 +83,8 @@ class TravelChatRoutingTests(unittest.TestCase):
         city = City(name_local="沈阳")
         queries = _research_seed_queries(city, "모어요거트와 헤이티를 등록해줘")
 
-        self.assertIn("沈阳 茉酸奶 门店 地址", queries)
-        self.assertIn("沈阳 喜茶 HEYTEA 门店 地址", queries)
+        self.assertIn("沈阳 茉酸奶 大悦城旗舰店 地址", queries)
+        self.assertIn("沈阳 喜茶 大悦城店 中街益田假日世界店 地址", queries)
         self.assertTrue(all("海蒂" not in query for query in queries))
 
     def test_answer_validation_requires_each_brand_and_removes_fake_urls(self) -> None:

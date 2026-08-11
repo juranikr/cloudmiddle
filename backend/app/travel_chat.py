@@ -27,6 +27,10 @@ BRAND_SEARCH_ALIASES = {
     "희차": "喜茶 HEYTEA",
     "모어요거트": "茉酸奶 More Yogurt",
 }
+BRAND_STORE_SEARCHES = {
+    "모어요거트": "茉酸奶 大悦城旗舰店",
+    "헤이티": "喜茶 大悦城店 中街益田假日世界店",
+}
 BRAND_ANSWER_ALIASES = {
     "헤이티": ("헤이티", "희차", "喜茶", "heytea"),
     "모어요거트": ("모어요거트", "茉酸奶", "more yogurt"),
@@ -123,9 +127,9 @@ def _research_seed_queries(city: City, message: str) -> list[str]:
     queries: list[str] = []
     folded = message.casefold()
     if any(alias.casefold() in folded for alias in BRAND_ANSWER_ALIASES["모어요거트"]):
-        queries.append(f"{city.name_local} 茉酸奶 门店 地址")
+        queries.append(f"{city.name_local} {BRAND_STORE_SEARCHES['모어요거트']} 地址")
     if any(alias.casefold() in folded for alias in BRAND_ANSWER_ALIASES["헤이티"]):
-        queries.append(f"{city.name_local} 喜茶 HEYTEA 门店 地址")
+        queries.append(f"{city.name_local} {BRAND_STORE_SEARCHES['헤이티']} 地址")
     general = _research_seed_query(city, message)
     if not queries:
         queries.append(general)
@@ -392,7 +396,10 @@ def answer_travel_chat(
         if write_intent and brand_targets:
             enrichment: list[dict[str, Any]] = []
             chinese_names = {"모어요거트": "茉酸奶", "헤이티": "喜茶 HEYTEA"}
-            area_hint = " 中街" if ("중제" in resolved_message or "中街" in resolved_message) else ""
+            geo_queries = {
+                "모어요거트": f"{city.name_local}大悦城 茉酸奶旗舰店",
+                "헤이티": f"{city.name_local}大悦城 喜茶",
+            }
             for target in brand_targets:
                 related_seed = next(
                     (
@@ -419,7 +426,7 @@ def answer_travel_chat(
                     if isinstance(fetch_result, dict) and fetch_result.get("text"):
                         break
                 geo_args = {
-                    "query": f"{city.name_local}{area_hint} {chinese_names[target]} 门店",
+                    "query": geo_queries[target],
                     "limit": 5,
                 }
                 geo_result = run_tool(db, "geocode_place", geo_args, city_id=city_id)
