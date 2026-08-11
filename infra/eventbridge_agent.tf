@@ -1,4 +1,4 @@
-# 하루 3회 (KST 03:00 / 11:00 / 19:00 = UTC 18:00 / 02:00 / 10:00) 성과 기반 에이전트 실행
+# KST 03:00 / 11:00 / 19:00 scheduled, outcome-driven city agents.
 resource "aws_cloudwatch_log_group" "agent" {
   name              = "/ecs/${local.name_prefix}-agent"
   retention_in_days = 14
@@ -45,6 +45,127 @@ resource "aws_ecs_task_definition" "agent" {
   ])
 }
 
+resource "aws_iam_role" "agent_step_functions" {
+  name = "${local.name_prefix}-agent-sfn"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "states.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "agent_step_functions" {
+  name = "${local.name_prefix}-agent-sfn"
+  role = aws_iam_role.agent_step_functions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:RunTask"]
+        Resource = [aws_ecs_task_definition.agent.arn]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecs:DescribeTasks",
+          "ecs:StopTask",
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = ["iam:PassRole"]
+        Resource = [
+          aws_iam_role.ecs_task_execution.arn,
+          aws_iam_role.ecs_task.arn,
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_sfn_state_machine" "agent" {
+  name     = "${local.name_prefix}-agent"
+  role_arn = aws_iam_role.agent_step_functions.arn
+
+  definition = jsonencode({
+    Comment = "Run each city agent independently and rotate Fargate egress on retryable provider blocks"
+    StartAt = "RunCities"
+    States = {
+      RunCities = {
+        Type           = "Map"
+        ItemsPath      = "$.city_ids"
+        MaxConcurrency = 1
+        ItemSelector = {
+          "city_id.$" = "$$.Map.Item.Value"
+        }
+        ItemProcessor = {
+          ProcessorConfig = {
+            Mode = "INLINE"
+          }
+          StartAt = "RunCityAgent"
+          States = {
+            RunCityAgent = {
+              Type           = "Task"
+              Resource       = "arn:aws:states:::ecs:runTask.waitForTaskToken"
+              TimeoutSeconds = 14400
+              Parameters = {
+                Cluster        = aws_ecs_cluster.main.arn
+                TaskDefinition = aws_ecs_task_definition.agent.arn
+                LaunchType     = "FARGATE"
+                NetworkConfiguration = {
+                  AwsvpcConfiguration = {
+                    Subnets        = aws_subnet.public[*].id
+                    SecurityGroups = [aws_security_group.ecs.id]
+                    AssignPublicIp = "ENABLED"
+                  }
+                }
+                Overrides = {
+                  ContainerOverrides = [
+                    {
+                      Name = "agent"
+                      Environment = [
+                        {
+                          Name      = "SFN_TASK_TOKEN"
+                          "Value.$" = "$$.Task.Token"
+                        },
+                        {
+                          Name      = "AGENT_CITY_ID"
+                          "Value.$" = "States.Format('{}', $.city_id)"
+                        },
+                      ]
+                    }
+                  ]
+                }
+              }
+              Retry = [
+                {
+                  ErrorEquals     = ["RetryableNetworkBlock"]
+                  IntervalSeconds = 30
+                  BackoffRate     = 3
+                  MaxAttempts     = 2
+                }
+              ]
+              End = true
+            }
+          }
+        }
+        End = true
+      }
+    }
+  })
+
+  depends_on = [aws_iam_role_policy.agent_step_functions]
+}
+
 resource "aws_iam_role" "events_ecs" {
   name = "${local.name_prefix}-events-ecs"
 
@@ -69,16 +190,8 @@ resource "aws_iam_role_policy" "events_ecs" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["ecs:RunTask"]
-        Resource = [aws_ecs_task_definition.agent.arn]
-      },
-      {
-        Effect = "Allow"
-        Action = ["iam:PassRole"]
-        Resource = [
-          aws_iam_role.ecs_task_execution.arn,
-          aws_iam_role.ecs_task.arn,
-        ]
+        Action   = ["states:StartExecution"]
+        Resource = [aws_sfn_state_machine.agent.arn]
       }
     ]
   })
@@ -92,18 +205,8 @@ resource "aws_cloudwatch_event_rule" "agent_daily" {
 
 resource "aws_cloudwatch_event_target" "agent_daily" {
   rule      = aws_cloudwatch_event_rule.agent_daily.name
-  target_id = "ecs-agent"
-  arn       = aws_ecs_cluster.main.arn
+  target_id = "step-functions-agent"
+  arn       = aws_sfn_state_machine.agent.arn
   role_arn  = aws_iam_role.events_ecs.arn
-
-  ecs_target {
-    task_count          = 1
-    task_definition_arn = aws_ecs_task_definition.agent.arn
-    launch_type         = "FARGATE"
-    network_configuration {
-      subnets          = aws_subnet.public[*].id
-      security_groups  = [aws_security_group.ecs.id]
-      assign_public_ip = true
-    }
-  }
+  input     = jsonencode({ city_ids = [1, 2] })
 }

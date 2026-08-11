@@ -75,6 +75,28 @@ resource "aws_iam_role" "ecs_task" {
   })
 }
 
+# The scheduled agent uses the Step Functions callback integration to report
+# whether a fresh Fargate task should be attempted. Callback APIs do not
+# support resource-level permissions, so the token itself is the authority.
+resource "aws_iam_role_policy" "ecs_task_step_functions_callback" {
+  name = "${local.name_prefix}-ecs-task-sfn-callback"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "states:SendTaskSuccess",
+          "states:SendTaskFailure",
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_ecs_task_definition" "api" {
   family                   = "${local.name_prefix}-api"
   requires_compatibilities = ["FARGATE"]
