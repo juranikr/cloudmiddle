@@ -11,7 +11,13 @@ from sqlalchemy.orm import sessionmaker
 from app.config import settings
 from app.db import Base
 from app.models import City
-from app.travel_chat import RESEARCH_TOOLS, WRITE_TOOLS, _chat_capabilities, answer_travel_chat
+from app.travel_chat import (
+    RESEARCH_TOOLS,
+    WRITE_TOOLS,
+    _chat_capabilities,
+    _needs_answer_retry,
+    answer_travel_chat,
+)
 
 
 class TravelChatRoutingTests(unittest.TestCase):
@@ -32,6 +38,10 @@ class TravelChatRoutingTests(unittest.TestCase):
 
         self.assertTrue(write_intent)
         self.assertEqual(tools, RESEARCH_TOOLS | WRITE_TOOLS)
+
+    def test_generic_clarification_is_retried(self) -> None:
+        self.assertTrue(_needs_answer_retry("죄송합니다, 요청 내용을 파악하지 못했습니다."))
+        self.assertFalse(_needs_answer_retry("현재 지도에는 음식 장소가 비어 있습니다."))
 
 
 class _FakeCompletions:
@@ -98,6 +108,10 @@ class TravelChatLoopTests(unittest.TestCase):
         self.assertEqual(result["row"].content, "확인한 세 지점을 가까운 순서로 정리했습니다.")
         self.assertEqual(len(completions.requests), 4)
         self.assertIn("tools", completions.requests[0])
+        self.assertEqual(
+            completions.requests[0]["tool_choice"],
+            {"type": "function", "function": {"name": "web_search"}},
+        )
         self.assertNotIn("tools", completions.requests[-1])
 
     def test_simple_question_uses_one_tool_free_completion(self) -> None:

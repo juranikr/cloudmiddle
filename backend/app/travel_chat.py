@@ -22,6 +22,9 @@ WEB_INTENT_RE = re.compile(
     r"지점|체인|가까운|근처|어디|주소|전화|메뉴"
 )
 FAILED_RESEARCH_REPLY = "조사가 길어져 여기서 멈췄습니다. 질문을 한 장소나 한 주제로 좁혀 다시 물어봐 주세요."
+GENERIC_CLARIFICATION_RE = re.compile(
+    r"요청 (?:내용|의도)을? 파악하지 못|구체적으로 어떤 정보를 원|질문을 이해하지 못"
+)
 MAX_TOOL_ROUNDS = 3
 MAX_TOOL_CALLS_PER_ROUND = 4
 
@@ -38,6 +41,10 @@ def _chat_capabilities(message: str) -> tuple[bool, set[str]]:
     if write_intent:
         allowed |= WRITE_TOOLS
     return write_intent, allowed
+
+
+def _needs_answer_retry(content: str) -> bool:
+    return bool(GENERIC_CLARIFICATION_RE.search(content or ""))
 
 
 def _earlier_user_context(rows: list[TravelChatMessage], recent: list[TravelChatMessage]) -> str:
@@ -204,7 +211,7 @@ def answer_travel_chat(
     final_text = ""
     seen_tool_calls: set[str] = set()
 
-    def complete(*, with_tools: bool) -> Any:
+    def complete(*, with_tools: bool, required_tool: str | None = None) -> Any:
         nonlocal model
         kwargs: dict[str, Any] = {}
         if "gpt-oss" in model:
@@ -217,7 +224,10 @@ def answer_travel_chat(
         }
         if with_tools and allowed:
             request["tools"] = _tool_subset(allowed)
-            request["tool_choice"] = "auto"
+            request["tool_choice"] = (
+                {"type": "function", "function": {"name": required_tool}}
+                if required_tool else "auto"
+            )
         try:
             return client.chat.completions.create(**request)
         except Exception as exc:
@@ -232,8 +242,11 @@ def answer_travel_chat(
                 return client.chat.completions.create(**request)
             raise
 
-    for _ in range(MAX_TOOL_ROUNDS if allowed else 0):
-        response = complete(with_tools=True)
+    for round_index in range(MAX_TOOL_ROUNDS if allowed else 0):
+        response = complete(
+            with_tools=True,
+            required_tool="web_search" if round_index == 0 else None,
+        )
         reply = response.choices[0].message
         calls = reply.tool_calls or []
         if not calls:
@@ -290,6 +303,21 @@ def answer_travel_chat(
         response = complete(with_tools=False)
         reply = response.choices[0].message
         final_text = (reply.content or "확인된 자료가 부족해 답을 완성하지 못했습니다.").strip()
+
+    if _needs_answer_retry(final_text):
+        messages.extend([
+            {"role": "assistant", "content": final_text},
+            {
+                "role": "system",
+                "content": (
+                    "사용자 질문은 충분히 구체적이다. 되묻거나 사과하지 말고 현재 지도 DB·일정·확인된 도구 결과로 "
+                    "바로 답하라. 가능한 선택이 적으면 그 한계를 솔직히 밝히고 최선의 짧은 답을 작성하라."
+                ),
+            },
+        ])
+        response = complete(with_tools=False)
+        reply = response.choices[0].message
+        final_text = (reply.content or final_text).strip()
 
     sources.update(URL_RE.findall(final_text))
     place_ids = {
