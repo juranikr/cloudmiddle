@@ -129,8 +129,8 @@ def _resolve_context_message(message: str, rows: list[TravelChatMessage]) -> str
     return message
 
 
-def _food_detail_recovery_query(city: City, query: str) -> str:
-    """Reduce an address-heavy geocode query back to its business name."""
+def _food_business_name(city: City, query: str) -> str:
+    """Extract the restaurant token from a restaurant/address search."""
     cleaned = re.sub(r"\s+", " ", query).strip()
     business = ""
     city_tokens = [f"{city.name_local}市", city.name_local, city.name_ko]
@@ -145,7 +145,19 @@ def _food_detail_recovery_query(city: City, query: str) -> str:
             business = business.replace(token, " ")
         business = re.sub(r"\s+", " ", business).strip()
     business = re.split(r"\s+(?:地址|位于|주소|辽宁省|[\u4e00-\u9fff]{1,6}[区县])", business, maxsplit=1)[0]
-    business = business.strip(" ,，:：-·")[:80]
+    business = (business.split() or [""])[0].strip(" ,，:：-·")[:80]
+    if (
+        not business
+        or re.search(r"\d|[区县路街号]$", business)
+        or business in {"必吃", "美食", "特色美食", "老字号", "餐厅", "饭店", "小吃"}
+    ):
+        return ""
+    return business
+
+
+def _food_detail_recovery_query(city: City, query: str) -> str:
+    """Reduce an address-heavy geocode query back to its business name."""
+    business = _food_business_name(city, query)
     return f"{city.name_local} {business} 去哪儿攻略" if business else ""
 
 
@@ -420,6 +432,7 @@ def answer_travel_chat(
     target_business_sources: dict[str, list[str]] = {}
     fetched_food_urls: set[str] = set()
     food_detail_queries: set[str] = set()
+    food_business_names: list[str] = []
     food_geo_candidates: list[dict[str, Any]] = []
 
     def add_food_geo_candidate(query: str, results: list[dict[str, Any]]) -> None:
@@ -487,7 +500,7 @@ def answer_travel_chat(
             return (-score, search_items.index(item))
 
         for item in sorted(search_items, key=evidence_priority):
-            if len(fetched) >= limit or len(fetched_food_urls) >= 12:
+            if len(fetched) >= limit or len(fetched_food_urls) >= 16:
                 break
             url = str(item.get("href") or "")
             if not url.startswith(("http://", "https://")) or url in fetched_food_urls:
@@ -577,7 +590,7 @@ def answer_travel_chat(
             seed_results.append({
                 "query": seed_query,
                 "result": seed_result,
-                "fetched_pages": fetch_food_evidence(seed_result),
+                "fetched_pages": fetch_food_evidence(seed_result, limit=1),
             })
             tool_results.append({"name": "web_search", "args": seed_args, "result": seed_result})
         messages.append({
@@ -726,11 +739,7 @@ def answer_travel_chat(
             # research call over from accumulated context. The required choice and
             # phase prompt still demand an action, while drift no longer becomes a 400.
             round_tools = set(allowed)
-            round_choice = (
-                {"type": "function", "function": {"name": "propose_place"}}
-                if len(food_geo_candidates) >= 2
-                else "required"
-            )
+            round_choice = {"type": "function", "function": {"name": "propose_place"}}
             pending_geo = food_geo_candidates[len(set(proposal_ids)):]
             messages.append({
                 "role": "system",
@@ -823,6 +832,10 @@ def answer_travel_chat(
                 args = json.loads(call.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+            if name == "web_search" and food_discovery:
+                business_name = _food_business_name(city, str(args.get("query") or ""))
+                if business_name and business_name not in food_business_names:
+                    food_business_names.append(business_name)
             signature = f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
             if index >= MAX_TOOL_CALLS_PER_ROUND:
                 result: Any = {"error": "이번 답변의 조사 예산을 넘었습니다. 현재 결과로 답을 정리하세요."}
@@ -927,6 +940,8 @@ def answer_travel_chat(
                 elif food_discovery and write_intent:
                     original_query = str(args.get("query") or "").strip()
                     recovery_query = _food_detail_recovery_query(city, original_query)[:300]
+                    if not recovery_query and food_business_names:
+                        recovery_query = f"{city.name_local} {food_business_names[-1]} 去哪儿攻略"[:300]
                     if original_query and recovery_query and recovery_query not in food_detail_queries:
                         food_detail_queries.add(recovery_query)
                         recovery_args = {"query": recovery_query, "max_results": 8}

@@ -17,6 +17,7 @@ from app.travel_chat import (
     WRITE_TOOLS,
     _brand_source_urls,
     _chat_capabilities,
+    _food_business_name,
     _food_detail_recovery_query,
     _missing_brand_targets,
     _needs_answer_retry,
@@ -109,6 +110,15 @@ class TravelChatRoutingTests(unittest.TestCase):
         query = _food_detail_recovery_query(city, "马家烧麦 沈阳市沈河区中街路195号")
 
         self.assertEqual(query, "沈阳 马家烧麦 去哪儿攻略")
+
+    def test_food_business_name_ignores_an_address_only_geocode(self) -> None:
+        city = City(name_ko="선양", name_local="沈阳")
+
+        self.assertEqual(_food_business_name(city, "沈阳市沈河区正阳街88号"), "")
+        self.assertEqual(
+            _food_business_name(city, "李连贵熏肉大饼 沈阳 地址"),
+            "李连贵熏肉大饼",
+        )
 
     def test_brand_seed_queries_use_correct_chinese_names(self) -> None:
         city = City(name_local="沈阳")
