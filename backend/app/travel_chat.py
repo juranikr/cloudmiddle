@@ -315,6 +315,7 @@ def answer_travel_chat(
     write_attempted = False
     write_succeeded = False
     successful_write_targets: set[str] = set()
+    actionable_targets: set[str] = set()
 
     def writes_complete() -> bool:
         return write_succeeded and (
@@ -324,7 +325,7 @@ def answer_travel_chat(
     def complete(
         *,
         tool_names: set[str] | None = None,
-        tool_choice: str = "auto",
+        tool_choice: Any = "auto",
     ) -> Any:
         nonlocal model
         kwargs: dict[str, Any] = {}
@@ -333,7 +334,7 @@ def answer_travel_chat(
         request: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": 0.0 if tool_choice == "required" else 0.2,
+            "temperature": 0.0 if tool_choice != "auto" else 0.2,
             **kwargs,
         }
         if tool_names:
@@ -368,8 +369,8 @@ def answer_travel_chat(
             )
             return fallback
 
+    seed_results: list[dict[str, Any]] = []
     if allowed:
-        seed_results: list[dict[str, Any]] = []
         for seed_query in _research_seed_queries(city, resolved_message):
             seed_args = {"query": seed_query, "max_results": 8}
             seed_result = run_tool(db, "web_search", seed_args, city_id=city_id)
@@ -388,34 +389,84 @@ def answer_travel_chat(
                 + json.dumps(seed_results, ensure_ascii=False, default=str)[:18000]
             ),
         })
+        if write_intent and brand_targets:
+            enrichment: list[dict[str, Any]] = []
+            chinese_names = {"모어요거트": "茉酸奶", "헤이티": "喜茶 HEYTEA"}
+            area_hint = " 中街" if ("중제" in resolved_message or "中街" in resolved_message) else ""
+            for target in brand_targets:
+                related_seed = next(
+                    (
+                        item
+                        for item in seed_results
+                        if chinese_names[target].split()[0] in item["query"]
+                    ),
+                    None,
+                )
+                search_items = (
+                    (related_seed.get("result") or {}).get("results") or []
+                    if related_seed
+                    else []
+                )
+                fetched: list[dict[str, Any]] = []
+                for item in search_items[:2]:
+                    url = str(item.get("href") or "") if isinstance(item, dict) else ""
+                    if not url.startswith(("http://", "https://")):
+                        continue
+                    fetch_result = run_tool(db, "fetch_page", {"url": url}, city_id=city_id)
+                    _collect_tool_sources("fetch_page", fetch_result, sources)
+                    tool_results.append({"name": "fetch_page", "args": {"url": url}, "result": fetch_result})
+                    fetched.append(fetch_result)
+                    if isinstance(fetch_result, dict) and fetch_result.get("text"):
+                        break
+                geo_args = {
+                    "query": f"{city.name_local}{area_hint} {chinese_names[target]} 门店",
+                    "limit": 5,
+                }
+                geo_result = run_tool(db, "geocode_place", geo_args, city_id=city_id)
+                _collect_tool_sources("geocode_place", geo_result, sources)
+                tool_results.append({"name": "geocode_place", "args": geo_args, "result": geo_result})
+                geo_hits = geo_result.get("results") or [] if isinstance(geo_result, dict) else []
+                if search_items and geo_hits:
+                    actionable_targets.add(target)
+                enrichment.append({
+                    "target": target,
+                    "search_results": search_items[:5],
+                    "fetched_pages": fetched,
+                    "geocode": geo_result,
+                    "actionable": target in actionable_targets,
+                })
+            messages.append({
+                "role": "system",
+                "content": (
+                    "서버가 저장 요청 대상을 각각 페이지 열람·다중 지오코딩까지 실행한 결과다. actionable=true인 대상만 "
+                    "실제 지점명·근거 URL·좌표 후보가 준비된 것이다. false인 대상은 추측해 저장하지 마라:\n"
+                    + json.dumps(enrichment, ensure_ascii=False, default=str)[:24000]
+                ),
+            })
 
     force_required = False
     tool_round_limit = MAX_WRITE_TOOL_ROUNDS if write_intent else MAX_RESEARCH_TOOL_ROUNDS
     for _round in range(tool_round_limit if allowed else 0):
         structured_brand_write = write_intent and bool(brand_targets)
-        if structured_brand_write and _round == 0:
-            round_tools = {"fetch_page"}
-            round_choice = "required"
-            messages.append({
-                "role": "system",
-                "content": "행동 1단계다. 서버 검색 결과에서 요청한 각 브랜드와 실제 관련 있는 페이지를 fetch_page로 열어 근거를 읽어라.",
-            })
-        elif structured_brand_write and _round == 1:
-            round_tools = {"geocode_place"}
-            round_choice = "required"
-            messages.append({
-                "role": "system",
-                "content": "행동 2단계다. 요청한 각 브랜드의 정확한 중국어 브랜드명·지점명·주소로 geocode_place를 호출해 좌표 후보를 확인하라.",
-            })
-        elif structured_brand_write:
-            round_tools = set(WRITE_TOOLS)
-            round_choice = "required"
-            remaining_targets = [target for target in brand_targets if target not in successful_write_targets]
+        if structured_brand_write:
+            remaining_targets = [
+                target
+                for target in brand_targets
+                if target in actionable_targets and target not in successful_write_targets
+            ]
+            if not remaining_targets:
+                break
+            round_tools = {"propose_place"}
+            round_choice = {
+                "type": "function",
+                "function": {"name": "propose_place"},
+            }
             messages.append({
                 "role": "system",
                 "content": (
-                    "행동 3단계다. 추가 검색을 멈추고 근거·좌표가 준비된 요청 대상을 propose_place로 실제 승인 대기에 저장하라. "
-                    f"아직 저장해야 할 대상: {remaining_targets}. 한 대상만 저장하고 끝내지 마라."
+                    "검색과 좌표 확인은 서버가 끝냈다. 이제 다른 도구를 요구하지 말고 propose_place만 호출해 "
+                    f"다음 대상을 실제 승인 대기에 저장하라: {remaining_targets}. actionable=false 대상은 저장하지 마라. "
+                    "도구가 오류를 반환하면 내용을 고쳐 다음 호출에서 재시도하라."
                 ),
             })
         else:
@@ -613,6 +664,36 @@ def answer_travel_chat(
             )
         else:
             final_text = "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다. 필요한 대상이나 조건 한 가지만 더 알려 주세요."
+
+    if write_intent:
+        target_text = "·".join(brand_targets) or "요청한 장소"
+        if writes_complete():
+            if proposal_ids:
+                final_text = (
+                    f"{target_text}을 관리자 승인 대기 제안 #{', #'.join(map(str, sorted(set(proposal_ids))))}로 실제 저장했습니다. "
+                    "관리자가 승인하면 지도에 반영됩니다."
+                )
+            elif "실제" not in final_text:
+                final_text = f"{target_text}의 확인된 정보를 기존 지도 장소에 실제 반영했습니다.\n\n{final_text}"
+        else:
+            completed = [target for target in brand_targets if target in successful_write_targets]
+            unverified = [target for target in brand_targets if target not in actionable_targets]
+            failed = [
+                target
+                for target in brand_targets
+                if target in actionable_targets and target not in successful_write_targets
+            ]
+            parts = ["요청을 전부 완료하지 못했습니다."]
+            if completed:
+                parts.append(f"{', '.join(completed)}은 승인 대기 제안으로 실제 저장했습니다.")
+            if unverified:
+                parts.append(f"{', '.join(unverified)}은 정확한 지점 좌표와 출처가 확인되지 않아 저장하지 않았습니다.")
+            if failed:
+                parts.append(f"{', '.join(failed)}은 근거가 있었지만 저장 도구가 성공하지 않아 DB 제안이 생성되지 않았습니다.")
+            if not brand_targets:
+                parts.append("성공한 저장 도구가 없어 DB 변경은 발생하지 않았습니다.")
+            parts.append("말로만 ‘추가하겠다’고 한 상태는 완료로 처리하지 않습니다.")
+            final_text = " ".join(parts)
 
     final_text = _strip_unsupported_urls(final_text, sources)
     place_ids = {

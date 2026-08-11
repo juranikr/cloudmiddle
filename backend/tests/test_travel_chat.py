@@ -133,42 +133,6 @@ class _ForcedWriteCompletions:
         if round_number == 1:
             calls = [
                 SimpleNamespace(
-                    id="fetch-1",
-                    function=SimpleNamespace(
-                        name="fetch_page",
-                        arguments=json.dumps({"url": "https://example.com/more"}),
-                    ),
-                ),
-                SimpleNamespace(
-                    id="fetch-2",
-                    function=SimpleNamespace(
-                        name="fetch_page",
-                        arguments=json.dumps({"url": "https://example.com/heytea"}),
-                    ),
-                ),
-            ]
-            message = SimpleNamespace(content="", tool_calls=calls)
-        elif round_number == 2:
-            calls = [
-                SimpleNamespace(
-                    id="geo-1",
-                    function=SimpleNamespace(
-                        name="geocode_place",
-                        arguments=json.dumps({"query": "沈阳 茉酸奶"}, ensure_ascii=False),
-                    ),
-                ),
-                SimpleNamespace(
-                    id="geo-2",
-                    function=SimpleNamespace(
-                        name="geocode_place",
-                        arguments=json.dumps({"query": "沈阳 喜茶"}, ensure_ascii=False),
-                    ),
-                ),
-            ]
-            message = SimpleNamespace(content="", tool_calls=calls)
-        elif round_number == 3:
-            calls = [
-                SimpleNamespace(
                     id="write-1",
                     function=SimpleNamespace(
                         name="propose_place",
@@ -304,11 +268,11 @@ class TravelChatLoopTests(unittest.TestCase):
 
         self.assertIn("실제 저장", result["row"].content)
         self.assertTrue(any(call.args[1] == "propose_place" for call in tool.call_args_list))
+        self.assertEqual(completions.requests[0]["tools"][0]["function"]["name"], "propose_place")
         self.assertEqual(
-            [request["tools"][0]["function"]["name"] for request in completions.requests[:2]],
-            ["fetch_page", "geocode_place"],
+            completions.requests[0]["tool_choice"],
+            {"type": "function", "function": {"name": "propose_place"}},
         )
-        self.assertEqual(completions.requests[2]["tool_choice"], "required")
         self.assertNotIn("tools", completions.requests[-1])
 
     def test_final_model_tool_error_never_becomes_http_500(self) -> None:
