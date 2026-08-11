@@ -88,18 +88,22 @@ def is_rollbackable(ev: PlaceEvent) -> bool:
     return True
 
 
-def list_agent_actions(db: Session, *, limit: int = 50) -> list[PlaceEvent]:
-    rows = (
-        db.query(PlaceEvent)
-        .filter(
-            PlaceEvent.actor == "agent",
-            PlaceEvent.action.in_(list(ROLLBACKABLE_ACTIONS)),
+def list_agent_actions(
+    db: Session, *, limit: int = 50, city_id: Optional[int] = None
+) -> list[PlaceEvent]:
+    query = db.query(PlaceEvent).filter(
+        PlaceEvent.actor == "agent",
+        PlaceEvent.action.in_(list(ROLLBACKABLE_ACTIONS)),
+    )
+    if city_id is not None:
+        query = query.join(Marker, Marker.id == PlaceEvent.place_id).filter(
+            Marker.city_id == city_id
         )
-        .order_by(PlaceEvent.created_at.desc())
+    return (
+        query.order_by(PlaceEvent.created_at.desc())
         .limit(max(1, min(limit, 200)))
         .all()
     )
-    return rows
 
 
 def rollback_event(

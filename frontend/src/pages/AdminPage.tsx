@@ -47,7 +47,7 @@ export default function AdminPage() {
       const [s, u, a, k, c, p, r, t] = await Promise.all([
         api.fetchAdminStatus(token),
         api.fetchAdminUsers(token),
-        api.fetchAdminAgentActions(token),
+        api.fetchAdminAgentActions(token, selectedCityId),
         api.fetchAdminKnowledge(token),
         api.fetchCities(token),
         api.fetchAdminAgentProposals(token, selectedCityId),

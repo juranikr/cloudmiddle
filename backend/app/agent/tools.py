@@ -855,6 +855,16 @@ def _complete_matching_proposal_tasks(
 def reconcile_proposal_tasks(db: Session, *, city_id: int) -> int:
     """Self-heal legacy candidate tasks once an equivalent proposal exists."""
     matched = 0
+    normalized = 0
+    legacy_tasks = db.query(AgentTask).filter(
+        AgentTask.city_id == city_id,
+        AgentTask.status == "pending",
+    ).all()
+    for task in legacy_tasks:
+        if task.title.startswith("승인 제안:"):
+            task.title = task.title.replace("승인 제안:", "후보 검증:", 1)
+            task.kind = "candidate_research"
+            normalized += 1
     proposals = db.query(AgentProposal).filter(
         AgentProposal.city_id == city_id,
         AgentProposal.action == "create_place",
@@ -867,7 +877,7 @@ def reconcile_proposal_tasks(db: Session, *, city_id: int) -> int:
             proposal_title=proposal.title,
             proposal_id=proposal.id,
         )
-    if matched:
+    if matched or normalized:
         db.commit()
     return matched
 

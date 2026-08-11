@@ -10,6 +10,7 @@ from app.agent.runner import count_unread
 from app.agent.tools import TOOLS, run_tool
 from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
+from app.rollback import list_agent_actions
 from app.models import (
     AgentKnowledge,
     AgentKnowledgeArchive,
@@ -89,6 +90,21 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(count_unread(self.db, 2), 1)
         rows = run_tool(self.db, "list_places", {}, city_id=2)
         self.assertEqual([row["city_id"] for row in rows], [2])
+
+    def test_admin_agent_history_can_be_scoped_to_city(self) -> None:
+        for city_id in (1, 2):
+            marker = self.db.query(Marker).filter(Marker.city_id == city_id).one()
+            self.db.add(PlaceEvent(
+                place_id=marker.id,
+                actor="agent",
+                action=PlaceEventAction.update,
+                summary=f"city {city_id}",
+                payload=json.dumps({"before": {"title": marker.title}}),
+            ))
+        self.db.commit()
+        rows = list_agent_actions(self.db, city_id=2)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].summary, "city 2")
 
     def test_disabled_auto_create_becomes_evidence_proposal(self) -> None:
         result = run_tool(

@@ -455,9 +455,10 @@ def admin_agent_actions(
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
     limit: int = 40,
+    city_id: Optional[int] = None,
 ) -> list[AdminAgentActionOut]:
     _ = admin
-    rows = list_agent_actions(db, limit=limit)
+    rows = list_agent_actions(db, limit=limit, city_id=city_id)
     place_ids = {e.place_id for e in rows if e.place_id}
     titles: dict[int, str] = {}
     if place_ids:

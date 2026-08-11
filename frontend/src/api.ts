@@ -339,8 +339,8 @@ export async function deleteAdminUser(token: string, id: number): Promise<void> 
   await handle<void>(res);
 }
 
-export async function fetchAdminAgentActions(token: string): Promise<AdminAgentAction[]> {
-  const res = await request("/api/admin/agent/actions", { headers: authHeaders(token) });
+export async function fetchAdminAgentActions(token: string, cityId: number): Promise<AdminAgentAction[]> {
+  const res = await request(`/api/admin/agent/actions?city_id=${cityId}`, { headers: authHeaders(token) });
   return handle<AdminAgentAction[]>(res);
 }
 
