@@ -293,6 +293,7 @@ class AgentCityScopeTests(unittest.TestCase):
             "update_place_fields",
             {
                 "place_id": marker.id,
+                "expected_title": marker.title,
                 "replace_title": marker.title,
                 "replace_description": marker.description,
                 "category": marker.category.value,
@@ -301,6 +302,42 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.assertEqual(result, {"ok": True, "changed": {}})
         self.assertEqual(self.db.query(PlaceEvent).count(), event_count)
+
+    def test_place_update_rejects_cross_subject_description(self) -> None:
+        marker = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        marker.is_agent_suggested = True
+        original = marker.description
+
+        result = run_tool(
+            self.db,
+            "update_place_fields",
+            {
+                "place_id": marker.id,
+                "expected_title": marker.title,
+                "replace_description": "청년공원은 1958년에 완공된 선허구의 도시공원입니다.",
+            },
+            city_id=2,
+        )
+
+        self.assertEqual(result["error"], "description_subject_mismatch")
+        self.assertEqual(marker.description, original)
+
+    def test_place_update_requires_current_expected_title(self) -> None:
+        marker = self.db.query(Marker).filter(Marker.city_id == 2).one()
+
+        result = run_tool(
+            self.db,
+            "update_place_fields",
+            {
+                "place_id": marker.id,
+                "expected_title": "다른 장소",
+                "travel_role": "nature",
+            },
+            city_id=2,
+        )
+
+        self.assertEqual(result["error"], "target_confirmation_required")
+        self.assertNotEqual(marker.travel_role, "nature")
 
     def test_zone_and_chain_are_relationships_not_merges(self) -> None:
         zone = Marker(

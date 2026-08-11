@@ -237,6 +237,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "update_place_fields",
             "description": (
                 "장소의 짧은 소개와 명칭을 정제한다. 운영 로그·이전 제목·조사 과정은 description에 넣지 않는다. "
+                "먼저 list_places/get_place에서 읽은 현재 제목을 expected_title에 그대로 넣어 대상 ID를 재확인한다. "
                 "언어 규칙: 설명 본문은 무조건 한국어(중국어 정보는 번역), "
                 "명칭은 중국어+한국어 병기('中文名 (한국어 명칭)'), 주소는 중국어 원문. "
                 "방문 팁·운영시간·역사·위치는 append_note가 아니라 upsert_place_insights로 출처와 함께 저장한다. "
@@ -248,6 +249,10 @@ TOOLS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "place_id": {"type": "integer"},
+                    "expected_title": {
+                        "type": "string",
+                        "description": "방금 읽은 대상 장소의 현재 제목. ID-장소 불일치 방지용",
+                    },
                     "append_note": {"type": "string", "description": "사용 중단. 구조화 정보는 upsert_place_insights 사용"},
                     "local_name": {"type": "string", "description": "현지(중국어 등) 공식 명칭·주소 병기"},
                     "replace_title": {
@@ -268,7 +273,7 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "이틀 여행에서 이 장소가 채우는 역할. 박물관은 history, 식당은 food처럼 실제 목적 기준",
                     },
                 },
-                "required": ["place_id"],
+                "required": ["place_id", "expected_title"],
             },
         },
     },
@@ -976,6 +981,17 @@ def _has_hangul(s: str) -> bool:
     return any("\uac00" <= ch <= "\ud7a3" for ch in s)
 
 
+def _compact_subject(value: str) -> str:
+    return "".join(re.findall(r"[0-9A-Za-z가-힣\u3400-\u9fff]+", value or "")).lower()
+
+
+def _title_subjects(title: str) -> list[str]:
+    """Stable local/Korean name forms used to reject cross-place description overwrites."""
+    parts = re.split(r"[()（）]", title or "")
+    candidates = [_compact_subject(part) for part in parts]
+    return [candidate for candidate in candidates if len(candidate) >= 4]
+
+
 def _has_cjk(s: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in s)
 
@@ -1581,13 +1597,22 @@ def run_tool(
                 "error": "structured_insight_required",
                 "detail": "설명 누적은 중단되었습니다. 위치·역사·방문정보·팁을 출처 URL과 함께 upsert_place_insights로 저장하세요.",
             }
+        expected_title = str(args.get("expected_title") or "").strip()
+        if not expected_title or _compact_subject(expected_title) != _compact_subject(m.title):
+            return {
+                "error": "target_confirmation_required",
+                "detail": (
+                    f"대상 ID의 현재 제목은 '{m.title}'입니다. list_places/get_place로 대상을 다시 읽고 "
+                    "expected_title을 정확히 넣어 재시도하세요."
+                ),
+            }
         before = marker_field_snapshot(m)
         original_description = m.description or ""
         changed: dict[str, Any] = {}
         local_name = str(args.get("local_name") or "").strip()
+        prospective_title = m.title
         if local_name and local_name not in m.title:
-            m.title = f"{m.title} ({local_name})"[:200]
-            changed["local_name"] = local_name
+            prospective_title = f"{m.title} ({local_name})"[:200]
         replace_title = str(args.get("replace_title") or "").strip()
         if replace_title and replace_title != m.title:
             if not _has_hangul(replace_title):
@@ -1595,8 +1620,7 @@ def run_tool(
                     "error": "korean_required",
                     "detail": "제목은 '中文名 (한국어 명칭)' 형식으로 한국어를 병기해 다시 호출하세요.",
                 }
-            m.title = replace_title[:200]
-            changed["replace_title"] = m.title
+            prospective_title = replace_title[:200]
         replace_description = str(args.get("replace_description") or "").strip()
         if replace_description and replace_description != m.description:
             if not _has_hangul(replace_description):
@@ -1609,6 +1633,17 @@ def run_tool(
                     "error": "user_content_protected",
                     "detail": "사용자가 작성한 한국어 설명은 전면 교체할 수 없습니다. 세부 사실은 upsert_place_insights로 보완하세요.",
                 }
+            subject_title = prospective_title
+            aliases = _title_subjects(subject_title)
+            compact_description = _compact_subject(replace_description)
+            if aliases and not any(alias in compact_description for alias in aliases):
+                return {
+                    "error": "description_subject_mismatch",
+                    "detail": (
+                        f"새 설명에 대상 장소명 '{subject_title}'이 확인되지 않습니다. 다른 장소 조사 결과를 "
+                        "잘못 덮어쓰지 않도록 대상 이름을 본문에 명시하고 다시 확인하세요."
+                    ),
+                }
             cleaned = "\n".join(
                 line for line in replace_description.splitlines()
                 if not line.strip().startswith("[이전 제목 보존]")
@@ -1620,6 +1655,12 @@ def run_tool(
                 }
             m.description = cleaned
             changed["replace_description"] = True
+        if prospective_title != m.title:
+            m.title = prospective_title
+            if replace_title:
+                changed["replace_title"] = m.title
+            else:
+                changed["local_name"] = local_name
         if args.get("category"):
             try:
                 new_category = MarkerCategory(str(args["category"]))
