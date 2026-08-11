@@ -11,10 +11,19 @@ import type {
 } from "./types";
 
 export interface GeocodeHit {
+  query: string;
   display_name: string;
   lat: number;
   lng: number;
   type: string;
+  source: string;
+  sources: string[];
+  confidence: number;
+  confidence_label: string;
+  storage_allowed: boolean;
+  existing_marker_id: number | null;
+  external_id: string;
+  source_url: string;
 }
 
 /** 개발: Vite 프록시(/api). 배포: 같은 오리진(ALB)의 /api */
@@ -85,6 +94,11 @@ export async function fetchMarkers(
   const qs = q.toString();
   const res = await request(`/api/markers${qs ? `?${qs}` : ""}`, { headers: authHeaders(token) });
   return handle<MarkerItem[]>(res);
+}
+
+export async function fetchMarker(token: string, id: number): Promise<MarkerItem> {
+  const res = await request(`/api/markers/${id}`, { headers: authHeaders(token) });
+  return handle<MarkerItem>(res);
 }
 
 export async function fetchCities(token: string): Promise<City[]> {

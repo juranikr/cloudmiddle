@@ -203,10 +203,35 @@ def geocode(
     city = db.query(City).filter(City.id == city_id, City.status == "active").first()
     if city is None:
         raise HTTPException(status_code=404, detail="도시를 찾을 수 없습니다")
+    local_rows = (
+        db.query(Marker)
+        .filter(Marker.city_id == city.id, Marker.merged_into_id.is_(None))
+        .order_by(Marker.updated_at.desc())
+        .all()
+    )
+    local_candidates = [
+        {
+            "id": marker.id,
+            "title": marker.title,
+            "description": marker.description,
+            "lat": marker.lat,
+            "lng": marker.lng,
+            "type": marker.category.value,
+        }
+        for marker in local_rows
+    ]
     try:
         return [
             GeocodeResult(**item)
-            for item in search_address(q, viewbox=city.search_viewbox, city_name=city.name_local)
+            for item in search_address(
+                q,
+                viewbox=city.search_viewbox,
+                city_name=city.name_local,
+                city_context=city.search_context,
+                local_candidates=local_candidates,
+                include_display_only=True,
+                arcgis_api_key=settings.arcgis_api_key,
+            )
         ]
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

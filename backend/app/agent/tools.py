@@ -35,6 +35,7 @@ from app.models import (
     AgentSearchLog,
     AgentSearchResult,
     AgentWebVisit,
+    City,
     Marker,
     MarkerCategory,
     MarkerShape,
@@ -413,12 +414,13 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "geocode_place",
-            "description": "지난(济南) 중심 주소/장소명 지오코딩. create_place 전에 사용.",
+            "description": "지정 도시 안에서 DB·OSM·Wikidata 다중 주소/장소 검색. create_place 전에 사용.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "default": 5},
+                    "city_id": {"type": "integer", "default": 1, "description": "1=지난, 2=선양"},
                 },
                 "required": ["query"],
             },
@@ -1343,8 +1345,19 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         query = str(args.get("query") or "").strip()
         if not query:
             return {"results": []}
+        city_id = int(args.get("city_id") or 1)
+        city = db.query(City).filter(City.id == city_id, City.status == "active").first()
+        if city is None:
+            return {"results": [], "error": f"unknown city_id: {city_id}"}
         try:
-            hits = search_address(query, limit=int(args.get("limit") or 5))
+            hits = search_address(
+                query,
+                limit=int(args.get("limit") or 5),
+                viewbox=city.search_viewbox,
+                city_name=city.name_local,
+                city_context=city.search_context,
+                arcgis_api_key=settings.arcgis_api_key,
+            )
         except Exception as exc:
             return {"results": [], "error": str(exc)}
         return {"results": hits}

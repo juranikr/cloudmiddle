@@ -42,6 +42,17 @@ type PanelMode = "create" | "view" | "edit" | null;
 type DraftKind = "point" | "polygon" | null;
 type MobileTab = "map" | "inbox" | "more";
 
+const GEOCODE_SOURCE_LABEL: Record<string, string> = {
+  local: "내 지도",
+  arcgis: "ArcGIS",
+  nominatim: "OSM",
+  wikidata: "Wikidata",
+};
+
+function geocodeShortName(hit: GeocodeHit): string {
+  return hit.display_name.split(",")[0].split(" · ")[0].trim() || hit.query;
+}
+
 function MapClickHandler({
   enabled,
   onPick,
@@ -129,7 +140,7 @@ export default function MapPage() {
   const [locateFollowOnce, setLocateFollowOnce] = useState(false);
   const [locateBusy, setLocateBusy] = useState(false);
   const [locateMsg, setLocateMsg] = useState("");
-  const [searchPin, setSearchPin] = useState<(LatLng & { label: string }) | null>(null);
+  const [searchPin, setSearchPin] = useState<(LatLng & { label: string; hit?: GeocodeHit }) | null>(null);
   const [searchHits, setSearchHits] = useState<GeocodeHit[]>([]);
   const [searchError, setSearchError] = useState("");
   const [searchSheetOpen, setSearchSheetOpen] = useState(false);
@@ -329,9 +340,20 @@ export default function MapPage() {
     }
   }
 
-  function handleSearchPick(hit: GeocodeHit) {
+  async function handleSearchPick(hit: GeocodeHit) {
+    if (hit.existing_marker_id && token) {
+      try {
+        const marker = await api.fetchMarker(token, hit.existing_marker_id);
+        clearSearch();
+        openView(marker);
+        setFlyTarget({ lat: marker.lat, lng: marker.lng });
+      } catch (err) {
+        setSearchError(err instanceof Error ? err.message : "저장된 장소를 열지 못했습니다.");
+      }
+      return;
+    }
     const point = { lat: hit.lat, lng: hit.lng };
-    setSearchPin({ ...point, label: hit.display_name });
+    setSearchPin({ ...point, label: hit.display_name, hit });
     setFlyTarget(point);
     setSearchSheetOpen(false);
     setSelected(null);
@@ -446,6 +468,7 @@ export default function MapPage() {
   const createShape: MarkerShape = draftKind === "polygon" ? "polygon" : "point";
   const showSearchList = searchSheetOpen && (searchHits.length > 0 || !!searchError);
   const showSearchCard = !!searchPin && !panelOpen && !showSearchList;
+  const selectedSearchHit = searchPin?.hit ?? null;
 
   const modeToggle = (
     <div className="mode-toggle" role="group" aria-label="지도 모드">
@@ -541,9 +564,22 @@ export default function MapPage() {
       <ul>
         {searchHits.map((hit) => (
           <li key={`${hit.lat},${hit.lng},${hit.display_name}`}>
-            <button type="button" onClick={() => handleSearchPick(hit)}>
-              <strong>{hit.display_name.split(",")[0]}</strong>
+            <button type="button" onClick={() => void handleSearchPick(hit)}>
+              <span className="result-list__title-row">
+                <strong>{geocodeShortName(hit)}</strong>
+                <span className="result-list__badges">
+                  {hit.sources.map((source) => (
+                    <em key={source} className={`source-badge source-badge--${source}`}>
+                      {GEOCODE_SOURCE_LABEL[source] ?? source}
+                    </em>
+                  ))}
+                </span>
+              </span>
               <span>{hit.display_name}</span>
+              <small>
+                {hit.confidence_label}
+                {!hit.storage_allowed ? " · 참고 위치—등록 시 지도에서 직접 지정" : ""}
+              </small>
             </button>
           </li>
         ))}
@@ -554,21 +590,57 @@ export default function MapPage() {
   const searchCard = showSearchCard ? (
     <div className="search-card">
       <div className="search-card__body">
-        <strong>{searchPin.label.split(",")[0]}</strong>
+        <span className="result-list__title-row">
+          <strong>{selectedSearchHit ? geocodeShortName(selectedSearchHit) : searchPin.label.split(",")[0]}</strong>
+          {selectedSearchHit ? (
+            <span className="result-list__badges">
+              {selectedSearchHit.sources.map((source) => (
+                <em key={source} className={`source-badge source-badge--${source}`}>
+                  {GEOCODE_SOURCE_LABEL[source] ?? source}
+                </em>
+              ))}
+            </span>
+          ) : null}
+        </span>
         <span>{searchPin.label}</span>
+        {selectedSearchHit ? (
+          <span>{selectedSearchHit.confidence_label} · 일치도 {Math.round(selectedSearchHit.confidence * 100)}%</span>
+        ) : null}
         <span className="search-card__coord">
           {searchPin.lat.toFixed(5)}, {searchPin.lng.toFixed(5)}
         </span>
+        {selectedSearchHit && !selectedSearchHit.storage_allowed ? (
+          <span className="search-card__notice">
+            ArcGIS 익명 결과는 참고용입니다. 같은 지점을 지도에서 직접 지정하면 저장할 수 있습니다.
+          </span>
+        ) : null}
       </div>
       <div className="search-card__actions">
         <button
           type="button"
           className="btn btn--primary"
           onClick={() => {
-            placePinDraft(searchPin.lat, searchPin.lng, { openCreate: true });
+            if (!selectedSearchHit || selectedSearchHit.storage_allowed) {
+              if (selectedSearchHit) {
+                setCreateDefaults({
+                  title: geocodeShortName(selectedSearchHit),
+                  description: selectedSearchHit.display_name,
+                  category: "tourist",
+                });
+              }
+              placePinDraft(searchPin.lat, searchPin.lng, { openCreate: true });
+              return;
+            }
+            const query = selectedSearchHit.query;
+            setCreateDefaults({ title: query, category: "tourist" });
+            setToolMode("pin");
+            pendingImportPick.current = true;
+            setAwaitingImportPick(true);
+            setError("ArcGIS 참고 위치를 확인한 뒤 지도에서 같은 지점을 직접 탭하세요.");
+            clearSearch();
           }}
         >
-          여기에 등록
+          {!selectedSearchHit || selectedSearchHit.storage_allowed ? "여기에 등록" : "지도에서 직접 지정"}
         </button>
         <button type="button" className="btn btn--ghost" onClick={clearSearch}>
           닫기

@@ -25,10 +25,19 @@ class CityOut(BaseModel):
 
 
 class GeocodeResult(BaseModel):
+    query: str = ""
     display_name: str
     lat: float
     lng: float
     type: str = ""
+    source: str = ""
+    sources: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    confidence_label: str = "확인 필요"
+    storage_allowed: bool = True
+    existing_marker_id: Optional[int] = None
+    external_id: str = ""
+    source_url: str = ""
 
 
 class ShareImportRequest(BaseModel):

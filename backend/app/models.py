@@ -89,6 +89,7 @@ class City(Base):
     center_lng: Mapped[float] = mapped_column(Float, nullable=False)
     default_zoom: Mapped[int] = mapped_column(Integer, default=12, nullable=False)
     search_viewbox: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    search_context: Mapped[str] = mapped_column(String(200), default="", nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

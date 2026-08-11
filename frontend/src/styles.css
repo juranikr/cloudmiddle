@@ -1532,6 +1532,45 @@ textarea {
   display: grid;
   gap: 2px;
 }
+.result-list__title-row {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.result-list__title-row > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.result-list__badges {
+  display: inline-flex !important;
+  flex: none;
+  gap: 4px;
+}
+.result-list .source-badge,
+.search-card .source-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 6px;
+  background: #edf2f4;
+  color: #51616b;
+  font-size: 0.66rem;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1.35;
+}
+.result-list .source-badge--local, .search-card .source-badge--local { background: #dcfce7; color: #166534; }
+.result-list .source-badge--arcgis, .search-card .source-badge--arcgis { background: #dbeafe; color: #1d4ed8; }
+.result-list .source-badge--nominatim, .search-card .source-badge--nominatim { background: #fef3c7; color: #92400e; }
+.result-list .source-badge--wikidata, .search-card .source-badge--wikidata { background: #ede9fe; color: #6d28d9; }
+.result-list li small {
+  color: var(--teal-deep);
+  font-size: 0.72rem;
+}
 .result-list li button:hover,
 .place-list li button:hover,
 .result-list li button:focus-visible,
@@ -1553,6 +1592,14 @@ textarea {
 .search-card__body strong { font-size: 1.02rem; }
 .search-card__body span { font-size: 0.82rem; color: var(--muted); }
 .search-card__coord { font-family: ui-monospace, monospace; font-size: 0.78rem !important; }
+.search-card__notice {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #eff6ff;
+  color: #1e40af !important;
+  line-height: 1.45;
+}
 .search-card__actions { display: flex; gap: 8px; }
 .search-card__actions .btn { flex: 1; }
 

@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-11 (KST) — 로컬 복구, 도시 분리, 에이전트 안전 모드
+최종 갱신: 2026-08-11 (KST) — 도시별 다중 위치 검색과 출처·저장 안전장치
 
 ---
 
@@ -31,7 +31,7 @@
 | RDS | `tourmiddle-dev-postgres…` (Postgres 16, `db.t4g.micro`, **publicly accessible**, SG `0.0.0.0/0:5432` — 강한 비밀번호 의존) |
 | GitHub OIDC role | `arn:aws:iam::155557574983:role/tourmiddle-dev-github-actions` |
 | TF state | S3 `tourmiddle-tfstate-155557574983` + DynamoDB `tourmiddle-tf-lock` |
-| App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`, `GROQ_API_KEY`, `GROQ_MODEL`) |
+| App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`, `GROQ_API_KEY`, `GROQ_MODEL`, `ARCGIS_API_KEY`) |
 | 이미지 S3 | `tourmiddle-dev-place-images-155557574983` |
 | 이미지 CDN | https://d3qw5zq6yb15c.cloudfront.net |
 | 에이전트 스케줄 | EventBridge `cron(0 18 * * ? *)` = 매일 03:00 KST → ECS task `tourmiddle-dev-agent` |
@@ -72,7 +72,11 @@
 - **관리자** `/admin` (성주한 `joohan92@naver.com`만, `ADMIN_EMAILS`): 에이전트 수동 실행, **에이전트 변경 이력·롤백**, 사용자 CRUD, 미읽음/Groq 상태. API 키는 Secrets Manager
 - 기존 마커에 `place_events`가 없으면 기동 시 **create 미읽음 백필**
 - **이미지**: S3 presigned PUT + CloudFront URL, 상세 상단 슬라이드 (`ImageSlideshow`)
-- 주소 검색: 백엔드 `/api/geocode` → Nominatim
+- 주소·장소 검색: 백엔드 `/api/geocode`가 **운영 DB → ArcGIS → Nominatim → Wikidata** 후보를 도시 경계 안에서 병렬 조회·근접 병합
+  - 이미 등록된 장소를 최우선 노출하고 상세로 바로 이동해 중복 방지
+  - 출처, 일치도, 교차 확인, Wikidata ID를 결과에 포함
+  - ArcGIS API 키가 없으면 단독 결과는 참고용(`storage_allowed=false`)이며 지도 직접 지정 후 등록
+  - Nominatim 공개 정책에 맞춰 1 req/s 제한과 12시간 캐시 적용
 - 위치: HTTPS/localhost에서 GPS; HTTP LAN(아이폰)은 지도 중심 **가상 위치**
 - 지도 뷰: center/zoom·locate 플래그 `localStorage` 유지
 - 마커 설명: `http(s)://`·`www.` URL 자동 링크 (보기 모드, 새 탭)
@@ -138,6 +142,14 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 7) 히스토리 타임라인
+
+### 2026-08-11 — 도시별 다중 위치 검색
+- `/api/geocode`: 운영 DB·ArcGIS·Nominatim·Wikidata 병렬 조회, 도시 viewbox 필터, 140m 근접 후보 병합
+- 검색 응답: `sources`, `confidence`, `confidence_label`, `storage_allowed`, `existing_marker_id`, `external_id`
+- UX: 출처 배지·교차 확인 표시, 기존 장소 바로 열기, 검색 결과에서 등록 폼 이름·설명 자동 입력
+- ArcGIS 익명 결과는 참고용으로 제한하고 지도 직접 지정 흐름 제공; 키 설정 시 `forStorage=true`
+- 도시 검색 문맥 DB 필드 `cities.search_context` 추가(지난=산둥성, 선양=랴오닝성)
+- 에이전트 `geocode_place`에 `city_id`를 추가해 같은 다중 검색기를 사용
 
 1. **아맵/디엔핑 스크래핑** — 한국에서 비현실적 → 자체 지난 여행 지도 앱으로 전환
 2. **MVP** — FastAPI + React + Leaflet, 공유 마커/구역, 3 테스트 계정, Docker Compose(Postgres) 옵션

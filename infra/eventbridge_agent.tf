@@ -29,6 +29,7 @@ resource "aws_ecs_task_definition" "agent" {
         { name = "JWT_SECRET", valueFrom = "${aws_secretsmanager_secret.app.arn}:JWT_SECRET::" },
         { name = "GROQ_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_API_KEY::" },
         { name = "GROQ_MODEL", valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_MODEL::" },
+        { name = "ARCGIS_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:ARCGIS_API_KEY::" },
       ]
       logConfiguration = {
         logDriver = "awslogs"

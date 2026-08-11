@@ -9,19 +9,25 @@ def ensure_schema() -> None:
     tables = set(insp.get_table_names())
 
     with engine.begin() as conn:
+        if "cities" in tables:
+            city_cols = {c["name"] for c in insp.get_columns("cities")}
+            if "search_context" not in city_cols:
+                conn.execute(text("ALTER TABLE cities ADD COLUMN search_context VARCHAR(200) DEFAULT '' NOT NULL"))
+
         if engine.dialect.name == "postgresql":
             conn.execute(text("""
                 INSERT INTO cities (id, slug, name_ko, name_local, country_code, center_lat, center_lng,
-                                    default_zoom, search_viewbox, status, sort_order)
+                                    default_zoom, search_viewbox, search_context, status, sort_order)
                 VALUES
                   (1, 'jinan', '지난', '济南', 'CN', 36.6512, 117.1201, 12,
-                   '116.70,36.95,117.55,36.35', 'active', 10),
+                   '116.70,36.95,117.55,36.35', '济南市 山东省 中国', 'active', 10),
                   (2, 'shenyang', '선양', '沈阳', 'CN', 41.8057, 123.4315, 12,
-                   '122.85,42.15,123.85,41.45', 'active', 20)
+                   '122.85,42.15,123.85,41.45', '沈阳市 辽宁省 中国', 'active', 20)
                 ON CONFLICT (id) DO UPDATE SET
                   slug = EXCLUDED.slug, name_ko = EXCLUDED.name_ko, name_local = EXCLUDED.name_local,
                   center_lat = EXCLUDED.center_lat, center_lng = EXCLUDED.center_lng,
                   default_zoom = EXCLUDED.default_zoom, search_viewbox = EXCLUDED.search_viewbox,
+                  search_context = EXCLUDED.search_context,
                   status = EXCLUDED.status, sort_order = EXCLUDED.sort_order
             """))
             conn.execute(text("""
@@ -32,13 +38,15 @@ def ensure_schema() -> None:
             conn.execute(text("""
                 INSERT OR IGNORE INTO cities
                   (id, slug, name_ko, name_local, country_code, center_lat, center_lng,
-                   default_zoom, search_viewbox, status, sort_order)
+                   default_zoom, search_viewbox, search_context, status, sort_order)
                 VALUES
                   (1, 'jinan', '지난', '济南', 'CN', 36.6512, 117.1201, 12,
-                   '116.70,36.95,117.55,36.35', 'active', 10),
+                   '116.70,36.95,117.55,36.35', '济南市 山东省 中国', 'active', 10),
                   (2, 'shenyang', '선양', '沈阳', 'CN', 41.8057, 123.4315, 12,
-                   '122.85,42.15,123.85,41.45', 'active', 20)
+                   '122.85,42.15,123.85,41.45', '沈阳市 辽宁省 中国', 'active', 20)
             """))
+            conn.execute(text("UPDATE cities SET search_context = '济南市 山东省 中国' WHERE id = 1"))
+            conn.execute(text("UPDATE cities SET search_context = '沈阳市 辽宁省 中国' WHERE id = 2"))
         if "markers" in tables:
             cols = {c["name"] for c in insp.get_columns("markers")}
             if "city_id" not in cols:
