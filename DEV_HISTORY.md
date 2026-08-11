@@ -156,6 +156,7 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 - `place_insights`: location/history/visit/tip을 타임라인형 장소 상세에 표시
 - 마커 좌표 provenance(provider/external ID/query/source URL/confidence/CRS) 저장 및 화면 노출
 - 따종/고덕 공유 가져오기와 GPS 범위를 선택 도시 컨텍스트로 전환
+- 고덕 공유문 `5.0分` 평점 줄/공유 문구를 제목으로 오인하던 문제 수정, 실제 POI·호텔명을 우선 선택
 - 선양 초기 조사 축과 공통 편집 기준을 지식베이스 seed로 추가
 
 ### 2026-08-11 — 도시별 다중 위치 검색

@@ -35,6 +35,12 @@ FOOD_HINT_RE = re.compile(
     r"(음식|餐饮|美食|菜|肉|火锅|烧烤|咖啡|奶茶|甜点|小吃|饭店|餐厅|食堂)",
     re.I,
 )
+RATING_ONLY_RE = re.compile(r"^(?:评分\s*)?\d(?:\.\d+)?\s*分$", re.I)
+SHARE_BOILERPLATE_RE = re.compile(r"^(?:分享|推荐|打开|复制|查看).*(?:高德|地图|链接|App)", re.I)
+ADDRESS_HINT_RE = re.compile(
+    r"(?:\d+\s*号|交叉口|路口|(?:省|市|区|县).*(?:路|街|巷)|(?:Street|Road|Avenue)\b|\bNo\.?\s*\d+)",
+    re.I,
+)
 
 
 @dataclass
@@ -109,13 +115,27 @@ def _has_cjk(s: str) -> bool:
 
 
 def _prefer_name(*candidates: str) -> str:
-    cjk = [c.strip() for c in candidates if c and c.strip() and _has_cjk(c)]
-    if cjk:
-        return cjk[0]
-    for c in candidates:
-        if c and c.strip():
-            return c.strip()
-    return ""
+    def score(value: str) -> tuple[int, int]:
+        cleaned = value.strip()
+        if not cleaned or RATING_ONLY_RE.fullmatch(cleaned) or SHARE_BOILERPLATE_RE.search(cleaned):
+            return (-1000, 0)
+        points = 30 if _has_cjk(cleaned) else 0
+        if any(
+            keyword in cleaned
+            for keyword in (
+                "酒店", "宾馆", "博物馆", "故宫", "公园", "市场", "早市", "餐厅", "饭店", "咖啡", "广场", "府",
+            )
+        ):
+            points += 20
+        if ADDRESS_HINT_RE.search(cleaned):
+            points -= 25
+        return (points, min(len(cleaned), 80))
+
+    usable = [candidate.strip() for candidate in candidates if candidate and candidate.strip()]
+    if not usable:
+        return ""
+    best = max(enumerate(usable), key=lambda item: (*score(item[1]), -item[0]))[1]
+    return "" if score(best)[0] < 0 else best
 
 
 def _follow_redirects(url: str, max_hops: int = 8, total_budget_s: float = 12.0) -> str:
@@ -176,7 +196,10 @@ def _parse_share_body_lines(text: str, url: str) -> tuple[str, str, str, str]:
         if "★" in cleaned:
             continue
 
-        if any(k in cleaned for k in ("路", "街", "号", "广场", "大厦", "路口", "交叉口")):
+        if RATING_ONLY_RE.fullmatch(cleaned) or SHARE_BOILERPLATE_RE.search(cleaned):
+            continue
+
+        if ADDRESS_HINT_RE.search(cleaned):
             if not address:
                 address = cleaned
             continue
