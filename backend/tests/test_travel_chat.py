@@ -41,6 +41,7 @@ class TravelChatRoutingTests(unittest.TestCase):
 
     def test_generic_clarification_is_retried(self) -> None:
         self.assertTrue(_needs_answer_retry("죄송합니다, 요청 내용을 파악하지 못했습니다."))
+        self.assertTrue(_needs_answer_retry("죄송합니다. 어떤 정보를 원하시는지 구체적으로 알려주세요."))
         self.assertFalse(_needs_answer_retry("현재 지도에는 음식 장소가 비어 있습니다."))
 
 
@@ -96,7 +97,7 @@ class TravelChatLoopTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch.object(settings, "groq_api_key", "test-key"),
-            patch("app.travel_chat.run_tool", return_value={"items": [], "source": "https://example.com"}),
+            patch("app.travel_chat.run_tool", return_value={"items": [], "source": "https://example.com"}) as tool,
         ):
             result = answer_travel_chat(
                 self.db,
@@ -108,10 +109,8 @@ class TravelChatLoopTests(unittest.TestCase):
         self.assertEqual(result["row"].content, "확인한 세 지점을 가까운 순서로 정리했습니다.")
         self.assertEqual(len(completions.requests), 4)
         self.assertIn("tools", completions.requests[0])
-        self.assertEqual(
-            completions.requests[0]["tool_choice"],
-            {"type": "function", "function": {"name": "web_search"}},
-        )
+        self.assertEqual(tool.call_args_list[0].args[1], "web_search")
+        self.assertIn("沈阳", tool.call_args_list[0].args[2]["query"])
         self.assertNotIn("tools", completions.requests[-1])
 
     def test_simple_question_uses_one_tool_free_completion(self) -> None:

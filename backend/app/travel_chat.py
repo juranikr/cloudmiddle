@@ -23,7 +23,8 @@ WEB_INTENT_RE = re.compile(
 )
 FAILED_RESEARCH_REPLY = "조사가 길어져 여기서 멈췄습니다. 질문을 한 장소나 한 주제로 좁혀 다시 물어봐 주세요."
 GENERIC_CLARIFICATION_RE = re.compile(
-    r"요청 (?:내용|의도)을? 파악하지 못|구체적으로 어떤 정보를 원|질문을 이해하지 못"
+    r"요청 (?:내용|의도)을? 파악하지 못|구체적으로 어떤 정보를 원|질문을 이해하지 못|"
+    r"죄송합니다.{0,30}(?:어떤 정보|구체적으로)|구체적으로 알려주"
 )
 MAX_TOOL_ROUNDS = 3
 MAX_TOOL_CALLS_PER_ROUND = 4
@@ -211,7 +212,7 @@ def answer_travel_chat(
     final_text = ""
     seen_tool_calls: set[str] = set()
 
-    def complete(*, with_tools: bool, required_tool: str | None = None) -> Any:
+    def complete(*, with_tools: bool) -> Any:
         nonlocal model
         kwargs: dict[str, Any] = {}
         if "gpt-oss" in model:
@@ -224,10 +225,7 @@ def answer_travel_chat(
         }
         if with_tools and allowed:
             request["tools"] = _tool_subset(allowed)
-            request["tool_choice"] = (
-                {"type": "function", "function": {"name": required_tool}}
-                if required_tool else "auto"
-            )
+            request["tool_choice"] = "auto"
         try:
             return client.chat.completions.create(**request)
         except Exception as exc:
@@ -242,11 +240,25 @@ def answer_travel_chat(
                 return client.chat.completions.create(**request)
             raise
 
-    for round_index in range(MAX_TOOL_ROUNDS if allowed else 0):
-        response = complete(
-            with_tools=True,
-            required_tool="web_search" if round_index == 0 else None,
+    if allowed:
+        seed_query = message if city.name_local in message else f"{city.name_local} {message}"
+        seed_args = {"query": seed_query, "max_results": 8}
+        seed_result = run_tool(db, "web_search", seed_args, city_id=city_id)
+        _collect_sources(seed_result, sources)
+        seen_tool_calls.add(
+            f"web_search:{json.dumps(seed_args, ensure_ascii=False, sort_keys=True, default=str)}"
         )
+        messages.append({
+            "role": "system",
+            "content": (
+                "서버가 사용자의 현재 조사 요청을 대상으로 먼저 실행한 웹 검색 결과다. 현재 질문의 핵심 대상에서 "
+                "벗어나 지도 속 다른 장소 설명만 반복하지 마라. 결과가 충분하면 출처를 근거로 답하고, 부족할 때만 "
+                "추가 도구를 호출하라:\n" + json.dumps(seed_result, ensure_ascii=False, default=str)[:12000]
+            ),
+        })
+
+    for _ in range(MAX_TOOL_ROUNDS if allowed else 0):
+        response = complete(with_tools=True)
         reply = response.choices[0].message
         calls = reply.tool_calls or []
         if not calls:
