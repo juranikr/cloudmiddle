@@ -131,8 +131,42 @@ class _ForcedWriteCompletions:
         self.requests.append(kwargs)
         round_number = len(self.requests)
         if round_number == 1:
-            message = SimpleNamespace(content="등록 제안 요약만 작성하겠습니다.", tool_calls=[])
+            calls = [
+                SimpleNamespace(
+                    id="fetch-1",
+                    function=SimpleNamespace(
+                        name="fetch_page",
+                        arguments=json.dumps({"url": "https://example.com/more"}),
+                    ),
+                ),
+                SimpleNamespace(
+                    id="fetch-2",
+                    function=SimpleNamespace(
+                        name="fetch_page",
+                        arguments=json.dumps({"url": "https://example.com/heytea"}),
+                    ),
+                ),
+            ]
+            message = SimpleNamespace(content="", tool_calls=calls)
         elif round_number == 2:
+            calls = [
+                SimpleNamespace(
+                    id="geo-1",
+                    function=SimpleNamespace(
+                        name="geocode_place",
+                        arguments=json.dumps({"query": "沈阳 茉酸奶"}, ensure_ascii=False),
+                    ),
+                ),
+                SimpleNamespace(
+                    id="geo-2",
+                    function=SimpleNamespace(
+                        name="geocode_place",
+                        arguments=json.dumps({"query": "沈阳 喜茶"}, ensure_ascii=False),
+                    ),
+                ),
+            ]
+            message = SimpleNamespace(content="", tool_calls=calls)
+        elif round_number == 3:
             calls = [
                 SimpleNamespace(
                     id="write-1",
@@ -156,6 +190,11 @@ class _ForcedWriteCompletions:
                 tool_calls=[],
             )
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+class _FailingCompletions:
+    def create(self, **_kwargs):
+        raise RuntimeError("Tool choice is none, but model called a tool")
 
 
 class TravelChatLoopTests(unittest.TestCase):
@@ -248,6 +287,10 @@ class TravelChatLoopTests(unittest.TestCase):
             self.assertEqual(city_id, 1)
             if name == "web_search":
                 return {"results": [{"href": "https://example.com/branch", "title": "branch"}]}
+            if name == "fetch_page":
+                return {"url": "https://example.com/branch", "title": "branch", "text": "verified"}
+            if name == "geocode_place":
+                return {"results": [{"lat": 41.8, "lng": 123.45, "source": "osm"}]}
             if name == "propose_place":
                 return {"ok": True, "proposal_created": True, "proposal_id": 31}
             return {"error": "unexpected_tool"}
@@ -261,8 +304,30 @@ class TravelChatLoopTests(unittest.TestCase):
 
         self.assertIn("실제 저장", result["row"].content)
         self.assertTrue(any(call.args[1] == "propose_place" for call in tool.call_args_list))
-        self.assertEqual(completions.requests[1]["tool_choice"], "required")
+        self.assertEqual(
+            [request["tools"][0]["function"]["name"] for request in completions.requests[:2]],
+            ["fetch_page", "geocode_place"],
+        )
+        self.assertEqual(completions.requests[2]["tool_choice"], "required")
         self.assertNotIn("tools", completions.requests[-1])
+
+    def test_final_model_tool_error_never_becomes_http_500(self) -> None:
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FailingCompletions()))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch.object(settings, "groq_api_key", "test-key"),
+        ):
+            result = answer_travel_chat(
+                self.db,
+                user_id=1,
+                city_id=1,
+                message="현재 지도 장소를 간단히 설명해줘",
+            )
+
+        self.assertIn("현재 지도", result["row"].content)
 
 
 if __name__ == "__main__":

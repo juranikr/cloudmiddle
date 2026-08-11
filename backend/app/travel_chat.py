@@ -333,7 +333,7 @@ def answer_travel_chat(
         request: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": 0.25,
+            "temperature": 0.0 if tool_choice == "required" else 0.2,
             **kwargs,
         }
         if tool_names:
@@ -352,6 +352,21 @@ def answer_travel_chat(
                     request.pop("extra_body", None)
                 return client.chat.completions.create(**request)
             raise
+
+    def complete_text(fallback: str) -> str:
+        """A model trying to call tools during final synthesis must never become an HTTP 500."""
+        try:
+            response = complete()
+            reply = response.choices[0].message
+            return (reply.content or fallback).strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "travel_chat final synthesis failed user=%s city=%s error=%s",
+                user_id,
+                city_id,
+                str(exc)[:400],
+            )
+            return fallback
 
     if allowed:
         seed_results: list[dict[str, Any]] = []
@@ -377,13 +392,63 @@ def answer_travel_chat(
     force_required = False
     tool_round_limit = MAX_WRITE_TOOL_ROUNDS if write_intent else MAX_RESEARCH_TOOL_ROUNDS
     for _round in range(tool_round_limit if allowed else 0):
-        response = complete(
-            tool_names=allowed,
-            tool_choice="required" if force_required else "auto",
-        )
+        structured_brand_write = write_intent and bool(brand_targets)
+        if structured_brand_write and _round == 0:
+            round_tools = {"fetch_page"}
+            round_choice = "required"
+            messages.append({
+                "role": "system",
+                "content": "행동 1단계다. 서버 검색 결과에서 요청한 각 브랜드와 실제 관련 있는 페이지를 fetch_page로 열어 근거를 읽어라.",
+            })
+        elif structured_brand_write and _round == 1:
+            round_tools = {"geocode_place"}
+            round_choice = "required"
+            messages.append({
+                "role": "system",
+                "content": "행동 2단계다. 요청한 각 브랜드의 정확한 중국어 브랜드명·지점명·주소로 geocode_place를 호출해 좌표 후보를 확인하라.",
+            })
+        elif structured_brand_write:
+            round_tools = set(WRITE_TOOLS)
+            round_choice = "required"
+            remaining_targets = [target for target in brand_targets if target not in successful_write_targets]
+            messages.append({
+                "role": "system",
+                "content": (
+                    "행동 3단계다. 추가 검색을 멈추고 근거·좌표가 준비된 요청 대상을 propose_place로 실제 승인 대기에 저장하라. "
+                    f"아직 저장해야 할 대상: {remaining_targets}. 한 대상만 저장하고 끝내지 마라."
+                ),
+            })
+        else:
+            round_tools = set(allowed) - {"web_search"}
+            if not round_tools:
+                round_tools = set(allowed)
+            round_choice = "required" if force_required else "auto"
+        try:
+            response = complete(tool_names=round_tools, tool_choice=round_choice)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "travel_chat tool planning failed user=%s city=%s round=%s error=%s",
+                user_id,
+                city_id,
+                _round + 1,
+                str(exc)[:400],
+            )
+            tool_results.append({
+                "name": "tool_planning",
+                "args": {"round": _round + 1},
+                "result": {"error": str(exc)[:300]},
+            })
+            force_required = True
+            continue
         reply = response.choices[0].message
         calls = reply.tool_calls or []
         if not calls:
+            if structured_brand_write and not writes_complete():
+                messages.append({
+                    "role": "system",
+                    "content": "아직 요청 대상 전체의 저장 성공이 확인되지 않았다. 답변하지 말고 현재 단계의 도구를 실행하라.",
+                })
+                continue
             if write_intent and not writes_complete() and not force_required:
                 messages.extend([
                     {"role": "assistant", "content": reply.content or ""},
@@ -491,9 +556,14 @@ def answer_travel_chat(
                 + action_state
             ),
         })
-        response = complete()
-        reply = response.choices[0].message
-        final_text = (reply.content or "확인된 자료가 부족해 답을 완성하지 못했습니다.").strip()
+        final_fallback = (
+            "요청한 모든 대상의 저장을 완료했습니다."
+            if writes_complete()
+            else "요청을 전부 완료하지 못했습니다. 실제 저장이 확인된 대상만 완료로 처리했습니다."
+            if write_intent
+            else "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다."
+        )
+        final_text = complete_text(final_fallback)
 
     missing_targets = _missing_brand_targets(resolved_message, final_text)
     bad_urls = _unsupported_urls(final_text, sources)
@@ -511,9 +581,7 @@ def answer_travel_chat(
                 ),
             },
         ])
-        response = complete()
-        reply = response.choices[0].message
-        final_text = (reply.content or final_text).strip()
+        final_text = complete_text(final_text)
 
     if _needs_answer_retry(final_text):
         target_text = "·".join(brand_targets) or "요청한 장소"
