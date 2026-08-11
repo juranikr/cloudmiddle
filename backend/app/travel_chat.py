@@ -787,7 +787,9 @@ def answer_travel_chat(
                 "content": (
                     "검증 가능한 식당 좌표가 준비됐다. 이제 검색을 더 하지 말고 propose_place로 관리자 승인 대기에 "
                     "실제 저장하라. title은 '중국어 원명 (한국어 음역·지점명)' 형식으로 쓰고 中街는 중제라고 "
-                    "표기한다. category=restaurant, travel_role=food로 쓰고, 자동으로 "
+                    "표기한다. 总店은 본점, 熏肉大饼은 훈제고기 전병처럼 자연스럽게 번역하고 기계식 한자음을 "
+                    "쓰지 않는다. 역사 연도와 수식어는 상세 페이지 본문에 명시된 경우에만 출처를 밝혀 쓴다. "
+                    "category=restaurant, travel_role=food로 쓰고, 자동으로 "
                     "읽은 페이지의 실제 URL을 source_urls와 최소 2개 insights에 넣어라. 아직 저장하지 않은 후보만 "
                     f"처리한다. 좌표 후보: {json.dumps(pending_geo[-2:], ensure_ascii=False, default=str)[:9000]}"
                 ),
