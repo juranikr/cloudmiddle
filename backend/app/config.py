@@ -21,7 +21,8 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
-    groq_chat_model: str = "openai/gpt-oss-20b"
+    # This project's allow-list currently enables 120B; chat falls back to groq_model if overridden model is blocked.
+    groq_chat_model: str = "openai/gpt-oss-120b"
     # 값이 있으면 ArcGIS를 forStorage=true로 호출해 선택 좌표를 영구 저장할 수 있다.
     # 값이 없으면 UI에서 참고 위치로만 노출하고 지도 직접 지정 절차를 거친다.
     arcgis_api_key: str = ""

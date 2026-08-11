@@ -29,7 +29,7 @@ export default function TravelAgent({ token, city, selected, onOpen }: { token: 
 
   return (
     <main className="workspace-screen travel-agent">
-      <header className="workspace-screen__header"><BrandMark /><div><span>MAP-GROUNDED TRAVEL COMPANION</span><h1>{city.name_ko}를 함께 걷는 대화</h1><p>저장된 장소와 일정부터 읽고, 필요할 때만 새 정보를 찾아요.</p></div></header>
+      <header className="workspace-screen__header"><BrandMark /><div><span>MAP-GROUNDED TRAVEL COMPANION</span><h1>{city.name_ko}을 함께 걷는 대화</h1><p>저장된 장소와 일정부터 읽고, 필요할 때만 새 정보를 찾아요.</p></div></header>
       <section className="agent-layout">
         <aside><strong>무엇을 도와드릴까요?</strong>{QUICK.map((prompt) => <button key={prompt} type="button" onClick={() => void submit(undefined, prompt)}>{prompt}</button>)}{selected ? <div><small>지금 보고 있는 장소</small><b>{selected.title}</b><span>장소 #{selected.id}</span></div> : null}</aside>
         <section className="agent-chat">

@@ -146,14 +146,30 @@ def answer_travel_chat(
         kwargs: dict[str, Any] = {}
         if "gpt-oss" in model:
             kwargs["extra_body"] = {"reasoning_effort": "medium"}
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=_tool_subset(allowed),
-            tool_choice="auto",
-            temperature=0.25,
-            **kwargs,
-        )
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=_tool_subset(allowed),
+                tool_choice="auto",
+                temperature=0.25,
+                **kwargs,
+            )
+        except Exception as exc:
+            fallback = settings.groq_model or "openai/gpt-oss-120b"
+            if model != fallback and ("blocked" in str(exc).lower() or "permission" in str(exc).lower()):
+                model = fallback
+                kwargs = {"extra_body": {"reasoning_effort": "medium"}} if "gpt-oss" in model else {}
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=_tool_subset(allowed),
+                    tool_choice="auto",
+                    temperature=0.25,
+                    **kwargs,
+                )
+            else:
+                raise
         reply = response.choices[0].message
         calls = reply.tool_calls or []
         if not calls:
