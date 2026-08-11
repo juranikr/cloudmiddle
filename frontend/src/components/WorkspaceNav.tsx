@@ -13,10 +13,14 @@ export default function WorkspaceNav({
   value,
   cityLabel,
   onChange,
+  moreOpen,
+  onMore,
 }: {
   value: WorkspaceView;
   cityLabel: string;
   onChange: (view: WorkspaceView) => void;
+  moreOpen: boolean;
+  onMore: () => void;
 }) {
   return (
     <>
@@ -48,6 +52,15 @@ export default function WorkspaceNav({
             <i>{item.icon}</i><span>{item.label}</span>
           </button>
         ))}
+        <button
+          type="button"
+          className={moreOpen ? "is-active" : ""}
+          onClick={onMore}
+          aria-expanded={moreOpen}
+          aria-controls="mobile-more-menu"
+        >
+          <i>選</i><span>메뉴</span>
+        </button>
       </nav>
     </>
   );

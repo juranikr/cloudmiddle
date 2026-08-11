@@ -1310,37 +1310,6 @@ textarea {
   font-family: inherit;
 }
 
-.city-guide-screen {
-  position: absolute;
-  inset: 0;
-  z-index: 900;
-  overflow: auto;
-  padding: clamp(20px, 5vw, 64px);
-  background:
-    radial-gradient(circle at 90% 10%, rgba(15,118,110,.16), transparent 34%),
-    linear-gradient(145deg, #f8f2e7, #edf6f1);
-  color: #17352f;
-}
-.city-guide-screen > header { max-width: 1180px; margin: 0 auto 28px; display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
-.city-guide-screen header small { color: #a35e35; font-weight: 900; letter-spacing: .14em; }
-.city-guide-screen h2 { margin: 6px 0; font-size: clamp(2rem, 5vw, 4rem); letter-spacing: -.05em; }
-.city-guide-screen header p { margin: 0; color: #54706a; }
-.city-guide-screen header > button { width: 44px; height: 44px; border: 0; border-radius: 50%; background: rgba(255,255,255,.8); color: #17352f; font-size: 1.8rem; cursor: pointer; }
-.city-guide__days { max-width: 1180px; margin: 0 auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
-.city-guide__days > article { padding: clamp(18px, 3vw, 30px); border: 1px solid rgba(23,53,47,.12); border-radius: 24px; background: rgba(255,255,255,.8); box-shadow: 0 20px 45px rgba(45,70,61,.1); }
-.city-guide__days article > span { color: #a35e35; font-weight: 900; font-size: .78rem; letter-spacing: .12em; }
-.city-guide__days h3 { margin: 5px 0 20px; font-size: 1.4rem; }
-.city-guide__days details { padding: 12px 0; border-top: 1px solid rgba(23,53,47,.1); }
-.city-guide__days summary { display: flex; justify-content: space-between; gap: 12px; cursor: pointer; }
-.city-guide__days summary em { color: #0f766e; font-size: .78rem; font-style: normal; }
-.city-guide__days details > p { color: #64748b; line-height: 1.45; }
-.city-guide__days ul { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 7px; }
-.city-guide__days li button { width: 100%; display: grid; gap: 3px; padding: 10px; border: 0; border-radius: 10px; background: #f2f7f4; color: inherit; text-align: left; cursor: pointer; }
-.city-guide__days li span { color: #64748b; font-size: .74rem; }
-@media (max-width: 720px) {
-  .city-guide__days { grid-template-columns: 1fr; }
-  .city-guide-screen { padding: 20px 14px 90px; }
-}
 .admin__knowledge p { margin: 8px 0; line-height: 1.55; }
 .admin__knowledge ul { margin: 8px 0; padding-left: 1.2rem; line-height: 1.55; }
 .admin__knowledge details summary { cursor: pointer; color: var(--teal-deep); font-weight: 700; }
@@ -1805,13 +1774,15 @@ textarea {
 .sheet-overlay {
   position: absolute;
   inset: 0;
-  z-index: 750;
+  z-index: 1100;
   background: rgba(20, 33, 43, 0.35);
   align-items: flex-end;
   justify-content: stretch;
 }
 .sheet-menu {
   width: 100%;
+  max-height: calc(100dvh - 20px);
+  overflow-y: auto;
   background: var(--surface);
   border-radius: 20px 20px 0 0;
   padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
@@ -1820,6 +1791,7 @@ textarea {
   box-shadow: var(--shadow);
 }
 .sheet-menu > strong { font-size: 1rem; margin-bottom: 4px; }
+.sheet-menu__section { margin: 8px 2px 0; color: var(--muted); font-size: .68rem; font-weight: 800; letter-spacing: .08em; }
 .sheet-menu > button,
 .sheet-menu__link {
   border: 1px solid var(--line);
@@ -2040,8 +2012,7 @@ textarea {
 .agent-thinking { display: flex; align-items: center; gap: 5px; color: var(--wonrae-muted); font-size: .7rem; }.agent-thinking i { width: 6px; height: 6px; border-radius: 50%; background: var(--wonrae-red); animation: wonraePulse 1.2s infinite; }.agent-thinking i:nth-child(2) { animation-delay: .15s; }.agent-thinking i:nth-child(3) { animation-delay: .3s; }.agent-thinking span { margin-left: 5px; } @keyframes wonraePulse { 50% { opacity: .25; transform: translateY(-2px); } }
 .agent-compose { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 9px; padding: 14px; border-top: 1px solid var(--wonrae-line); background: #faf7f0; }.agent-compose textarea { resize: none; border: 1px solid var(--wonrae-line); border-radius: 13px; padding: 11px; background: white; }.agent-compose button { border: 0; border-radius: 12px; padding: 0 20px; background: var(--wonrae-red); color: white; font-weight: 800; }.agent-compose small { grid-column: 1 / -1; color: var(--wonrae-muted); font-size: .64rem; }
 
-.legacy-gnb { display: none !important; }
-.workspace-gnb { position: fixed; z-index: 1000; left: 10px; right: 10px; bottom: max(8px, env(safe-area-inset-bottom)); height: 62px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; padding: 5px; border: 1px solid rgba(255,255,255,.6); border-radius: 18px; background: rgba(255,253,248,.94); box-shadow: 0 12px 36px rgba(28,39,33,.22); backdrop-filter: blur(15px); }
+.workspace-gnb { position: fixed; z-index: 1000; left: 10px; right: 10px; bottom: max(8px, env(safe-area-inset-bottom)); height: 62px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 3px; padding: 5px; border: 1px solid rgba(255,255,255,.6); border-radius: 18px; background: rgba(255,253,248,.94); box-shadow: 0 12px 36px rgba(28,39,33,.22); backdrop-filter: blur(15px); }
 .workspace-gnb button { border: 0; border-radius: 13px; background: transparent; color: #7a7f75; }.workspace-gnb button i, .workspace-gnb button span { display: block; }.workspace-gnb button i { font: normal 1.05rem "Songti SC", serif; }.workspace-gnb button span { margin-top: 2px; font-size: .61rem; font-weight: 800; }.workspace-gnb button.is-active { background: var(--wonrae-jade); color: white; }
 
 @media (min-width: 860px) {

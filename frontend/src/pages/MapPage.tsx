@@ -45,7 +45,6 @@ const INITIAL_VIEW = loadMapView({ center: JINAN_CENTER, zoom: DEFAULT_ZOOM });
 type ToolMode = "pin" | "zone";
 type PanelMode = "create" | "view" | "edit" | null;
 type DraftKind = "point" | "polygon" | null;
-type MobileTab = "map" | "inbox" | "more";
 
 const GEOCODE_SOURCE_LABEL: Record<string, string> = {
   local: "내 지도",
@@ -158,10 +157,8 @@ export default function MapPage() {
   const [flyTarget, setFlyTarget] = useState<LatLng | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [unreadMsg, setUnreadMsg] = useState(0);
-  const [mobileTab, setMobileTab] = useState<MobileTab>("map");
   const [moreOpen, setMoreOpen] = useState(false);
   const [sideCollapsed, setSideCollapsed] = useState(false);
-  const [guideOpen, setGuideOpen] = useState(false);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("map");
   const [controlsOpen, setControlsOpen] = useState(false);
   const [plannerPlace, setPlannerPlace] = useState<MarkerItem | null>(null);
@@ -303,7 +300,6 @@ export default function MapPage() {
     setSearchSheetOpen(false);
     setSelected(marker);
     setPanelMode("view");
-    setMobileTab("map");
   }
 
   function closePanel() {
@@ -475,24 +471,6 @@ export default function MapPage() {
     }
   }
 
-  function onGnb(tab: MobileTab) {
-    if (tab === "map") {
-      setMobileTab("map");
-      setMoreOpen(false);
-      setInboxOpen(false);
-    } else if (tab === "inbox") {
-      setMobileTab("inbox");
-      setInboxOpen(true);
-      setMoreOpen(false);
-    } else if (tab === "more") {
-      // 더보기는 모달일 뿐이므로 탭 상태(mobileTab)는 바꾸지 않는다 — 닫으면 원래 화면 그대로
-      setMoreOpen((v) => !v);
-      setInboxOpen(false);
-      setMobileTab((t) => (t === "inbox" ? "map" : t));
-    }
-  }
-
-
   const createShape: MarkerShape = draftKind === "polygon" ? "polygon" : "point";
   const showSearchList = searchSheetOpen && (searchHits.length > 0 || !!searchError);
   const showSearchCard = !!searchPin && !panelOpen && !showSearchList;
@@ -529,7 +507,6 @@ export default function MapPage() {
           setCategoryFilter(null);
           setFavoritesOnly(false);
           setAgentSuggestedOnly(false);
-          setMobileTab("map");
         }}
       >
         전체
@@ -737,7 +714,26 @@ export default function MapPage() {
 
   return (
     <div className={`map-app wonrae-app map-app--${workspaceView} ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""} ${sideCollapsed ? "map-app--side-collapsed" : ""}`}>
-      <WorkspaceNav value={workspaceView} cityLabel={`${selectedCity.name_ko} ${selectedCity.name_local}`} onChange={(view) => { if (view !== "map") { setCategoryFilter(null); setFavoritesOnly(false); setAgentSuggestedOnly(false); setZoneFilter(null); } setWorkspaceView(view); setControlsOpen(false); }} />
+      <WorkspaceNav
+        value={workspaceView}
+        cityLabel={`${selectedCity.name_ko} ${selectedCity.name_local}`}
+        moreOpen={moreOpen}
+        onMore={() => {
+          setMoreOpen((current) => !current);
+          setInboxOpen(false);
+        }}
+        onChange={(view) => {
+          if (view !== "map") {
+            setCategoryFilter(null);
+            setFavoritesOnly(false);
+            setAgentSuggestedOnly(false);
+            setZoneFilter(null);
+          }
+          setMoreOpen(false);
+          setWorkspaceView(view);
+          setControlsOpen(false);
+        }}
+      />
       <aside className={`map-side ${controlsOpen ? "map-side--open" : ""}`}>
         <button
           type="button"
@@ -763,7 +759,6 @@ export default function MapPage() {
               <button type="button" className="link-btn" onClick={() => setInboxOpen(true)}>
                 메시지{unreadMsg ? ` (${unreadMsg})` : ""}
               </button>
-              <button type="button" className="link-btn" onClick={() => setGuideOpen(true)}>이틀 가이드</button>
               <button type="button" className="link-btn" onClick={() => setSelectedCityId(0)}>
                 도시 변경
               </button>
@@ -943,39 +938,6 @@ export default function MapPage() {
         </div>
       ) : null}
 
-      {guideOpen ? (
-        <section className="city-guide-screen" aria-label={`${selectedCity.name_ko} 이틀 여행 가이드`}>
-          <header>
-            <div><small>2-DAY CITY GUIDE</small><h2>{selectedCity.name_ko} {selectedCity.name_local}</h2><p>구역별 역사·장소·방문 정보를 하루 동선으로 묶었습니다.</p></div>
-            <button type="button" onClick={() => setGuideOpen(false)} aria-label="가이드 닫기">×</button>
-          </header>
-          <div className="city-guide__days">
-            {[1, 2].map((day) => {
-              const dayZones = zones.filter((zone) => {
-                const isOldTown = /中街|西塔/.test(zone.title);
-                return day === 1 ? isOldTown : !isOldTown;
-              });
-              return (
-                <article key={day}>
-                  <span>DAY {day}</span>
-                  <h3>{day === 1 ? "황궁과 옛 도심" : "근현대사와 공업도시"}</h3>
-                  {dayZones.map((zone) => {
-                    const zonePlaces = markers.filter((item) => item.shape === "point" && item.zone_id === zone.id);
-                    return (
-                      <details key={zone.id} open>
-                        <summary><strong>{zone.title}</strong><em>{zonePlaces.length}곳</em></summary>
-                        <p>{zone.description}</p>
-                        {zonePlaces.length ? <ul>{zonePlaces.map((place) => <li key={place.id}><button type="button" onClick={() => { setGuideOpen(false); openView(place); setFlyTarget({ lat: place.lat, lng: place.lng }); }}><strong>{place.title}</strong><span>{CATEGORY_META[place.category].label} · 정보 {place.insights.length}건</span></button></li>)}</ul> : <small>에이전트가 이 구역의 근거 기반 장소를 조사 중입니다.</small>}
-                      </details>
-                    );
-                  })}
-                </article>
-              );
-            })}
-          </div>
-        </section>
-      ) : null}
-
       {!isDesktop ? (
         <div className="mobile-sheets">
           {searchList}
@@ -1000,26 +962,29 @@ export default function MapPage() {
 
       {moreOpen ? (
         <div className="sheet-overlay mobile-only" onClick={() => setMoreOpen(false)}>
-          <div className="sheet-menu" onClick={(e) => e.stopPropagation()}>
-            <strong>더보기</strong>
+          <div id="mobile-more-menu" className="sheet-menu" onClick={(e) => e.stopPropagation()}>
+            <strong>계정과 도시</strong>
+            {user?.is_admin ? (
+              <a className="sheet-menu__link" href="/admin">
+                관리
+              </a>
+            ) : null}
+            <button type="button" onClick={() => { setMoreOpen(false); setInboxOpen(true); }}>
+              메시지{unreadMsg ? ` (${unreadMsg})` : ""}
+            </button>
+            <button type="button" onClick={() => { setMoreOpen(false); setSelectedCityId(0); }}>
+              도시 변경
+            </button>
+            <button type="button" onClick={logout}>
+              로그아웃
+            </button>
+            <span className="sheet-menu__section">지도 도구</span>
             <button type="button" onClick={() => void toggleLocate()} disabled={locateBusy}>
               {locateOn ? "내 위치 끄기" : "내 위치"}
             </button>
             {token ? (
               <ShareImport token={token} cityId={selectedCityId} source="amap" placement="main" onImported={handleShareImported} />
             ) : null}
-            {user?.is_admin ? (
-              <a className="sheet-menu__link" href="/admin">
-                관리자
-              </a>
-            ) : null}
-            <button type="button" onClick={() => { setGuideOpen(true); setMoreOpen(false); }}>이틀 여행 가이드</button>
-            <button type="button" onClick={() => setSelectedCityId(0)}>
-              도시 변경
-            </button>
-            <button type="button" onClick={logout}>
-              로그아웃
-            </button>
             <button type="button" className="btn btn--ghost" onClick={() => setMoreOpen(false)}>
               닫기
             </button>
@@ -1027,37 +992,12 @@ export default function MapPage() {
         </div>
       ) : null}
 
-      <nav className="gnb legacy-gnb" aria-label="하단 메뉴">
-        <button
-          type="button"
-          className={mobileTab === "map" && !inboxOpen && !moreOpen ? "is-active" : ""}
-          onClick={() => onGnb("map")}
-        >
-          <span>지도</span>
-        </button>
-        <button
-          type="button"
-          className={`gnb__msg ${mobileTab === "inbox" || inboxOpen ? "is-active" : ""} ${unreadMsg ? "has-unread" : ""}`}
-          onClick={() => onGnb("inbox")}
-        >
-          <span>메시지{unreadMsg ? ` ${unreadMsg}` : ""}</span>
-        </button>
-        <button
-          type="button"
-          className={moreOpen ? "is-active" : ""}
-          onClick={() => onGnb("more")}
-        >
-          <span>더보기</span>
-        </button>
-      </nav>
-
       {token ? (
         <MessageInbox
           token={token}
           open={inboxOpen}
           onClose={() => {
             setInboxOpen(false);
-            setMobileTab("map");
           }}
           onUnreadChange={setUnreadMsg}
           onOpenPlace={(placeId) => {
