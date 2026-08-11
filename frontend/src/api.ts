@@ -1,12 +1,16 @@
 import type {
   AdminAgentAction,
   AdminAgentProposal,
+  AdminAgentRunHistory,
+  AdminAgentTask,
   AdminKnowledge,
   AdminStatus,
   City,
   MarkerItem,
   MarkerPayload,
   PlaceEventItem,
+  PlaceNote,
+  PlaceChain,
   User,
   UserMessage,
 } from "./types";
@@ -264,6 +268,10 @@ export interface AgentRunResult {
   unread_before: number;
   unread_after: number;
   city_id: number;
+  score: number;
+  performance: Record<string, number>;
+  remaining_gaps: string[];
+  run_id: number | null;
 }
 
 export interface AgentRunStatus {
@@ -353,6 +361,61 @@ export async function rollbackAdminAgentAction(
 export async function fetchAdminKnowledge(token: string): Promise<AdminKnowledge[]> {
   const res = await request("/api/admin/knowledge", { headers: authHeaders(token) });
   return handle<AdminKnowledge[]>(res);
+}
+
+export async function fetchAdminAgentRuns(token: string, cityId: number): Promise<AdminAgentRunHistory[]> {
+  const res = await request(`/api/admin/agent/runs?city_id=${cityId}`, { headers: authHeaders(token) });
+  return handle<AdminAgentRunHistory[]>(res);
+}
+
+export async function fetchAdminAgentTasks(token: string, cityId: number): Promise<AdminAgentTask[]> {
+  const res = await request(`/api/admin/agent/tasks?city_id=${cityId}&task_status=pending`, { headers: authHeaders(token) });
+  return handle<AdminAgentTask[]>(res);
+}
+
+export async function fetchPlaceNotes(token: string, placeId: number): Promise<PlaceNote[]> {
+  const res = await request(`/api/markers/${placeId}/notes`, { headers: authHeaders(token) });
+  return handle<PlaceNote[]>(res);
+}
+
+export async function createPlaceNote(
+  token: string,
+  placeId: number,
+  body: string,
+  visibility: "shared" | "private" = "shared",
+): Promise<PlaceNote> {
+  const res = await request(`/api/markers/${placeId}/notes`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({ body, visibility }),
+  });
+  return handle<PlaceNote>(res);
+}
+
+export async function deletePlaceNote(token: string, noteId: number): Promise<void> {
+  const res = await request(`/api/notes/${noteId}`, {
+    method: "DELETE",
+    headers: authHeaders(token),
+  });
+  await handle<void>(res);
+}
+
+export async function fetchChains(token: string, cityId?: number): Promise<PlaceChain[]> {
+  const q = cityId ? `?city_id=${cityId}` : "";
+  const res = await request(`/api/chains${q}`, { headers: authHeaders(token) });
+  return handle<PlaceChain[]>(res);
+}
+
+export async function createChain(
+  token: string,
+  body: { name_local: string; name_ko?: string; category?: string; aliases?: string[]; description?: string },
+): Promise<PlaceChain> {
+  const res = await request("/api/chains", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return handle<PlaceChain>(res);
 }
 
 export async function fetchAdminAgentProposals(

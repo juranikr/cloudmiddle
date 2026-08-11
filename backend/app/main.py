@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.admin_api import router as admin_router
@@ -37,6 +37,8 @@ from app.models import (
     PlaceEventAction,
     PlaceImage,
     PlaceInsight,
+    PlaceNote,
+    PlaceChain,
     User,
     UserMessage,
     UserMessageKind,
@@ -60,6 +62,11 @@ from app.schemas import (
     PlaceEventOut,
     PlaceImageOut,
     PlaceInsightOut,
+    PlaceNoteCreate,
+    PlaceNoteUpdate,
+    PlaceNoteOut,
+    PlaceChainCreate,
+    PlaceChainOut,
     ShareImportRequest,
     ShareImportResultOut,
     TokenResponse,
@@ -107,6 +114,24 @@ def _centroid(points: list[LatLng]) -> tuple[float, float]:
     return lat, lng
 
 
+def _validate_marker_links(
+    db: Session,
+    *,
+    city_id: int,
+    zone_id: Optional[int],
+    chain_id: Optional[int],
+    marker_id: Optional[int] = None,
+) -> None:
+    if zone_id is not None:
+        zone = db.query(Marker).filter(Marker.id == zone_id, Marker.merged_into_id.is_(None)).first()
+        if zone is None or zone.city_id != city_id or zone.shape != MarkerShape.polygon:
+            raise HTTPException(status_code=400, detail="같은 도시의 유효한 구역만 선택할 수 있습니다")
+        if marker_id is not None and zone.id == marker_id:
+            raise HTTPException(status_code=400, detail="구역 자체를 소속 구역으로 선택할 수 없습니다")
+    if chain_id is not None and db.query(PlaceChain.id).filter(PlaceChain.id == chain_id).first() is None:
+        raise HTTPException(status_code=404, detail="체인을 찾을 수 없습니다")
+
+
 def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
     names: list[str] = []
     for c in marker.contributors or []:
@@ -138,6 +163,11 @@ def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
         )
         for item in sorted(marker.insights or [], key=lambda x: (x.sort_order, x.id))
     ]
+    chain_name = ""
+    if marker.chain:
+        chain_name = marker.chain.name_local
+        if marker.chain.name_ko:
+            chain_name += f" ({marker.chain.name_ko})"
     return MarkerOut(
         id=marker.id,
         city_id=marker.city_id,
@@ -154,6 +184,12 @@ def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
         polygon=_parse_polygon(marker.polygon),
         images=images,
         insights=insights,
+        zone_id=marker.zone_id,
+        zone_title=marker.zone.title if marker.zone else "",
+        chain_id=marker.chain_id,
+        chain_name=chain_name,
+        branch_name=marker.branch_name or "",
+        note_count=len(marker.notes or []),
         coordinate_source=marker.coordinate_source or "manual",
         coordinate_external_id=marker.coordinate_external_id or "",
         coordinate_query=marker.coordinate_query or "",
@@ -176,6 +212,9 @@ def _load_place(db: Session, place_id: int) -> Optional[Marker]:
             joinedload(Marker.contributors).joinedload(PlaceContributor.user),
             joinedload(Marker.images),
             joinedload(Marker.insights),
+            joinedload(Marker.notes),
+            joinedload(Marker.chain),
+            joinedload(Marker.zone),
         )
         .filter(Marker.id == place_id, Marker.merged_into_id.is_(None))
         .first()
@@ -195,7 +234,13 @@ def list_cities(
     _ = current_user
     counts = dict(
         db.query(Marker.city_id, func.count(Marker.id))
-        .filter(Marker.merged_into_id.is_(None))
+        .filter(Marker.merged_into_id.is_(None), Marker.shape == MarkerShape.point)
+        .group_by(Marker.city_id)
+        .all()
+    )
+    zone_counts = dict(
+        db.query(Marker.city_id, func.count(Marker.id))
+        .filter(Marker.merged_into_id.is_(None), Marker.shape == MarkerShape.polygon)
         .group_by(Marker.city_id)
         .all()
     )
@@ -213,6 +258,7 @@ def list_cities(
             search_viewbox=city.search_viewbox,
             status=city.status,
             place_count=int(counts.get(city.id, 0)),
+            zone_count=int(zone_counts.get(city.id, 0)),
         )
         for city in rows
     ]
@@ -338,6 +384,9 @@ def list_markers(
             joinedload(Marker.contributors).joinedload(PlaceContributor.user),
             joinedload(Marker.images),
             joinedload(Marker.insights),
+            joinedload(Marker.notes),
+            joinedload(Marker.chain),
+            joinedload(Marker.zone),
         )
         .filter(Marker.merged_into_id.is_(None))
         .filter(Marker.city_id == city_id)
@@ -362,6 +411,9 @@ def create_marker(
 ) -> MarkerOut:
     if db.query(City.id).filter(City.id == body.city_id, City.status == "active").first() is None:
         raise HTTPException(status_code=404, detail="도시를 찾을 수 없습니다")
+    _validate_marker_links(
+        db, city_id=body.city_id, zone_id=body.zone_id, chain_id=body.chain_id
+    )
     lat, lng = body.lat, body.lng
     polygon_json: Optional[str] = None
     if body.shape == MarkerShape.polygon and body.polygon:
@@ -384,6 +436,9 @@ def create_marker(
         coordinate_source_url=body.coordinate_source_url,
         coordinate_confidence=body.coordinate_confidence,
         coordinate_crs=body.coordinate_crs or "WGS84",
+        zone_id=body.zone_id if body.shape == MarkerShape.point else None,
+        chain_id=body.chain_id if body.shape == MarkerShape.point else None,
+        branch_name=body.branch_name.strip() if body.shape == MarkerShape.point else "",
     )
     db.add(marker)
     db.flush()
@@ -414,6 +469,154 @@ def get_marker(
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
     fav = db.query(PlaceFavorite).filter(PlaceFavorite.user_id == current_user.id, PlaceFavorite.place_id == marker.id).first()
     return marker_to_out(marker, is_favorite=fav is not None)
+
+
+def _note_out(note: PlaceNote, current_user: User) -> PlaceNoteOut:
+    return PlaceNoteOut(
+        id=note.id,
+        place_id=note.place_id,
+        user_id=note.user_id,
+        author_name=note.user.display_name if note.user else "사용자",
+        body=note.body,
+        visibility=note.visibility,
+        is_mine=note.user_id == current_user.id,
+        created_at=note.created_at,
+        updated_at=note.updated_at,
+    )
+
+
+@app.get("/api/markers/{marker_id}/notes", response_model=list[PlaceNoteOut])
+def list_place_notes(
+    marker_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[PlaceNoteOut]:
+    if db.query(Marker.id).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first() is None:
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    rows = (
+        db.query(PlaceNote)
+        .options(joinedload(PlaceNote.user))
+        .filter(
+            PlaceNote.place_id == marker_id,
+            or_(PlaceNote.visibility == "shared", PlaceNote.user_id == current_user.id),
+        )
+        .order_by(PlaceNote.created_at.asc())
+        .all()
+    )
+    return [_note_out(row, current_user) for row in rows]
+
+
+@app.post("/api/markers/{marker_id}/notes", response_model=PlaceNoteOut, status_code=status.HTTP_201_CREATED)
+def create_place_note(
+    marker_id: int,
+    body: PlaceNoteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PlaceNoteOut:
+    if db.query(Marker.id).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first() is None:
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    row = PlaceNote(
+        place_id=marker_id,
+        user_id=current_user.id,
+        body=body.body.strip(),
+        visibility=body.visibility,
+    )
+    db.add(row)
+    db.commit()
+    row = db.query(PlaceNote).options(joinedload(PlaceNote.user)).filter(PlaceNote.id == row.id).one()
+    return _note_out(row, current_user)
+
+
+@app.patch("/api/notes/{note_id}", response_model=PlaceNoteOut)
+def update_place_note(
+    note_id: int,
+    body: PlaceNoteUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PlaceNoteOut:
+    row = db.query(PlaceNote).filter(PlaceNote.id == note_id, PlaceNote.user_id == current_user.id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="수정할 메모를 찾을 수 없습니다")
+    row.body = body.body.strip()
+    if body.visibility is not None:
+        row.visibility = body.visibility
+    db.commit()
+    row = db.query(PlaceNote).options(joinedload(PlaceNote.user)).filter(PlaceNote.id == note_id).one()
+    return _note_out(row, current_user)
+
+
+@app.delete("/api/notes/{note_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+def delete_place_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    row = db.query(PlaceNote).filter(PlaceNote.id == note_id, PlaceNote.user_id == current_user.id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="삭제할 메모를 찾을 수 없습니다")
+    db.delete(row)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _chain_out(row: PlaceChain, branch_count: int = 0) -> PlaceChainOut:
+    try:
+        aliases = json.loads(row.aliases or "[]")
+    except json.JSONDecodeError:
+        aliases = []
+    return PlaceChainOut(
+        id=row.id,
+        name_local=row.name_local,
+        name_ko=row.name_ko or "",
+        category=row.category or "other",
+        aliases=[str(item) for item in aliases if str(item).strip()],
+        description=row.description or "",
+        branch_count=int(branch_count),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@app.get("/api/chains", response_model=list[PlaceChainOut])
+def list_place_chains(
+    city_id: Optional[int] = Query(None, gt=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[PlaceChainOut]:
+    _ = current_user
+    count_query = db.query(Marker.chain_id, func.count(Marker.id)).filter(
+        Marker.chain_id.is_not(None), Marker.merged_into_id.is_(None)
+    )
+    if city_id is not None:
+        count_query = count_query.filter(Marker.city_id == city_id)
+    counts = dict(count_query.group_by(Marker.chain_id).all())
+    rows = db.query(PlaceChain).order_by(PlaceChain.name_local.asc()).all()
+    return [_chain_out(row, counts.get(row.id, 0)) for row in rows if city_id is None or counts.get(row.id, 0)]
+
+
+@app.post("/api/chains", response_model=PlaceChainOut, status_code=status.HTTP_201_CREATED)
+def create_place_chain(
+    body: PlaceChainCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PlaceChainOut:
+    existing = db.query(PlaceChain).filter(
+        func.lower(PlaceChain.name_local) == body.name_local.strip().lower()
+    ).first()
+    if existing is not None:
+        return _chain_out(existing, len(existing.branches or []))
+    row = PlaceChain(
+        name_local=body.name_local.strip(),
+        name_ko=body.name_ko.strip(),
+        category=body.category,
+        aliases=json.dumps([item.strip() for item in body.aliases if item.strip()], ensure_ascii=False),
+        description=body.description.strip(),
+        created_by_user_id=current_user.id,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _chain_out(row)
 
 
 @app.get("/api/markers/{marker_id}/events", response_model=list[PlaceEventOut])
@@ -495,6 +698,19 @@ def update_marker(
         data["title"] = data["title"].strip()
     if "description" in data and data["description"] is not None:
         data["description"] = data["description"].strip()
+    if "branch_name" in data and data["branch_name"] is not None:
+        data["branch_name"] = data["branch_name"].strip()
+    next_zone_id = data.get("zone_id", marker.zone_id)
+    next_chain_id = data.get("chain_id", marker.chain_id)
+    if marker.shape == MarkerShape.polygon and (next_zone_id is not None or next_chain_id is not None):
+        raise HTTPException(status_code=400, detail="구역은 다른 구역이나 체인에 소속될 수 없습니다")
+    _validate_marker_links(
+        db,
+        city_id=marker.city_id,
+        zone_id=next_zone_id,
+        chain_id=next_chain_id,
+        marker_id=marker.id,
+    )
     if "polygon" in data:
         poly = data.pop("polygon")
         if poly is not None:
@@ -549,6 +765,10 @@ def delete_marker(
         summary=f"장소 삭제: {marker.title}",
         payload={"title": marker.title},
     )
+    if marker.shape == MarkerShape.polygon:
+        db.query(Marker).filter(Marker.zone_id == marker.id).update(
+            {Marker.zone_id: None}, synchronize_session=False
+        )
     db.delete(marker)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

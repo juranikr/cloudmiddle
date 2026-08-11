@@ -31,7 +31,7 @@ import {
   saveLocateOn,
 } from "../mapStorage";
 import { getCategoryIcon, getSearchResultIcon } from "../markerIcons";
-import type { City, LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
+import type { City, LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape, PlaceChain } from "../types";
 
 const JINAN_CENTER: [number, number] = [36.65, 117.12];
 const DEFAULT_ZOOM = 12;
@@ -124,6 +124,9 @@ export default function MapPage() {
     return Number.isInteger(saved) && saved > 0 ? saved : 0;
   });
   const [markers, setMarkers] = useState<MarkerItem[]>([]);
+  const [zones, setZones] = useState<MarkerItem[]>([]);
+  const [chains, setChains] = useState<PlaceChain[]>([]);
+  const [zoneFilter, setZoneFilter] = useState<number | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<MarkerCategory | null>(null);
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [agentSuggestedOnly, setAgentSuggestedOnly] = useState(false);
@@ -152,6 +155,8 @@ export default function MapPage() {
   const [unreadMsg, setUnreadMsg] = useState(0);
   const [mobileTab, setMobileTab] = useState<MobileTab>("map");
   const [moreOpen, setMoreOpen] = useState(false);
+  const [sideCollapsed, setSideCollapsed] = useState(false);
+  const [guideOpen, setGuideOpen] = useState(false);
   const [isDesktop, setIsDesktop] = useState(() =>
     typeof window !== "undefined" ? window.matchMedia("(min-width: 860px)").matches : true,
   );
@@ -187,6 +192,8 @@ export default function MapPage() {
       window.localStorage.removeItem("cloudmiddle.city_id");
     }
     setCategoryFilter(null);
+    setZoneFilter(null);
+    setZones([]);
     setSearchHits([]);
     setSearchPin(null);
     setSelected(null);
@@ -209,17 +216,24 @@ export default function MapPage() {
         favoritesOnly,
         agentSuggestedOnly,
       });
-      setMarkers(data);
+      const loadedZones = data.filter((item) => item.shape === "polygon");
+      if (loadedZones.length) setZones(loadedZones);
+      setMarkers(zoneFilter ? data.filter((item) => item.id === zoneFilter || item.zone_id === zoneFilter) : data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "목록을 불러오지 못했습니다");
     } finally {
       setLoading(false);
     }
-  }, [token, selectedCityId, categoryFilter, favoritesOnly, agentSuggestedOnly]);
+  }, [token, selectedCityId, categoryFilter, favoritesOnly, agentSuggestedOnly, zoneFilter]);
 
   useEffect(() => {
     void loadMarkers();
   }, [loadMarkers]);
+
+  useEffect(() => {
+    if (!token || !selectedCityId) return;
+    void api.fetchChains(token).then(setChains).catch(() => setChains([]));
+  }, [token, selectedCityId]);
 
   const draftIcon = useMemo(
     () =>
@@ -668,6 +682,8 @@ export default function MapPage() {
       createDefaults={createDefaults}
       token={token}
       cityId={selectedCityId}
+      zones={zones}
+      chains={chains}
       canEdit={!!selected && !!user}
       onClose={closePanel}
       onCreate={handleCreate}
@@ -678,6 +694,7 @@ export default function MapPage() {
         setSelected(m);
         setMarkers((prev) => prev.map((x) => (x.id === m.id ? m : x)));
       }}
+      onChainCreated={(chain) => setChains((prev) => [...prev.filter((item) => item.id !== chain.id), chain])}
     />
   ) : null;
 
@@ -698,7 +715,7 @@ export default function MapPage() {
             <button key={city.id} type="button" className="city-card" onClick={() => setSelectedCityId(city.id)}>
               <span className="city-card__local">{city.name_local}</span>
               <strong>{city.name_ko}</strong>
-              <small>{city.place_count > 0 ? `저장된 장소 ${city.place_count}곳` : "새 여행 준비하기"}</small>
+              <small>{city.place_count > 0 ? `저장된 장소 ${city.place_count}곳 · 구역 ${city.zone_count ?? 0}개` : "새 여행 준비하기"}</small>
               <em>{city.slug === "shenyang" ? "청 왕조의 시작과 근대 동북의 역사" : "샘과 골목, 산둥의 오래된 도시"}</em>
             </button>
           ))}
@@ -708,8 +725,17 @@ export default function MapPage() {
   }
 
   return (
-    <div className={`map-app ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""}`}>
+    <div className={`map-app ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""} ${sideCollapsed ? "map-app--side-collapsed" : ""}`}>
       <aside className="map-side">
+        <button
+          type="button"
+          className="side-collapse-btn desktop-only"
+          onClick={() => setSideCollapsed((value) => !value)}
+          aria-label={sideCollapsed ? "도구 패널 펼치기" : "도구 패널 접기"}
+          title={sideCollapsed ? "도구 패널 펼치기" : "도구 패널 접기"}
+        >
+          {sideCollapsed ? "›" : "‹"}
+        </button>
         <div className="map-side__top">
           <div className="map-side__brand">
             <div>
@@ -725,6 +751,7 @@ export default function MapPage() {
               <button type="button" className="link-btn" onClick={() => setInboxOpen(true)}>
                 메시지{unreadMsg ? ` (${unreadMsg})` : ""}
               </button>
+              <button type="button" className="link-btn" onClick={() => setGuideOpen(true)}>이틀 가이드</button>
               <button type="button" className="link-btn" onClick={() => setSelectedCityId(0)}>
                 도시 변경
               </button>
@@ -738,11 +765,24 @@ export default function MapPage() {
             <select value={selectedCityId} onChange={(e) => setSelectedCityId(Number(e.target.value))}>
               {cities.map((city) => (
                 <option key={city.id} value={city.id}>
-                  {city.name_ko} {city.name_local} · {city.place_count}곳
+                  {city.name_ko} {city.name_local} · 장소 {city.place_count} · 구역 {city.zone_count ?? 0}
                 </option>
               ))}
             </select>
           </label>
+          {zones.length ? (
+            <label className="zone-select">
+              <span>관광 구역</span>
+              <select value={zoneFilter ?? ""} onChange={(e) => setZoneFilter(e.target.value ? Number(e.target.value) : null)}>
+                <option value="">도시 전체 보기</option>
+                {zones.map((zone) => (
+                  <option key={zone.id} value={zone.id}>
+                    {zone.title} · {markers.filter((item) => item.zone_id === zone.id).length}곳
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           {token && selectedCity ? (
             <AddressSearch token={token} cityId={selectedCity.id} onResults={handleSearchResults} />
           ) : null}
@@ -876,6 +916,36 @@ export default function MapPage() {
         </MapContainer>
       </div>
 
+      {guideOpen ? (
+        <section className="city-guide-screen" aria-label={`${selectedCity.name_ko} 이틀 여행 가이드`}>
+          <header>
+            <div><small>2-DAY CITY GUIDE</small><h2>{selectedCity.name_ko} {selectedCity.name_local}</h2><p>구역별 역사·장소·방문 정보를 하루 동선으로 묶었습니다.</p></div>
+            <button type="button" onClick={() => setGuideOpen(false)} aria-label="가이드 닫기">×</button>
+          </header>
+          <div className="city-guide__days">
+            {[1, 2].map((day) => {
+              const dayZones = zones.filter((_zone, index) => index % 2 === day - 1);
+              return (
+                <article key={day}>
+                  <span>DAY {day}</span>
+                  <h3>{day === 1 ? "황궁과 옛 도심" : "근현대사와 공업도시"}</h3>
+                  {dayZones.map((zone) => {
+                    const zonePlaces = markers.filter((item) => item.shape === "point" && item.zone_id === zone.id);
+                    return (
+                      <details key={zone.id} open>
+                        <summary><strong>{zone.title}</strong><em>{zonePlaces.length}곳</em></summary>
+                        <p>{zone.description}</p>
+                        {zonePlaces.length ? <ul>{zonePlaces.map((place) => <li key={place.id}><button type="button" onClick={() => { setGuideOpen(false); openView(place); setFlyTarget({ lat: place.lat, lng: place.lng }); }}><strong>{place.title}</strong><span>{CATEGORY_META[place.category].label} · 정보 {place.insights.length}건</span></button></li>)}</ul> : <small>에이전트가 이 구역의 근거 기반 장소를 조사 중입니다.</small>}
+                      </details>
+                    );
+                  })}
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
       {!isDesktop ? (
         <div className="mobile-sheets">
           {searchList}
@@ -913,6 +983,7 @@ export default function MapPage() {
                 관리자
               </a>
             ) : null}
+            <button type="button" onClick={() => { setGuideOpen(true); setMoreOpen(false); }}>이틀 여행 가이드</button>
             <button type="button" onClick={() => setSelectedCityId(0)}>
               도시 변경
             </button>

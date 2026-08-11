@@ -9,11 +9,12 @@
 from __future__ import annotations
 
 import os
+import json
 
 from sqlalchemy.orm import Session
 
 from app.auth import hash_password
-from app.models import AgentKnowledge, User
+from app.models import AgentKnowledge, Marker, MarkerCategory, MarkerShape, User
 
 # aliases: 기존 이메일도 찾아 같은 user_id(마커 소유)를 유지한 채 갱신
 ACCOUNT_SPECS = [
@@ -78,7 +79,7 @@ def seed_data(db: Session) -> None:
 
     starter_knowledge = [
         {
-            "topic": "global:editorial_standard",
+            "topic": "editorial_standard",
             "title": "여행 장소 정보 편집 기준",
             "scope": "global",
             "city_id": None,
@@ -87,10 +88,18 @@ def seed_data(db: Session) -> None:
                 "운영시간·가격처럼 바뀌는 정보는 확인일과 출처를 남기고, 위치 좌표는 WGS84와 원본 좌표계를 구분한다. "
                 "단일 블로그 주장보다 공식 기관·박물관·교차 출처를 우선한다."
             ),
+            "category": "quality",
+            "summary": "장소 소개와 구조화 사실, 시스템 이력을 서로 분리한다.",
+            "principles": "[]",
+            "next_actions": "[]",
+            "evidence_count": 3,
+            "quality_score": 1.0,
+            "status": "active",
+            "version": 1,
         },
         {
-            "topic": "city:2:starter_shenyang",
-            "title": "선양 초기 조사 지도",
+            "topic": "city:2:city_playbook",
+            "title": "선양 조사 플레이북",
             "scope": "city",
             "city_id": 2,
             "content": (
@@ -99,12 +108,46 @@ def seed_data(db: Session) -> None:
                 "명소를 나열하지 말고 청 초기 수도 → 근대 군벌/동북 역사 → 9·18 → 공업도시라는 시간축과 "
                 "현재 동선을 연결한다. 각 장소는 공식 출처를 포함한 승인 제안으로 만든다."
             ),
+            "category": "city",
+            "summary": "청 초기 수도부터 공업도시까지의 시간축을 실제 관광 동선과 연결한다.",
+            "principles": "[]",
+            "next_actions": "[]",
+            "evidence_count": 3,
+            "quality_score": 0.9,
+            "status": "active",
+            "version": 1,
         },
     ]
     for item in starter_knowledge:
         if db.query(AgentKnowledge.id).filter(AgentKnowledge.topic == item["topic"]).first() is None:
             db.add(AgentKnowledge(**item))
             changed = True
+
+    if db.query(Marker.id).filter(
+        Marker.city_id == 2,
+        Marker.shape == MarkerShape.polygon,
+        Marker.merged_into_id.is_(None),
+    ).first() is None:
+        zone_specs = [
+            ("中街·故宫 (중제·고궁권)", "선양고궁·장씨수부·중제를 도보로 잇는 핵심 역사 구역", 41.785, 41.810, 123.425, 123.475),
+            ("西塔·沈阳站 (서탑·선양역권)", "서탑 음식문화와 선양역 주변을 묶는 서부 도심 구역", 41.790, 41.815, 123.375, 123.425),
+            ("北陵·皇姑 (북릉·황구권)", "북릉공원과 청 소릉을 중심으로 한 북부 역사 구역", 41.815, 41.865, 123.405, 123.465),
+            ("九一八·大东 (9·18·다둥권)", "9·18 역사박물관과 동북 근현대사를 살피는 북동부 구역", 41.840, 41.890, 123.455, 123.505),
+            ("铁西工业 (톄시 공업권)", "중국공업박물관과 톄시 현대문화 공간을 잇는 공업사 구역", 41.780, 41.830, 123.300, 123.380),
+        ]
+        for title, description, south, north, west, east in zone_specs:
+            polygon = [
+                {"lat": south, "lng": west}, {"lat": south, "lng": east},
+                {"lat": north, "lng": east}, {"lat": north, "lng": west},
+            ]
+            db.add(Marker(
+                user_id=None, city_id=2, category=MarkerCategory.tourist,
+                shape=MarkerShape.polygon, title=title, description=description,
+                lat=(south + north) / 2, lng=(west + east) / 2,
+                polygon=json.dumps(polygon), coordinate_source="curated_zone",
+                coordinate_crs="WGS84", agent_context="관광 동선용 운영 구역",
+            ))
+        changed = True
 
     if changed:
         db.commit()

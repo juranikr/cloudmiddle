@@ -55,6 +55,14 @@ def ensure_schema() -> None:
                 if engine.dialect.name == "postgresql":
                     conn.execute(text("ALTER TABLE markers ALTER COLUMN city_id SET NOT NULL"))
                     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_markers_city_id ON markers (city_id)"))
+            if "zone_id" not in cols:
+                conn.execute(text("ALTER TABLE markers ADD COLUMN zone_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_markers_zone_id ON markers (zone_id)"))
+            if "chain_id" not in cols:
+                conn.execute(text("ALTER TABLE markers ADD COLUMN chain_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_markers_chain_id ON markers (chain_id)"))
+            if "branch_name" not in cols:
+                conn.execute(text("ALTER TABLE markers ADD COLUMN branch_name VARCHAR(120) DEFAULT '' NOT NULL"))
             if "shape" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN shape VARCHAR(20) DEFAULT 'point' NOT NULL"))
             if "polygon" not in cols:
@@ -114,6 +122,19 @@ def ensure_schema() -> None:
                 conn.execute(text("ALTER TABLE agent_knowledge ADD COLUMN city_id INTEGER"))
                 if engine.dialect.name == "postgresql":
                     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_knowledge_city_id ON agent_knowledge (city_id)"))
+            knowledge_additions = {
+                "category": "VARCHAR(30) DEFAULT 'playbook' NOT NULL",
+                "summary": "TEXT DEFAULT '' NOT NULL",
+                "principles": "TEXT DEFAULT '[]' NOT NULL",
+                "next_actions": "TEXT DEFAULT '[]' NOT NULL",
+                "evidence_count": "INTEGER DEFAULT 0 NOT NULL",
+                "quality_score": "FLOAT DEFAULT 0.7 NOT NULL",
+                "status": "VARCHAR(20) DEFAULT 'active' NOT NULL",
+                "version": "INTEGER DEFAULT 1 NOT NULL",
+            }
+            for column, ddl in knowledge_additions.items():
+                if column not in knowledge_cols:
+                    conn.execute(text(f"ALTER TABLE agent_knowledge ADD COLUMN {column} {ddl}"))
 
         if "agent_search_logs" in tables:
             search_cols = {c["name"] for c in insp.get_columns("agent_search_logs")}

@@ -21,6 +21,9 @@ FIELD_LABELS_KO: dict[str, str] = {
     "local_name": "현지 명칭",
     "append_note": "설명 보완",
     "replace_title": "제목",
+    "zone_id": "소속 구역",
+    "chain_id": "체인",
+    "branch_name": "지점명",
 }
 
 
@@ -51,6 +54,9 @@ def marker_field_snapshot(m: Marker) -> dict[str, Any]:
         "lng": m.lng,
         "polygon": m.polygon or "",
         "agent_context": m.agent_context or "",
+        "zone_id": m.zone_id,
+        "chain_id": m.chain_id,
+        "branch_name": m.branch_name or "",
     }
 
 

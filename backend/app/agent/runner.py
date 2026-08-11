@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -10,7 +11,19 @@ from sqlalchemy.orm import Session
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
 from app.knowledge import knowledge_brief
-from app.models import City, Marker, PlaceAppeal, PlaceAppealStatus, PlaceEvent
+from app.models import (
+    AgentKnowledge,
+    AgentProposal,
+    AgentRun,
+    AgentRunStep,
+    AgentTask,
+    City,
+    Marker,
+    PlaceAppeal,
+    PlaceAppealStatus,
+    PlaceEvent,
+    PlaceInsight,
+)
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
 목표: 미읽음 이력·이의신청·롤백·웹조사를 바탕으로 지도를 정리하고,
@@ -66,21 +79,20 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
   seen=true·already_visited=true 페이지는 다시 열지 않는다.
 - 여러 글에서 반복 추천되는데 지도에 없는 장소를 골라
   list_places로 중복 확인 → geocode_place → create_place (사이클당 5~12개, 근거가 있으면 많을수록 좋다).
-- 이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·꿀팁·교통·현지 표기·별칭 등)가
-  나오면 버리지 말고 update_place_fields(append_note·local_name)나
-  update_place_context로 해당 장소를 보완한다. 사용자 원문은 보존하고 덧붙이기만 할 것.
+- 이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·역사 등)는
+  upsert_place_insights로 출처·신뢰도와 함께 보완한다. description에는 실행 로그·이전 제목·조사 과정을 누적하지 않는다.
 - 조사 묶음의 마지막 동작은 반드시 upsert_knowledge(topic 'research_strategy')다:
-  어떤 검색어·소스가 효과적이었는지, 무엇을 추가·보완했는지, 다음에 팔 키워드를 기록.
+  어떤 검색어·소스가 효과적인지 재사용할 원칙만 짧게 합성한다. 다음에 할 일은 upsert_agent_task로 분리한다.
   재검증·사진 보강 등 다른 작업으로 넘어가기 전에 먼저 호출한다 (마지막으로 미루면
   스텝 부족으로 누락된다 — 실제로 반복된 실패 패턴이다).
 
 【지식베이스 — 필수】
-- 작업 시작 시 list_knowledge를 호출한다.
+- 작업 시작 시 list_knowledge·list_agent_tasks·list_zones를 호출한다.
 - 사이클이 끝나기 전에 upsert_knowledge를 최소 1회 이상 호출한다.
 - 지식 갱신 없이 텍스트 요약만 하고 끝내면 실패다.
 
 【언어 규칙 — 필수, 위반 시 툴이 거부】
-- 설명(description)·append_note·agent_context·안내·이의 답변·지식베이스: 무조건 한국어.
+- 설명(description)·agent_context·안내·이의 답변·지식베이스: 무조건 한국어.
   중국어 원문 정보는 한국어로 번역·요약해 적는다.
 - 명칭(title): 중국어+한국어 병기 — 형식 "中文名 (한국어 명칭)", 예: "泉城广场 (취안청 광장)".
 - 주소·검색용 표기: 지도에서 검색 가능하도록 중국어 원문 유지.
@@ -88,13 +100,14 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 - 기존 장소 중 설명이 중국어/영어 위주(한국어 없음)인 것을 발견하면 즉시 정비:
   · agent 추가 장소: update_place_fields(replace_description)로 한국어 본문 전면 재작성,
     제목에 한국어가 없으면 replace_title로 "中文名 (한국어 명칭)" 형식 교체.
-  · 사용자 작성 장소: 설명에 한국어가 이미 있으면 보존(append_note만).
+  · 사용자 작성 장소: 설명에 한국어가 이미 있으면 보존하고 구조화 인사이트로만 보완.
     설명이 중국어/영어뿐이면 replace_description으로 원문 정보를 모두 번역해 한국어로
     재작성(원문 명칭·주소는 병기 유지). 제목에 한국어가 없으면 제목을 바꾸지 말고
     local_name으로 한국어 명칭만 병기 추가 (예: "HeyTea" → "HeyTea (헤이티)").
 
 원칙:
-- 사용자 기록(설명·제목)은 최대한 보존. append_note·local_name으로 보완.
+- 사용자 기록(설명·제목)은 최대한 보존. 세부 정보는 upsert_place_insights, 체인은 assign_place_chain,
+  관광 권역은 assign_place_zone으로 보완.
 - 좌표 WGS84. 새 장소는 geocode_place 후 create_place.
 - list_recent_rollbacks를 보고 롤백된 방향은 반복하지 말 것.
 
@@ -220,6 +233,73 @@ def _queue_brief(queue: dict[str, Any]) -> str:
     )[:6000]
 
 
+def _performance_snapshot(db: Session, city_id: int) -> dict[str, int]:
+    return {
+        "unread": count_unread(db, city_id),
+        "proposals": db.query(AgentProposal).filter(AgentProposal.city_id == city_id).count(),
+        "insights": (
+            db.query(PlaceInsight)
+            .join(Marker, Marker.id == PlaceInsight.place_id)
+            .filter(Marker.city_id == city_id, Marker.merged_into_id.is_(None))
+            .count()
+        ),
+        "zoned_places": db.query(Marker).filter(
+            Marker.city_id == city_id,
+            Marker.zone_id.is_not(None),
+            Marker.merged_into_id.is_(None),
+        ).count(),
+        "chained_places": db.query(Marker).filter(
+            Marker.city_id == city_id,
+            Marker.chain_id.is_not(None),
+            Marker.merged_into_id.is_(None),
+        ).count(),
+        "completed_tasks": db.query(AgentTask).filter(
+            AgentTask.city_id == city_id, AgentTask.status == "completed"
+        ).count(),
+    }
+
+
+def _performance_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    return {
+        key: after.get(key, 0) - before.get(key, 0)
+        for key in after
+        if key != "unread"
+    } | {"unread_cleared": max(0, before.get("unread", 0) - after.get("unread", 0))}
+
+
+def _performance_score(delta: dict[str, int], tool_counts: dict[str, int]) -> float:
+    return round(
+        delta.get("unread_cleared", 0) * 8
+        + delta.get("proposals", 0) * 12
+        + delta.get("insights", 0) * 3
+        + delta.get("zoned_places", 0) * 2
+        + delta.get("chained_places", 0) * 2
+        + delta.get("completed_tasks", 0) * 4
+        + min(tool_counts.get("verify_place", 0), 8) * 1.5
+        + (2 if tool_counts.get("upsert_knowledge", 0) else 0),
+        1,
+    )
+
+
+def _research_gaps(
+    delta: dict[str, int], tool_counts: dict[str, int]
+) -> list[str]:
+    gaps: list[str] = []
+    if tool_counts.get("list_agent_tasks", 0) == 0:
+        gaps.append("이전 조사 백로그 확인")
+    if tool_counts.get("list_zones", 0) == 0:
+        gaps.append("구역 현황 확인")
+    if tool_counts.get("fetch_page", 0) < 4:
+        gaps.append(f"근거 페이지 4개 이상 정독(현재 {tool_counts.get('fetch_page', 0)})")
+    if delta.get("proposals", 0) < 6:
+        gaps.append(f"승인 제안 6건 이상(현재 +{delta.get('proposals', 0)})")
+    if tool_counts.get("upsert_knowledge", 0) == 0:
+        gaps.append("재사용 원칙 최신 합성")
+    if tool_counts.get("upsert_agent_task", 0) == 0:
+        gaps.append("미완료 후속 과제 백로그 분리")
+    return gaps
+
+
 def run_agent(
     db: Session,
     *,
@@ -272,15 +352,23 @@ def run_agent(
 
     client = Groq(api_key=settings.groq_api_key)
     model = settings.groq_model or "openai/gpt-oss-120b"
-    base_steps = max_steps or settings.agent_max_steps
-    # 작업 건수에 비례해 스텝 확보 (건당 ~4 + 지식/롤백 오버헤드)
-    if research_only:
-        # 스크래핑 조사 + 재검증 + 사진 보강까지 수행하므로 여유 확보
-        steps_limit = max(base_steps, 110)
-    else:
-        # 큐 검토·수정 뒤 mark_events_read까지 끝낼 여유를 먼저 보장한다.
-        # 기존 8+4n은 2건 큐에서도 16스텝 만에 소진되어 "조치는 했지만 읽음 처리를 못 한" 실패를 만들었다.
-        steps_limit = max(base_steps, min(140, 48 + unread_before * 4))
+    # 종료는 아래 성과 게이트/정체 판단으로 결정한다. 이 값은 비정상 무한루프만 막는 안전 상한이다.
+    steps_limit = max_steps or (180 if research_only else max(100, 64 + unread_before * 4))
+    performance_before = _performance_snapshot(db, city_id)
+    agent_run = AgentRun(
+        city_id=city_id,
+        mode="research" if allow_research else "queue",
+        status="running",
+        objective=(
+            "이틀 여행에 필요한 근거 기반 장소 제안·구역·체인·방문정보 확보"
+            if allow_research
+            else "사용자 작업 큐 전원 처리"
+        ),
+        metrics=json.dumps({"before": performance_before}, ensure_ascii=False),
+    )
+    db.add(agent_run)
+    db.commit()
+    db.refresh(agent_run)
 
     if research_only:
         user_msg = (
@@ -288,8 +376,8 @@ def run_agent(
             "현재 미읽음 작업은 없습니다. 연구 사이클을 수행하세요.\n"
             f"우선 조사 테마: {_research_themes(city)}\n"
             f"기존 지식베이스 요약: {kb_hint}\n"
-            "필수: 시작 list_knowledge, 종료 전 upsert_knowledge 1회 이상.\n"
-            "1) list_knowledge / list_places로 현황 파악\n"
+            "필수: 시작 list_knowledge·list_agent_tasks·list_zones, 종료 전 upsert_knowledge와 upsert_agent_task.\n"
+            "1) list_knowledge / list_agent_tasks / list_zones / list_places로 현황과 구역별 정보 공백 파악\n"
             "2) 언어 정비: list_places에서 설명에 한국어가 없거나 중국어/영어 위주인 장소를 "
             "전부 찾아 언어 규칙대로 재작성 — 설명에 한국어가 전혀 없으면(사용자 작성 포함) "
             "replace_description으로 원문 정보를 번역해 한국어 재작성(중국어 주소·명칭은 병기 유지). "
@@ -301,12 +389,13 @@ def run_agent(
             "덜 판 검색어 심화 + 새 테마 키워드 2~3개 조사 → web_search에서 seen=false 결과 위주로 "
             "fetch_page 4~8개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
             "5) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
-            "geocode_place → create_place 5~12개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
+            "geocode_place → create_place 승인 제안 6~12개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
             "이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·별칭)는 "
             "upsert_place_insights로 위치·역사·방문정보를 분리해 보완하고, 모든 항목에 출처 URL과 "
             "confidence를 기록. description은 간단한 소개만 유지\n"
-            "6) 조사 전략(효과적 검색어·소스·다음 키워드)을 upsert_knowledge"
-            "(topic 'research_strategy')로 병합. 7)·8)보다 먼저, 조사 직후 바로 호출할 것 "
+            "6) 기존 장소는 실제 지점이면 assign_place_chain으로 묶고(지점끼리 병합 금지), list_zones의 구역에 "
+            "assign_place_zone으로 배정. 효과적 소스·판단 원칙은 upsert_knowledge 최신 합성본으로 저장하고, "
+            "미완료 후속 조사는 upsert_agent_task로 분리. 7)·8)보다 먼저 호출할 것 "
             "(빠뜨리면 실패)\n"
             "7) 재검증: list_stale_places로 30일 이상 미확인 장소를 받아 8~12곳을 web_search로 "
             "재확인 → verify_place(valid|closed|moved|uncertain + note). "
@@ -323,7 +412,7 @@ def run_agent(
             f"작업 큐 JSON: {_queue_brief(queue)}\n"
             f"기존 지식베이스 요약: {kb_hint}\n"
             "필수 순서:\n"
-            "1) list_knowledge, list_recent_rollbacks\n"
+            "1) list_knowledge, list_agent_tasks, list_zones, list_recent_rollbacks\n"
             "2) appeal_ids 각각 resolve_appeal\n"
             "3) event_ids 각각 검토(필요 시 find_nearby_candidates/list_places로 전체 지도 비교) "
             "후 mark_events_read. 이의가 '같은 장소' 주장이면 웹 근거로 확인 후 병합, "
@@ -335,7 +424,7 @@ def run_agent(
             "기존 장소와 겹치는 유용한 정보는 update_place_fields/context로 보완\n"
             "6) 여유 스텝이 남으면 재검증(list_stale_places → verify_place 3~5곳)과 "
             "사진 보강(image_count 0인 장소 2~3곳)도 수행\n"
-            "7) upsert_knowledge(research_strategy 포함) 후 한 줄 요약\n"
+            "7) 재사용 원칙은 upsert_knowledge 최신 합성본, 미완료 조사는 upsert_agent_task로 분리 후 한 줄 요약\n"
             "일부만 처리하고 끝내면 실패다."
         )
 
@@ -358,10 +447,11 @@ def run_agent(
     used_tools: set[str] = set()
     tool_counts: dict[str, int] = {}
     work_nudges = 0
-    kb_nudges = 0
-    research_nudges = 0
-    volume_nudges = 0
+    progress_nudges = 0
     schema_retries = 0
+    no_progress_actions = 0
+    action_sequence = 0
+    current_score = 0.0
     try:
         for _ in range(steps_limit):
             steps += 1
@@ -417,68 +507,29 @@ def run_agent(
                         }
                     )
                     continue
-                if (
-                    allow_research
-                    and "fetch_page" not in used_tools
-                    and research_nudges < 2
-                    and steps < steps_limit
-                ):
-                    research_nudges += 1
+                current_snapshot = _performance_snapshot(db, city_id)
+                current_delta = _performance_delta(performance_before, current_snapshot)
+                gaps = _research_gaps(current_delta, tool_counts) if allow_research else []
+                current_score = _performance_score(current_delta, tool_counts)
+                if gaps and progress_nudges < 8 and no_progress_actions < 18 and steps < steps_limit:
+                    progress_nudges += 1
                     messages.append(
                         {
                             "role": "user",
                             "content": (
-                                "아직 이번 사이클의 필수 웹 조사(스크래핑)를 하지 않았습니다. "
-                                "list_research_history로 과거 이력을 확인하고, 덜 판 검색어나 "
-                                "새 테마 키워드로 web_search → seen=false 글 2개 이상 fetch_page → "
-                                "반복 추천되는 미등록 장소가 있으면 create_place 하세요. "
-                                "웹 조사 없이 종료하면 실패입니다."
+                                f"성과 게이트가 아직 충족되지 않았습니다(현재 점수 {current_score}). "
+                                f"남은 결과: {', '.join(gaps)}. 스텝 수가 아니라 실제 결과를 만들고 다시 측정하세요. "
+                                "같은 검색을 반복하지 말고 구역별 정보 공백·기존 백로그를 활용하세요. "
+                                "실패한 후속 작업은 지식 본문이 아니라 upsert_agent_task에 구체적으로 남기세요."
                             ),
                         }
                     )
                     continue
-                if "upsert_knowledge" not in used_tools and kb_nudges < 2 and steps < steps_limit:
-                    kb_nudges += 1
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "아직 upsert_knowledge를 호출하지 않았습니다. "
-                                "이번 사이클 교훈을 topic별로 upsert_knowledge로 저장한 뒤 "
-                                "한 줄 요약으로 종료하세요. 지식 저장은 필수입니다."
-                            ),
-                        }
+                if no_progress_actions >= 18:
+                    final_text = (
+                        f"연속 {no_progress_actions}회 성과 변화가 없어 안전 종료했습니다. "
+                        "미완료 항목은 에이전트 과제 백로그에서 다음 실행이 이어받습니다."
                     )
-                    continue
-                # 스텝 여유가 큰데 조기 종료하려는 경우: 잔여 할당량을 채우도록 계속시킨다
-                if (
-                    allow_research
-                    and volume_nudges < 3
-                    and steps < int(steps_limit * 0.6)
-                ):
-                    volume_nudges += 1
-                    done_brief = ", ".join(
-                        f"{t} {c}회"
-                        for t, c in tool_counts.items()
-                        if t in ("create_place", "verify_place", "attach_image_from_url",
-                                 "fetch_page", "update_place_fields")
-                    ) or "주요 작업 없음"
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"아직 스텝 여유가 큽니다 ({steps}/{steps_limit} 사용, 지금까지: {done_brief}). "
-                                "'다음 사이클에 하겠다'는 예고는 금지 — 지금 이 사이클에서 계속 진행하세요. "
-                                "우선순위: ① 조사에서 발견한 미등록 장소 create_place 추가 등록 "
-                                "② 새 키워드 web_search → fetch_page 추가 조사 "
-                                "③ list_stale_places 재검증 8~12곳 verify_place "
-                                "④ image_count 0인 장소 사진 보강 3~6곳 "
-                                "⑤ 언어 규칙 위반 장소 정비. "
-                                "할당량을 채운 뒤 upsert_knowledge로 마무리하세요."
-                            ),
-                        }
-                    )
-                    continue
                 break
 
             messages.append(
@@ -507,6 +558,39 @@ def run_agent(
                 used_tools.add(tc.function.name)
                 tool_counts[tc.function.name] = tool_counts.get(tc.function.name, 0) + 1
                 result = run_tool(db, tc.function.name, args, city_id=city_id)
+                snapshot_after_tool = _performance_snapshot(db, city_id)
+                total_delta = _performance_delta(performance_before, snapshot_after_tool)
+                next_score = _performance_score(total_delta, tool_counts)
+                score_delta = round(max(0.0, next_score - current_score), 1)
+                current_score = next_score
+                outcome = "error" if isinstance(result, dict) and result.get("error") else "ok"
+                observation_progress = (
+                    outcome == "ok"
+                    and (
+                        score_delta > 0
+                        or tc.function.name in {"fetch_page", "web_search", "geocode_place"}
+                        or (tool_counts[tc.function.name] == 1 and tc.function.name.startswith("list_"))
+                    )
+                )
+                if observation_progress:
+                    no_progress_actions = 0
+                else:
+                    no_progress_actions += 1
+                action_sequence += 1
+                db.add(
+                    AgentRunStep(
+                        run_id=agent_run.id,
+                        sequence=action_sequence,
+                        phase="observe" if tc.function.name.startswith("list_") else "act",
+                        tool=tc.function.name,
+                        outcome=outcome,
+                        score_delta=score_delta,
+                        detail=json.dumps(
+                            {"args": args, "result": result}, ensure_ascii=False, default=str
+                        )[:3000],
+                    )
+                )
+                db.commit()
                 messages.append(
                     {
                         "role": "tool",
@@ -514,6 +598,12 @@ def run_agent(
                         "content": json.dumps(result, ensure_ascii=False)[:12000],
                     }
                 )
+            if no_progress_actions >= 18 and steps >= 20:
+                final_text = (
+                    f"연속 {no_progress_actions}개 행동에서 새 근거·데이터·정제가 생기지 않아 종료했습니다. "
+                    "남은 과제는 다음 성과 기반 실행이 이어받습니다."
+                )
+                break
     except Exception as exc:
         try:
             db.rollback()
@@ -531,6 +621,19 @@ def run_agent(
             unread_after = count_unread(db, city_id)
         except Exception:
             unread_after = unread_before
+        try:
+            failed_run = db.get(AgentRun, agent_run.id)
+            if failed_run is not None:
+                failed_run.status = "failed"
+                failed_run.summary = detail[:4000]
+                failed_run.score = current_score
+                failed_run.finished_at = datetime.now(timezone.utc)
+                failed_run.metrics = json.dumps(
+                    {"before": performance_before, "tool_counts": tool_counts}, ensure_ascii=False
+                )
+                db.commit()
+        except Exception:
+            db.rollback()
         return {
             "ok": False,
             "steps": steps,
@@ -541,6 +644,10 @@ def run_agent(
         }
 
     unread_after = count_unread(db, city_id)
+    performance_after = _performance_snapshot(db, city_id)
+    performance_delta = _performance_delta(performance_before, performance_after)
+    current_score = _performance_score(performance_delta, tool_counts)
+    gaps = _research_gaps(performance_delta, tool_counts) if allow_research else []
     ok = unread_after == 0
     summary = final_text or "에이전트 사이클 완료"
     if tool_counts:
@@ -551,6 +658,26 @@ def run_agent(
             f"미처리 {unread_after}건 잔존 (시작 {unread_before}건, steps={steps}). "
             f"{summary}"
         )
+    run_row = db.get(AgentRun, agent_run.id)
+    if run_row is not None:
+        run_row.status = "completed" if ok and not gaps else "partial"
+        run_row.score = current_score
+        run_row.summary = summary[:4000]
+        run_row.finished_at = datetime.now(timezone.utc)
+        run_row.metrics = json.dumps(
+            {
+                "before": performance_before,
+                "after": performance_after,
+                "delta": performance_delta,
+                "tool_counts": tool_counts,
+                "remaining_gaps": gaps,
+                "no_progress_actions": no_progress_actions,
+            },
+            ensure_ascii=False,
+        )
+        db.commit()
+    if gaps:
+        summary = f"{summary}\n[남은 성과] {', '.join(gaps)}"
     return {
         "ok": ok,
         "steps": steps,
@@ -558,5 +685,9 @@ def run_agent(
         "unread_before": unread_before,
         "unread_after": unread_after,
         "tool_counts": tool_counts,
+        "score": current_score,
+        "performance": performance_delta,
+        "remaining_gaps": gaps,
+        "run_id": agent_run.id,
         "city_id": city_id,
     }

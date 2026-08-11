@@ -27,6 +27,7 @@ export interface City {
   search_viewbox: string;
   status: string;
   place_count: number;
+  zone_count: number;
 }
 
 export interface User {
@@ -42,6 +43,7 @@ export interface AdminStatus {
   groq_configured: boolean;
   groq_model: string;
   markers_active: number;
+  zones_active?: number;
   events_total: number;
   events_unread: number;
   appeals_open: number;
@@ -102,6 +104,30 @@ export interface PlaceInsight {
   verified_at: string | null;
 }
 
+export interface PlaceNote {
+  id: number;
+  place_id: number;
+  user_id: number;
+  author_name: string;
+  body: string;
+  visibility: "shared" | "private";
+  is_mine: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlaceChain {
+  id: number;
+  name_local: string;
+  name_ko: string;
+  category: string;
+  aliases: string[];
+  description: string;
+  branch_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface MarkerItem {
   id: number;
   city_id: number;
@@ -118,6 +144,12 @@ export interface MarkerItem {
   polygon: LatLng[] | null;
   images: PlaceImage[];
   insights: PlaceInsight[];
+  zone_id: number | null;
+  zone_title: string;
+  chain_id: number | null;
+  chain_name: string;
+  branch_name: string;
+  note_count: number;
   coordinate_source: string;
   coordinate_external_id: string;
   coordinate_query: string;
@@ -146,6 +178,9 @@ export interface MarkerPayload {
   coordinate_source_url?: string;
   coordinate_confidence?: number | null;
   coordinate_crs?: string;
+  zone_id?: number | null;
+  chain_id?: number | null;
+  branch_name?: string;
 }
 
 export interface UserMessage {
@@ -168,6 +203,14 @@ export interface AdminKnowledge {
   scope?: "global" | "city" | "place";
   city_id?: number | null;
   place_id: number | null;
+  category?: string;
+  summary?: string;
+  principles?: string[];
+  next_actions?: string[];
+  evidence_count?: number;
+  quality_score?: number;
+  status?: string;
+  version?: number;
   created_at: string;
   updated_at: string;
 }
@@ -187,4 +230,33 @@ export interface AdminAgentProposal {
   decision_note: string;
   created_at: string;
   decided_at: string | null;
+}
+
+export interface AdminAgentRunHistory {
+  id: number;
+  city_id: number;
+  mode: string;
+  status: string;
+  objective: string;
+  score: number;
+  metrics: Record<string, unknown>;
+  summary: string;
+  step_count: number;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface AdminAgentTask {
+  id: number;
+  city_id: number;
+  kind: string;
+  title: string;
+  detail: string;
+  success_metric: string;
+  priority: number;
+  status: string;
+  attempts: number;
+  result: string;
+  created_at: string;
+  updated_at: string;
 }

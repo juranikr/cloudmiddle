@@ -75,6 +75,7 @@ class User(Base):
     messages: Mapped[list["UserMessage"]] = relationship(back_populates="user")
     appeals: Mapped[list["PlaceAppeal"]] = relationship(back_populates="user")
     favorites: Mapped[list["PlaceFavorite"]] = relationship(back_populates="user")
+    notes: Mapped[list["PlaceNote"]] = relationship(back_populates="user")
 
 
 class City(Base):
@@ -110,6 +111,13 @@ class Marker(Base):
     city_id: Mapped[int] = mapped_column(
         ForeignKey("cities.id", ondelete="RESTRICT"), index=True, nullable=False, default=1
     )
+    zone_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    chain_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("place_chains.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    branch_name: Mapped[str] = mapped_column(String(120), default="", nullable=False)
     category: Mapped[MarkerCategory] = mapped_column(
         Enum(
             MarkerCategory,
@@ -168,6 +176,16 @@ class Marker(Base):
     )
     insights: Mapped[list["PlaceInsight"]] = relationship(
         back_populates="place", cascade="all, delete-orphan", order_by="PlaceInsight.sort_order"
+    )
+    notes: Mapped[list["PlaceNote"]] = relationship(
+        back_populates="place", cascade="all, delete-orphan", order_by="PlaceNote.created_at"
+    )
+    chain: Mapped[Optional["PlaceChain"]] = relationship(back_populates="branches")
+    zone: Mapped[Optional["Marker"]] = relationship(
+        remote_side="Marker.id", foreign_keys=[zone_id], back_populates="zone_members"
+    )
+    zone_members: Mapped[list["Marker"]] = relationship(
+        foreign_keys=[zone_id], back_populates="zone"
     )
     # 삭제 후에도 place_events는 이력으로 남김 (FK ON DELETE SET NULL)
     events: Mapped[list["PlaceEvent"]] = relationship(back_populates="place")
@@ -261,6 +279,48 @@ class PlaceInsight(Base):
     place: Mapped[Marker] = relationship(back_populates="insights")
 
 
+class PlaceNote(Base):
+    """장소 본문과 분리된 사용자별 메모/댓글."""
+
+    __tablename__ = "place_notes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    place_id: Mapped[int] = mapped_column(ForeignKey("markers.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    visibility: Mapped[str] = mapped_column(String(20), default="shared", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    place: Mapped[Marker] = relationship(back_populates="notes")
+    user: Mapped[User] = relationship(back_populates="notes")
+
+
+class PlaceChain(Base):
+    """브랜드/체인 본체. Marker는 실제 지점이며 chain_id로 묶인다."""
+
+    __tablename__ = "place_chains"
+    __table_args__ = (UniqueConstraint("name_local", "name_ko", name="uq_place_chain_names"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name_local: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
+    name_ko: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    category: Mapped[str] = mapped_column(String(30), default="other", nullable=False)
+    aliases: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    branches: Mapped[list[Marker]] = relationship(back_populates="chain")
+
+
 class UserMessage(Base):
     """인앱 알림. 에이전트 병합/추가·이의 처리 결과 등."""
 
@@ -336,6 +396,14 @@ class AgentKnowledge(Base):
     place_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
     )
+    category: Mapped[str] = mapped_column(String(30), default="playbook", nullable=False, index=True)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    principles: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    next_actions: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    evidence_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    quality_score: Mapped[float] = mapped_column(Float, default=0.7, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -439,4 +507,81 @@ class AgentProposal(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentKnowledgeArchive(Base):
+    """정리 전 장문 지식 원본을 보존하는 별도 시스템 기록."""
+
+    __tablename__ = "agent_knowledge_archive"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    original_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    topic: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    scope: Mapped[str] = mapped_column(String(20), default="global", nullable=False)
+    city_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    place_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    archived_reason: Mapped[str] = mapped_column(String(200), default="knowledge_rebuild", nullable=False)
+    archived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AgentRun(Base):
+    """토큰이 아닌 성과를 기록하는 에이전트 실행 단위."""
+
+    __tablename__ = "agent_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    mode: Mapped[str] = mapped_column(String(30), default="queue", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="running", index=True, nullable=False)
+    objective: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    score: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    metrics: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    steps: Mapped[list["AgentRunStep"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="AgentRunStep.sequence"
+    )
+
+
+class AgentRunStep(Base):
+    __tablename__ = "agent_run_steps"
+    __table_args__ = (UniqueConstraint("run_id", "sequence", name="uq_agent_run_step_sequence"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    phase: Mapped[str] = mapped_column(String(30), default="act", nullable=False)
+    tool: Mapped[str] = mapped_column(String(80), default="", index=True, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(20), default="ok", nullable=False)
+    score_delta: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    detail: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    run: Mapped[AgentRun] = relationship(back_populates="steps")
+
+
+class AgentTask(Base):
+    """다음 사이클이 이어받는 조사/정제 백로그."""
+
+    __tablename__ = "agent_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(30), default="research", index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    success_metric: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=50, index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    result: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 

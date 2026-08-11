@@ -19,6 +19,9 @@ from app.db import SessionLocal, get_db
 from app.models import (
     AgentKnowledge,
     AgentProposal,
+    AgentRun,
+    AgentRunStep,
+    AgentTask,
     City,
     Marker,
     PlaceAppeal,
@@ -26,7 +29,7 @@ from app.models import (
     PlaceEvent,
     User,
 )
-from app.knowledge import list_knowledge
+from app.knowledge import list_knowledge, rebuild_knowledge_base
 from app.rollback import is_rollbackable, list_agent_actions, rollback_event
 from app.schemas import AgentKnowledgeOut, AgentRunResponse, UserOut
 
@@ -38,6 +41,7 @@ class AdminStatusOut(BaseModel):
     groq_configured: bool
     groq_model: str
     markers_active: int
+    zones_active: int = 0
     events_total: int
     events_unread: int
     appeals_open: int
@@ -75,7 +79,8 @@ def admin_status(
         admin_email=admin.email,
         groq_configured=bool(settings.groq_api_key),
         groq_model=settings.groq_model,
-        markers_active=db.query(Marker).filter(Marker.merged_into_id.is_(None)).count(),
+        markers_active=db.query(Marker).filter(Marker.merged_into_id.is_(None), Marker.shape == "point").count(),
+        zones_active=db.query(Marker).filter(Marker.merged_into_id.is_(None), Marker.shape == "polygon").count(),
         events_total=db.query(PlaceEvent).count(),
         events_unread=events_unread,
         appeals_open=appeals_open,
@@ -119,6 +124,35 @@ def _agent_run_status() -> AgentRunStatusOut:
 class AgentRunRequest(BaseModel):
     city_id: int = Field(default=2, gt=0)
     research: bool = False
+
+
+class AgentRunHistoryOut(BaseModel):
+    id: int
+    city_id: int
+    mode: str
+    status: str
+    objective: str
+    score: float
+    metrics: dict[str, Any]
+    summary: str
+    step_count: int
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+
+
+class AgentTaskOut(BaseModel):
+    id: int
+    city_id: int
+    kind: str
+    title: str
+    detail: str
+    success_metric: str
+    priority: int
+    status: str
+    attempts: int
+    result: str
+    created_at: datetime
+    updated_at: datetime
 
 
 def _run_agent_background(city_id: int, research: bool) -> None:
@@ -176,6 +210,54 @@ def admin_agent_run_status(
     return _agent_run_status()
 
 
+@router.get("/agent/runs", response_model=list[AgentRunHistoryOut])
+def admin_agent_runs(
+    city_id: Optional[int] = None,
+    limit: int = 30,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> list[AgentRunHistoryOut]:
+    _ = admin
+    query = db.query(AgentRun)
+    if city_id is not None:
+        query = query.filter(AgentRun.city_id == city_id)
+    rows = query.order_by(AgentRun.started_at.desc()).limit(max(1, min(limit, 100))).all()
+    output: list[AgentRunHistoryOut] = []
+    for row in rows:
+        try:
+            metrics = json.loads(row.metrics or "{}")
+        except json.JSONDecodeError:
+            metrics = {}
+        output.append(AgentRunHistoryOut(
+            id=row.id, city_id=row.city_id, mode=row.mode, status=row.status,
+            objective=row.objective, score=row.score, metrics=metrics, summary=row.summary,
+            step_count=len(row.steps or []), started_at=row.started_at, finished_at=row.finished_at,
+        ))
+    return output
+
+
+@router.get("/agent/tasks", response_model=list[AgentTaskOut])
+def admin_agent_tasks(
+    city_id: Optional[int] = None,
+    task_status: str = "pending",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> list[AgentTaskOut]:
+    _ = admin
+    query = db.query(AgentTask)
+    if city_id is not None:
+        query = query.filter(AgentTask.city_id == city_id)
+    if task_status != "all":
+        query = query.filter(AgentTask.status == task_status)
+    rows = query.order_by(AgentTask.priority.desc(), AgentTask.created_at.asc()).limit(max(1, min(limit, 200))).all()
+    return [AgentTaskOut(
+        id=row.id, city_id=row.city_id, kind=row.kind, title=row.title, detail=row.detail,
+        success_metric=row.success_metric, priority=row.priority, status=row.status,
+        attempts=row.attempts, result=row.result, created_at=row.created_at, updated_at=row.updated_at,
+    ) for row in rows]
+
+
 @router.get("/knowledge", response_model=list[AgentKnowledgeOut])
 def admin_knowledge(
     db: Session = Depends(get_db),
@@ -184,6 +266,12 @@ def admin_knowledge(
 ) -> list[AgentKnowledgeOut]:
     _ = admin
     rows = list_knowledge(db, limit=limit)
+    def as_list(raw: str) -> list[str]:
+        try:
+            value = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            return []
+        return [str(item) for item in value] if isinstance(value, list) else []
     return [
         AgentKnowledgeOut(
             id=r.id,
@@ -193,11 +281,28 @@ def admin_knowledge(
             scope=r.scope,
             city_id=r.city_id,
             place_id=r.place_id,
+            category=r.category or "playbook",
+            summary=r.summary or "",
+            principles=as_list(r.principles),
+            next_actions=as_list(r.next_actions),
+            evidence_count=r.evidence_count or 0,
+            quality_score=r.quality_score or 0,
+            status=r.status or "active",
+            version=r.version or 1,
             created_at=r.created_at,
             updated_at=r.updated_at,
         )
         for r in rows
     ]
+
+
+@router.post("/knowledge/rebuild")
+def admin_rebuild_knowledge(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> dict[str, int]:
+    _ = admin
+    return rebuild_knowledge_base(db)
 
 
 class AgentProposalOut(BaseModel):

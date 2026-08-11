@@ -9,7 +9,9 @@ import type {
   MarkerItem,
   MarkerPayload,
   MarkerShape,
+  PlaceChain,
   PlaceEventItem,
+  PlaceNote,
 } from "../types";
 import ImageSlideshow from "./ImageSlideshow";
 import ShareImport from "./ShareImport";
@@ -67,6 +69,8 @@ interface Props {
   createDefaults?: CreateDefaults | null;
   token?: string | null;
   cityId: number;
+  zones: MarkerItem[];
+  chains: PlaceChain[];
   canEdit: boolean;
   onClose: () => void;
   onCreate: (payload: MarkerPayload) => Promise<void>;
@@ -74,6 +78,7 @@ interface Props {
   onDelete: (id: number) => Promise<void>;
   onStartEdit: () => void;
   onMarkerRefresh?: (marker: MarkerItem) => void;
+  onChainCreated?: (chain: PlaceChain) => void;
 }
 
 export default function MarkerPanel({
@@ -85,6 +90,8 @@ export default function MarkerPanel({
   createDefaults,
   token,
   cityId,
+  zones,
+  chains,
   canEdit,
   onClose,
   onCreate,
@@ -92,6 +99,7 @@ export default function MarkerPanel({
   onDelete,
   onStartEdit,
   onMarkerRefresh,
+  onChainCreated,
 }: Props) {
   const [category, setCategory] = useState<MarkerCategory>("tourist");
   const [title, setTitle] = useState("");
@@ -104,16 +112,30 @@ export default function MarkerPanel({
   const [events, setEvents] = useState<PlaceEventItem[]>([]);
   const [eventsOpen, setEventsOpen] = useState(false);
   const [eventsLoading, setEventsLoading] = useState(false);
+  const [notes, setNotes] = useState<PlaceNote[]>([]);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [notePrivate, setNotePrivate] = useState(false);
+  const [zoneId, setZoneId] = useState("");
+  const [chainId, setChainId] = useState("");
+  const [branchName, setBranchName] = useState("");
+  const [newChainName, setNewChainName] = useState("");
 
   useEffect(() => {
     if (marker && (mode === "view" || mode === "edit")) {
       setCategory(marker.category);
       setTitle(marker.title);
       setDescription(marker.description);
+      setZoneId(marker.zone_id ? String(marker.zone_id) : "");
+      setChainId(marker.chain_id ? String(marker.chain_id) : "");
+      setBranchName(marker.branch_name ?? "");
     } else if (mode === "create") {
       setCategory(createDefaults?.category ?? "tourist");
       setTitle(createDefaults?.title ?? "");
       setDescription(createDefaults?.description ?? "");
+      setZoneId("");
+      setChainId("");
+      setBranchName("");
     }
     setError("");
     setAppealOpen(false);
@@ -121,7 +143,22 @@ export default function MarkerPanel({
     setAppealDone(false);
     setEvents([]);
     setEventsOpen(false);
+    setNotes([]);
+    setNoteDraft("");
+    setNotePrivate(false);
+    setNewChainName("");
   }, [marker, mode, latlng, polygon, createDefaults]);
+
+  useEffect(() => {
+    if (!token || !marker || mode !== "view") return;
+    let cancelled = false;
+    setNotesLoading(true);
+    void api.fetchPlaceNotes(token, marker.id)
+      .then((rows) => { if (!cancelled) setNotes(rows); })
+      .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : "메모를 불러오지 못했습니다"); })
+      .finally(() => { if (!cancelled) setNotesLoading(false); });
+    return () => { cancelled = true; };
+  }, [token, marker?.id, mode]);
 
   useEffect(() => {
     if (!token || !marker || mode !== "view" || !eventsOpen) return;
@@ -171,6 +208,38 @@ export default function MarkerPanel({
     setError("");
   }
 
+  async function addNote() {
+    if (!token || !marker || !noteDraft.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const row = await api.createPlaceNote(
+        token,
+        marker.id,
+        noteDraft.trim(),
+        notePrivate ? "private" : "shared",
+      );
+      setNotes((prev) => [...prev, row]);
+      setNoteDraft("");
+      onMarkerRefresh?.({ ...marker, note_count: marker.note_count + 1 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "메모 저장 실패");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeNote(note: PlaceNote) {
+    if (!token || !marker || !note.is_mine) return;
+    try {
+      await api.deletePlaceNote(token, note.id);
+      setNotes((prev) => prev.filter((item) => item.id !== note.id));
+      onMarkerRefresh?.({ ...marker, note_count: Math.max(0, marker.note_count - 1) });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "메모 삭제 실패");
+    }
+  }
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (!title.trim()) {
@@ -180,6 +249,18 @@ export default function MarkerPanel({
     setBusy(true);
     setError("");
     try {
+      let resolvedChainId: number | null = chainId && chainId !== "new" ? Number(chainId) : null;
+      if (chainId === "new") {
+        if (!token || !newChainName.trim()) {
+          throw new Error("새 체인 이름을 입력하세요");
+        }
+        const created = await api.createChain(token, {
+          name_local: newChainName.trim(),
+          category,
+        });
+        resolvedChainId = created.id;
+        onChainCreated?.(created);
+      }
       if (mode === "create" && latlng) {
         await onCreate({
           category,
@@ -195,12 +276,18 @@ export default function MarkerPanel({
           coordinate_source_url: createDefaults?.coordinateSourceUrl ?? "",
           coordinate_confidence: createDefaults?.coordinateConfidence ?? null,
           coordinate_crs: "WGS84",
+          zone_id: !isZone && zoneId ? Number(zoneId) : null,
+          chain_id: !isZone ? resolvedChainId : null,
+          branch_name: !isZone ? branchName.trim() : "",
         });
       } else if (mode === "edit" && marker) {
         await onUpdate(marker.id, {
           category,
           title: title.trim(),
           description: description.trim(),
+          zone_id: !isZone && zoneId ? Number(zoneId) : null,
+          chain_id: !isZone ? resolvedChainId : null,
+          branch_name: !isZone ? branchName.trim() : "",
         });
       }
     } catch (err) {
@@ -305,6 +392,14 @@ export default function MarkerPanel({
           <p className="panel__desc">
             {marker.description ? linkifyText(marker.description) : "설명 없음"}
           </p>
+          {marker.zone_title || marker.chain_name ? (
+            <div className="place-relations">
+              {marker.zone_title ? <span><b>구역</b>{marker.zone_title}</span> : null}
+              {marker.chain_name ? (
+                <span><b>체인</b>{marker.chain_name}{marker.branch_name ? ` · ${marker.branch_name}` : ""}</span>
+              ) : null}
+            </div>
+          ) : null}
           {marker.insights?.length ? (
             <div className="place-insights">
               {(["location", "history", "visit", "tip"] as const).map((kind) => {
@@ -317,8 +412,8 @@ export default function MarkerPanel({
                   tip: "현지 팁",
                 };
                 return (
-                  <section key={kind} className={`place-insights__group place-insights__group--${kind}`}>
-                    <h4>{labels[kind]}</h4>
+                  <details key={kind} className={`place-insights__group place-insights__group--${kind}`} open={kind === "location"}>
+                    <summary><h4>{labels[kind]}</h4><span>{rows.length}</span></summary>
                     <ul>
                       {rows.map((item) => (
                         <li key={item.id}>
@@ -336,7 +431,7 @@ export default function MarkerPanel({
                         </li>
                       ))}
                     </ul>
-                  </section>
+                  </details>
                 );
               })}
             </div>
@@ -355,13 +450,45 @@ export default function MarkerPanel({
             ) : null}
           </div>
           {marker.agent_context ? (
-            <div className="panel__context">
-              <strong>정리 메모</strong>
+            <details className="panel__context">
+              <summary><strong>에이전트 정리 메모</strong></summary>
               <p>{linkifyText(marker.agent_context)}</p>
-            </div>
+            </details>
           ) : null}
           {token ? (
-            <div className="panel__history">
+            <details className="place-notes" open>
+              <summary><strong>여행 메모</strong><span>{notes.length || marker.note_count}</span></summary>
+              {notesLoading ? <p className="panel__meta">메모 불러오는 중…</p> : null}
+              {notes.length ? (
+                <ul>
+                  {notes.map((note) => (
+                    <li key={note.id}>
+                      <div><strong>{note.author_name}</strong><small>{note.visibility === "private" ? "나만 보기" : "공유"}</small></div>
+                      <p>{linkifyText(note.body)}</p>
+                      <time dateTime={note.created_at}>{new Date(note.created_at).toLocaleString("ko-KR")}</time>
+                      {note.is_mine ? <button type="button" onClick={() => void removeNote(note)}>삭제</button> : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : !notesLoading ? <p className="panel__meta">첫 여행 메모를 남겨보세요.</p> : null}
+              <textarea
+                value={noteDraft}
+                onChange={(e) => setNoteDraft(e.target.value)}
+                rows={3}
+                maxLength={4000}
+                placeholder="개인 일정, 먹어볼 메뉴, 일행에게 남길 팁…"
+              />
+              <div className="place-notes__compose">
+                <label><input type="checkbox" checked={notePrivate} onChange={(e) => setNotePrivate(e.target.checked)} /> 나만 보기</label>
+                <button type="button" className="btn btn--primary" disabled={busy || !noteDraft.trim()} onClick={() => void addNote()}>메모 남기기</button>
+              </div>
+            </details>
+          ) : null}
+          {token ? (
+            <details className="panel__history" onToggle={(e) => {
+              if ((e.currentTarget as HTMLDetailsElement).open) setEventsOpen(true);
+            }}>
+              <summary><strong>시스템 변경 이력</strong></summary>
               <button
                 type="button"
                 className="btn btn--ghost"
@@ -406,7 +533,7 @@ export default function MarkerPanel({
                   </ul>
                 )
               ) : null}
-            </div>
+            </details>
           ) : null}
           {canEdit ? (
             <div className="panel__actions">
@@ -486,6 +613,35 @@ export default function MarkerPanel({
               ))}
             </select>
           </label>
+          {!isZone ? (
+            <div className="panel__relation-fields">
+              <label>
+                소속 구역
+                <select value={zoneId} onChange={(e) => setZoneId(e.target.value)}>
+                  <option value="">구역 미지정</option>
+                  {zones.map((zone) => <option key={zone.id} value={zone.id}>{zone.title}</option>)}
+                </select>
+              </label>
+              <label>
+                체인·브랜드
+                <select value={chainId} onChange={(e) => setChainId(e.target.value)}>
+                  <option value="">독립 장소</option>
+                  {chains.map((chain) => (
+                    <option key={chain.id} value={chain.id}>
+                      {chain.name_local}{chain.name_ko ? ` (${chain.name_ko})` : ""} · {chain.branch_count}개 지점
+                    </option>
+                  ))}
+                  <option value="new">+ 새 체인 만들기</option>
+                </select>
+              </label>
+              {chainId === "new" ? (
+                <label>새 체인 이름<input value={newChainName} onChange={(e) => setNewChainName(e.target.value)} maxLength={160} /></label>
+              ) : null}
+              {chainId ? (
+                <label>지점명<input value={branchName} onChange={(e) => setBranchName(e.target.value)} maxLength={120} placeholder="중제점, 선허구점 등" /></label>
+              ) : null}
+            </div>
+          ) : null}
           <label>
             제목
             <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={200} required />

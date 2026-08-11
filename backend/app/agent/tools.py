@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app import storage
@@ -37,6 +38,7 @@ from app.models import (
     AgentSearchLog,
     AgentSearchResult,
     AgentWebVisit,
+    AgentTask,
     City,
     Marker,
     MarkerCategory,
@@ -47,6 +49,7 @@ from app.models import (
     PlaceEventAction,
     PlaceImage,
     PlaceInsight,
+    PlaceChain,
     UserMessageKind,
 )
 from app.rollback import _rollback_merge, marker_snapshot
@@ -215,7 +218,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "update_place_context",
-            "description": "장소의 내부 컨텍스트(agent_context)를 갱신한다. 사용자 description과 별개.",
+            "description": "장소의 현재 내부 판단 요약(agent_context)을 교체한다. 실행 로그를 누적하지 말고 최신 결론만 1,500자 이내로 유지한다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -231,10 +234,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "update_place_fields",
             "description": (
-                "기존 기록을 최대한 보존하며 보완한다. "
+                "장소의 짧은 소개와 명칭을 정제한다. 운영 로그·이전 제목·조사 과정은 description에 넣지 않는다. "
                 "언어 규칙: 설명 본문은 무조건 한국어(중국어 정보는 번역), "
                 "명칭은 중국어+한국어 병기('中文名 (한국어 명칭)'), 주소는 중국어 원문. "
-                "사용자가 쓴 설명은 append_note로만 보완. "
+                "방문 팁·운영시간·역사·위치는 append_note가 아니라 upsert_place_insights로 출처와 함께 저장한다. "
                 "설명이 중국어/영어 위주로 잘못 작성된 장소(주로 agent 추가분)는 "
                 "replace_description으로 한국어 본문으로 전면 재작성 "
                 "(주소는 '주소: [중국어 원문]' 형태로 유지)."
@@ -243,7 +246,7 @@ TOOLS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "place_id": {"type": "integer"},
-                    "append_note": {"type": "string", "description": "설명 끝에 덧붙일 보완 정보. 반드시 한국어"},
+                    "append_note": {"type": "string", "description": "사용 중단. 구조화 정보는 upsert_place_insights 사용"},
                     "local_name": {"type": "string", "description": "현지(중국어 등) 공식 명칭·주소 병기"},
                     "replace_title": {
                         "type": "string",
@@ -288,6 +291,10 @@ TOOLS: list[dict[str, Any]] = [
                     "coordinate_query": {"type": "string"},
                     "coordinate_source_url": {"type": "string"},
                     "coordinate_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "zone_id": {"type": "integer", "description": "list_zones에서 확인한 소속 관광 구역"},
+                    "chain_name_local": {"type": "string", "description": "체인점이면 브랜드 현지명"},
+                    "chain_name_ko": {"type": "string"},
+                    "branch_name": {"type": "string", "description": "체인점의 실제 지점명"},
                     "evidence": {
                         "type": "string",
                         "description": "왜 이 장소를 추가해야 하는지와 교차 확인한 근거를 한국어로 요약",
@@ -457,15 +464,21 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "upsert_knowledge",
             "description": (
-                "【필수】교훈·조사·병합 정책을 주제(topic)별로 저장/병합한다. "
-                "매 사이클 종료 전 최소 1회 호출. 기존 content와 모순되면 완성본으로 재작성."
+                "【필수】재사용할 원칙만 주제별 최신 합성본으로 저장한다. 실행 일지·검색 목록·다음에 할 일은 "
+                "content에 누적하지 말고 AgentRun과 upsert_agent_task로 분리한다."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "영문/숫자 slug, 예: appeal_lessons, jinan_food"},
                     "title": {"type": "string"},
-                    "content": {"type": "string", "description": "한국어로 정리된 지식 본문"},
+                    "content": {"type": "string", "description": "한국어로 정리된 짧은 최신 합성본"},
+                    "category": {"type": "string", "description": "quality|workflow|city|source|data_model"},
+                    "summary": {"type": "string", "description": "핵심 결론 1~3문장"},
+                    "principles": {"type": "array", "items": {"type": "string"}, "description": "다음 실행이 재사용할 원칙"},
+                    "next_actions": {"type": "array", "items": {"type": "string"}, "description": "표시용 요약. 실제 과제는 upsert_agent_task에도 저장"},
+                    "evidence_count": {"type": "integer"},
+                    "quality_score": {"type": "number", "minimum": 0, "maximum": 1},
                     "scope": {
                         "type": "string",
                         "enum": ["global", "city", "place"],
@@ -533,7 +546,7 @@ TOOLS: list[dict[str, Any]] = [
                 "다른 새 페이지를 고를 것. 자주 언급되는 미등록 장소를 찾으면 "
                 "list_places로 중복 확인 → geocode_place → create_place. "
                 "이미 등록된 장소에 대한 유용한 정보(영업시간·가격·팁·교통·별칭)가 나오면 "
-                "update_place_fields(append_note)나 update_place_context로 보완할 것."
+                "upsert_place_insights로 출처·신뢰도와 함께 보완할 것."
             ),
             "parameters": {
                 "type": "object",
@@ -652,6 +665,78 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_zones",
+            "description": "현재 도시의 구역과 소속 장소 수를 조회한다. 조사를 구역별로 분산하고 동선을 구성할 때 먼저 사용한다.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assign_place_zone",
+            "description": "장소를 같은 도시의 polygon 구역에 배정하거나 zone_id를 생략해 해제한다. 실제 동네·관광 권역 근거가 있을 때 사용한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_id": {"type": "integer"},
+                    "zone_id": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["place_id", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assign_place_chain",
+            "description": "체인 본체를 찾거나 만들고 실제 지점을 연결한다. 같은 브랜드의 다른 지점을 병합하지 말고 이 도구로 묶는다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_id": {"type": "integer"},
+                    "chain_name_local": {"type": "string"},
+                    "chain_name_ko": {"type": "string"},
+                    "branch_name": {"type": "string"},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
+                    "reason": {"type": "string"},
+                },
+                "required": ["place_id", "chain_name_local", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_agent_tasks",
+            "description": "이전 실행이 남긴 미완료 조사·정제 과제를 우선순위순으로 조회한다.",
+            "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 12}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "upsert_agent_task",
+            "description": "다음 실행이 이어받을 구체적 과제를 만들거나 기존 과제를 완료한다. 예고 문장을 지식베이스에 넣지 말고 백로그로 분리한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "kind": {"type": "string"},
+                    "title": {"type": "string"},
+                    "detail": {"type": "string"},
+                    "success_metric": {"type": "string"},
+                    "priority": {"type": "integer"},
+                    "status": {"type": "string", "enum": ["pending", "completed", "blocked"]},
+                    "result": {"type": "string"},
+                },
+                "required": ["title", "status"],
+            },
+        },
+    },
 ]
 
 
@@ -682,6 +767,11 @@ def _place_brief(m: Marker) -> dict[str, Any]:
         "coordinate_source": m.coordinate_source or "manual",
         "coordinate_confidence": m.coordinate_confidence,
         "coordinate_crs": m.coordinate_crs or "WGS84",
+        "zone_id": m.zone_id,
+        "zone_title": m.zone.title if m.zone else "",
+        "chain_id": m.chain_id,
+        "chain_name": m.chain.name_local if m.chain else "",
+        "branch_name": m.branch_name or "",
     }
 
 
@@ -1187,7 +1277,7 @@ def run_tool(
 
     if name == "update_place_context":
         pid = int(args["place_id"])
-        ctx = str(args.get("context") or "")[:8000]
+        ctx = str(args.get("context") or "").strip()[:3000]
         m = db.query(Marker).filter(
             Marker.id == pid,
             Marker.city_id == city_id,
@@ -1196,11 +1286,8 @@ def run_tool(
         if not m:
             return {"error": "not_found"}
         before = marker_field_snapshot(m)
-        # 덮어쓰기보다 병합 선호
-        if m.agent_context and ctx and ctx not in m.agent_context:
-            m.agent_context = (m.agent_context.rstrip() + "\n\n" + ctx).strip()[:8000]
-        else:
-            m.agent_context = ctx or m.agent_context
+        # 실행 과정은 AgentRunStep에 남기고, 장소에는 최신 판단만 유지한다.
+        m.agent_context = ctx or m.agent_context
         after = marker_field_snapshot(m)
         changes = diff_marker_fields(before, after, keys=["agent_context"])
         log_place_event(
@@ -1230,6 +1317,11 @@ def run_tool(
         ).first()
         if not m:
             return {"error": "not_found"}
+        if str(args.get("append_note") or "").strip():
+            return {
+                "error": "structured_insight_required",
+                "detail": "설명 누적은 중단되었습니다. 위치·역사·방문정보·팁을 출처 URL과 함께 upsert_place_insights로 저장하세요.",
+            }
         before = marker_field_snapshot(m)
         original_description = m.description or ""
         changed: dict[str, Any] = {}
@@ -1244,22 +1336,8 @@ def run_tool(
                     "error": "korean_required",
                     "detail": "제목은 '中文名 (한국어 명칭)' 형식으로 한국어를 병기해 다시 호출하세요.",
                 }
-            # 기존 제목은 설명에 보존
-            if m.title and m.title not in (m.description or ""):
-                note = f"[이전 제목 보존] {m.title}"
-                m.description = ((m.description or "") + "\n" + note).strip()[:2000]
             m.title = replace_title[:200]
             changed["replace_title"] = m.title
-        append_note = str(args.get("append_note") or "").strip()
-        if append_note:
-            if not _has_hangul(append_note):
-                return {
-                    "error": "korean_required",
-                    "detail": "append_note는 한국어로 작성해야 합니다. 중국어 정보는 번역해 다시 호출하세요.",
-                }
-            if append_note not in (m.description or ""):
-                m.description = ((m.description or "").rstrip() + "\n\n" + append_note).strip()[:2000]
-                changed["append_note"] = True
         replace_description = str(args.get("replace_description") or "").strip()
         if replace_description and replace_description != m.description:
             if not _has_hangul(replace_description):
@@ -1270,9 +1348,18 @@ def run_tool(
             if not m.is_agent_suggested and _has_hangul(original_description):
                 return {
                     "error": "user_content_protected",
-                    "detail": "사용자가 작성한 한국어 설명은 전면 교체 불가. append_note로 보완하세요.",
+                    "detail": "사용자가 작성한 한국어 설명은 전면 교체할 수 없습니다. 세부 사실은 upsert_place_insights로 보완하세요.",
                 }
-            m.description = replace_description[:2000]
+            cleaned = "\n".join(
+                line for line in replace_description.splitlines()
+                if not line.strip().startswith("[이전 제목 보존]")
+            ).strip()
+            if len(cleaned) > 1200:
+                return {
+                    "error": "description_too_long",
+                    "detail": "description은 1,200자 이내의 소개만 유지하고 세부 사실은 upsert_place_insights로 분리하세요.",
+                }
+            m.description = cleaned
             changed["replace_description"] = True
         if args.get("category"):
             try:
@@ -1369,6 +1456,10 @@ def run_tool(
             "coordinate_confidence": max(
                 0.0, min(float(args.get("coordinate_confidence") or args.get("confidence") or 0.5), 1.0)
             ),
+            "zone_id": int(args["zone_id"]) if args.get("zone_id") is not None else None,
+            "chain_name_local": str(args.get("chain_name_local") or "").strip()[:160],
+            "chain_name_ko": str(args.get("chain_name_ko") or "").strip()[:160],
+            "branch_name": str(args.get("branch_name") or "").strip()[:120],
             "insights": insights_payload,
         }
         if not settings.agent_allow_auto_create and not approved:
@@ -1413,6 +1504,31 @@ def run_tool(
             coordinate_verified_at=datetime.now(timezone.utc),
             is_agent_suggested=True,
         )
+        if payload["zone_id"] is not None:
+            zone = db.query(Marker).filter(
+                Marker.id == payload["zone_id"],
+                Marker.city_id == city_id,
+                Marker.shape == MarkerShape.polygon,
+                Marker.merged_into_id.is_(None),
+            ).first()
+            if zone is not None:
+                m.zone_id = zone.id
+        if payload["chain_name_local"]:
+            chain = db.query(PlaceChain).filter(
+                PlaceChain.name_local.ilike(payload["chain_name_local"])
+            ).first()
+            if chain is None:
+                chain = PlaceChain(
+                    name_local=payload["chain_name_local"],
+                    name_ko=payload["chain_name_ko"],
+                    category=cat.value,
+                    aliases="[]",
+                    description="에이전트 제안에서 생성",
+                )
+                db.add(chain)
+                db.flush()
+            m.chain_id = chain.id
+            m.branch_name = payload["branch_name"]
         db.add(m)
         db.flush()
         for index, item in enumerate(insights_payload):
@@ -1677,6 +1793,161 @@ def run_tool(
         ]
 
 
+    if name == "list_zones":
+        zones = (
+            db.query(Marker)
+            .filter(
+                Marker.city_id == city_id,
+                Marker.shape == MarkerShape.polygon,
+                Marker.merged_into_id.is_(None),
+            )
+            .order_by(Marker.title.asc())
+            .all()
+        )
+        counts = dict(
+            db.query(Marker.zone_id, func.count(Marker.id))
+            .filter(Marker.city_id == city_id, Marker.zone_id.is_not(None), Marker.merged_into_id.is_(None))
+            .group_by(Marker.zone_id)
+            .all()
+        )
+        return [
+            {
+                "id": zone.id,
+                "title": zone.title,
+                "category": zone.category.value if zone.category else "other",
+                "member_count": int(counts.get(zone.id, 0)),
+                "polygon": json.loads(zone.polygon or "[]"),
+            }
+            for zone in zones
+        ]
+
+    if name == "assign_place_zone":
+        place_id = int(args["place_id"])
+        zone_id = int(args["zone_id"]) if args.get("zone_id") is not None else None
+        place = db.query(Marker).filter(
+            Marker.id == place_id,
+            Marker.city_id == city_id,
+            Marker.shape == MarkerShape.point,
+            Marker.merged_into_id.is_(None),
+        ).first()
+        if place is None:
+            return {"error": "place_not_found_or_not_point"}
+        if zone_id is not None:
+            zone = db.query(Marker).filter(
+                Marker.id == zone_id,
+                Marker.city_id == city_id,
+                Marker.shape == MarkerShape.polygon,
+                Marker.merged_into_id.is_(None),
+            ).first()
+            if zone is None:
+                return {"error": "zone_not_found"}
+        if place.zone_id == zone_id:
+            return {"ok": True, "changed": False, "zone_id": zone_id}
+        before = marker_field_snapshot(place)
+        place.zone_id = zone_id
+        after = marker_field_snapshot(place)
+        changes = diff_marker_fields(before, after, keys=["zone_id"])
+        log_place_event(
+            db,
+            place_id=place.id,
+            user=None,
+            action=PlaceEventAction.context_update,
+            summary=summary_for_changes("에이전트 구역 배정", changes),
+            payload={"reason": str(args.get("reason") or "")[:1000], "before": before, "after": after, "changes": changes},
+            actor="agent",
+        )
+        db.commit()
+        return {"ok": True, "changed": True, "zone_id": zone_id}
+
+    if name == "assign_place_chain":
+        place_id = int(args["place_id"])
+        place = db.query(Marker).filter(
+            Marker.id == place_id,
+            Marker.city_id == city_id,
+            Marker.shape == MarkerShape.point,
+            Marker.merged_into_id.is_(None),
+        ).first()
+        if place is None:
+            return {"error": "place_not_found_or_not_point"}
+        chain_local = str(args.get("chain_name_local") or "").strip()[:160]
+        if not chain_local:
+            return {"error": "chain_name_required"}
+        chain = db.query(PlaceChain).filter(PlaceChain.name_local.ilike(chain_local)).first()
+        if chain is None:
+            chain = PlaceChain(
+                name_local=chain_local,
+                name_ko=str(args.get("chain_name_ko") or "").strip()[:160],
+                category=place.category.value if place.category else "other",
+                aliases=json.dumps([str(item)[:160] for item in (args.get("aliases") or [])], ensure_ascii=False),
+                description=str(args.get("reason") or "").strip()[:2000],
+            )
+            db.add(chain)
+            db.flush()
+        before = marker_field_snapshot(place)
+        place.chain_id = chain.id
+        place.branch_name = str(args.get("branch_name") or "").strip()[:120]
+        after = marker_field_snapshot(place)
+        changes = diff_marker_fields(before, after, keys=["chain_id", "branch_name"])
+        if changes:
+            log_place_event(
+                db,
+                place_id=place.id,
+                user=None,
+                action=PlaceEventAction.context_update,
+                summary=summary_for_changes("에이전트 체인 연결", changes),
+                payload={"reason": str(args.get("reason") or "")[:1000], "before": before, "after": after, "changes": changes},
+                actor="agent",
+            )
+        db.commit()
+        return {"ok": True, "changed": bool(changes), "chain_id": chain.id}
+
+    if name == "list_agent_tasks":
+        limit = max(1, min(int(args.get("limit") or 12), 50))
+        rows = (
+            db.query(AgentTask)
+            .filter(AgentTask.city_id == city_id, AgentTask.status == "pending")
+            .order_by(AgentTask.priority.desc(), AgentTask.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "title": row.title,
+                "detail": row.detail,
+                "success_metric": row.success_metric,
+                "priority": row.priority,
+                "attempts": row.attempts,
+            }
+            for row in rows
+        ]
+
+    if name == "upsert_agent_task":
+        status_value = str(args.get("status") or "pending")
+        task_id = int(args["task_id"]) if args.get("task_id") is not None else None
+        row = db.query(AgentTask).filter(AgentTask.id == task_id, AgentTask.city_id == city_id).first() if task_id else None
+        if row is None:
+            title = str(args.get("title") or "").strip()[:240]
+            row = db.query(AgentTask).filter(
+                AgentTask.city_id == city_id,
+                AgentTask.title == title,
+                AgentTask.status == "pending",
+            ).first()
+            if row is None:
+                row = AgentTask(city_id=city_id, title=title)
+                db.add(row)
+        row.kind = str(args.get("kind") or row.kind or "research")[:30]
+        row.detail = str(args.get("detail") or row.detail or "")[:8000]
+        row.success_metric = str(args.get("success_metric") or row.success_metric or "")[:2000]
+        row.priority = max(1, min(int(args.get("priority") or row.priority or 50), 100))
+        row.status = status_value if status_value in {"pending", "completed", "blocked"} else "pending"
+        row.result = str(args.get("result") or row.result or "")[:8000]
+        if row.status == "completed":
+            row.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        return {"ok": True, "task_id": row.id, "status": row.status}
+
     if name == "list_knowledge":
         limit = int(args.get("limit") or 30)
         rows = list_knowledge(db, limit=limit, city_id=city_id)
@@ -1686,6 +1957,10 @@ def run_tool(
                 "topic": r.topic,
                 "title": r.title,
                 "content": r.content,
+                "summary": r.summary,
+                "principles": json.loads(r.principles or "[]"),
+                "next_actions": json.loads(r.next_actions or "[]"),
+                "quality_score": r.quality_score,
                 "scope": r.scope,
                 "city_id": r.city_id,
                 "place_id": r.place_id,
@@ -1711,6 +1986,12 @@ def run_tool(
             city_id=knowledge_city_id,
             place_id=requested_place_id,
             merge=bool(args.get("merge", False)),
+            category=str(args.get("category") or "playbook"),
+            summary=str(args.get("summary") or ""),
+            principles=[str(item) for item in (args.get("principles") or [])],
+            next_actions=[str(item) for item in (args.get("next_actions") or [])],
+            evidence_count=int(args.get("evidence_count") or 0),
+            quality_score=float(args.get("quality_score") or 0.7),
         )
         db.commit()
         return {"ok": True, "topic": row.topic, "id": row.id, "chars": len(row.content or "")}

@@ -4,6 +4,8 @@ import { useAuth } from "../auth";
 import type {
   AdminAgentAction,
   AdminAgentProposal,
+  AdminAgentRunHistory,
+  AdminAgentTask,
   AdminKnowledge,
   AdminStatus,
   City,
@@ -26,6 +28,8 @@ export default function AdminPage() {
   const [knowledge, setKnowledge] = useState<AdminKnowledge[]>([]);
   const [cities, setCities] = useState<City[]>([]);
   const [proposals, setProposals] = useState<AdminAgentProposal[]>([]);
+  const [runs, setRuns] = useState<AdminAgentRunHistory[]>([]);
+  const [tasks, setTasks] = useState<AdminAgentTask[]>([]);
   const [selectedCityId, setSelectedCityId] = useState(2);
   const [researchMode, setResearchMode] = useState(true);
   const [error, setError] = useState("");
@@ -34,18 +38,21 @@ export default function AdminPage() {
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
+  const [activeTab, setActiveTab] = useState<"agent" | "proposals" | "history" | "knowledge" | "users">("agent");
 
   const reload = useCallback(async () => {
     if (!token) return;
     setError("");
     try {
-      const [s, u, a, k, c, p] = await Promise.all([
+      const [s, u, a, k, c, p, r, t] = await Promise.all([
         api.fetchAdminStatus(token),
         api.fetchAdminUsers(token),
         api.fetchAdminAgentActions(token),
         api.fetchAdminKnowledge(token),
         api.fetchCities(token),
         api.fetchAdminAgentProposals(token, selectedCityId),
+        api.fetchAdminAgentRuns(token, selectedCityId),
+        api.fetchAdminAgentTasks(token, selectedCityId),
       ]);
       setStatus(s);
       setUsers(u);
@@ -53,6 +60,8 @@ export default function AdminPage() {
       setKnowledge(k);
       setCities(c);
       setProposals(p);
+      setRuns(r);
+      setTasks(t);
     } catch (e) {
       setError(e instanceof Error ? e.message : "관리자 정보를 불러오지 못했습니다");
     }
@@ -80,7 +89,7 @@ export default function AdminPage() {
       const r = status.result;
       if (r) {
         setInfo(
-          `${r.ok ? "완료" : "실패"} · steps ${r.steps} · unread ${r.unread_before}→${r.unread_after}\n${r.message}`,
+          `${r.ok ? "완료" : "실패"} · 성과 ${r.score ?? 0}점 · 행동 라운드 ${r.steps} · 미처리 ${r.unread_before}→${r.unread_after}\n${r.message}`,
         );
       } else if (status.running) {
         setInfo("아직 실행 중입니다. 잠시 후 새로고침으로 결과를 확인하세요.");
@@ -217,7 +226,19 @@ export default function AdminPage() {
       {error ? <p className="panel__error">{error}</p> : null}
       {info ? <pre className="admin__info">{info}</pre> : null}
 
-      <section className="admin__card">
+      <nav className="admin__tabs" aria-label="관리 화면">
+        {([
+          ["agent", "운영"],
+          ["proposals", `승인 제안 ${proposals.length ? `(${proposals.length})` : ""}`],
+          ["history", "시스템 이력"],
+          ["knowledge", "지식"],
+          ["users", "사용자"],
+        ] as const).map(([key, label]) => (
+          <button key={key} type="button" className={activeTab === key ? "is-active" : ""} onClick={() => setActiveTab(key)}>{label}</button>
+        ))}
+      </nav>
+
+      {activeTab === "agent" ? <section className="admin__card">
         <h2>에이전트</h2>
         <div className="admin__agent-controls">
           <label>
@@ -225,7 +246,7 @@ export default function AdminPage() {
             <select value={selectedCityId} onChange={(e) => setSelectedCityId(Number(e.target.value))}>
               {cities.map((city) => (
                 <option key={city.id} value={city.id}>
-                  {city.name_ko} ({city.name_local}) · 장소 {city.place_count}
+                  {city.name_ko} ({city.name_local}) · 장소 {city.place_count} · 구역 {city.zone_count ?? 0}
                 </option>
               ))}
             </select>
@@ -245,6 +266,7 @@ export default function AdminPage() {
               Groq: {status.groq_configured ? "설정됨" : "미설정"} ({status.groq_model})
             </li>
             <li>활성 장소: {status.markers_active}</li>
+            <li>관광 구역: {status.zones_active ?? 0}</li>
             <li>
               미읽음 이력: {status.events_unread} / 전체 {status.events_total}
             </li>
@@ -269,9 +291,9 @@ export default function AdminPage() {
           매일 새벽 03:00(KST)에도 자동 실행됩니다. API 키는 AWS Secrets Manager
           (`tourmiddle-dev/app`의 GROQ_*)에서 관리합니다.
         </p>
-      </section>
+      </section> : null}
 
-      <section className="admin__card admin__card--proposals">
+      {activeTab === "proposals" ? <section className="admin__card admin__card--proposals">
         <h2>근거 기반 승인 대기 ({proposals.length})</h2>
         <p className="panel__meta">
           에이전트가 찾은 신규 장소와 병합 후보입니다. 출처와 신뢰도를 확인한 뒤 반영하세요.
@@ -313,10 +335,28 @@ export default function AdminPage() {
             ))}
           </ul>
         )}
-      </section>
+      </section> : null}
 
-      <section className="admin__card">
-        <h2>에이전트 변경 이력</h2>
+      {activeTab === "history" ? <section className="admin__card">
+        <h2>에이전트 시스템 이력</h2>
+        <p className="panel__meta">실행 로그와 후속 과제는 장소 설명·지식베이스와 분리되어 보관됩니다.</p>
+        {runs.length ? (
+          <ul className="admin__runs">
+            {runs.map((run) => (
+              <li key={run.id}>
+                <div><strong>실행 #{run.id} · {run.score.toFixed(1)}점</strong><span className={`run-status run-status--${run.status}`}>{run.status}</span></div>
+                <p>{run.objective}</p>
+                <small>{new Date(run.started_at).toLocaleString("ko-KR")} · 도구 행동 {run.step_count}회</small>
+                <details><summary>결과 보기</summary><pre>{run.summary}</pre></details>
+              </li>
+            ))}
+          </ul>
+        ) : <p className="panel__meta">새 성과 기반 실행 이력이 아직 없습니다.</p>}
+        <details className="admin__tasks" open>
+          <summary><strong>다음 실행 백로그 ({tasks.length})</strong></summary>
+          {tasks.length ? <ul>{tasks.map((task) => <li key={task.id}><strong>{task.title}</strong><span>우선순위 {task.priority} · {task.success_metric || task.kind}</span><p>{task.detail}</p></li>)}</ul> : <p className="panel__meta">대기 중인 후속 과제가 없습니다.</p>}
+        </details>
+        <h3>장소 변경·롤백 이력</h3>
         <p className="panel__meta">
           롤백하면 지도가 이전 상태로 돌아가고, 다음 에이전트 실행 시 같은 방향의 수정을
           피하도록 이력이 전달됩니다.
@@ -361,10 +401,10 @@ export default function AdminPage() {
             ))}
           </ul>
         )}
-      </section>
+      </section> : null}
 
       
-      <section className="admin__card">
+      {activeTab === "knowledge" ? <section className="admin__card">
         <h2>에이전트 지식베이스</h2>
         <p className="panel__meta">
           이의·롤백·웹조사에서 얻은 교훈을 주제별로 병합해 다음 실행에 사용합니다.
@@ -382,14 +422,16 @@ export default function AdminPage() {
                   {new Date(k.updated_at).toLocaleString("ko-KR")}
                   {k.place_id ? ` · 장소 #${k.place_id}` : ""}
                 </span>
-                <pre>{k.content}</pre>
+                <p>{k.summary || k.content}</p>
+                {k.principles?.length ? <ul>{k.principles.map((item) => <li key={item}>{item}</li>)}</ul> : null}
+                {k.next_actions?.length ? <details><summary>다음 과제 {k.next_actions.length}개</summary><ul>{k.next_actions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
               </li>
             ))}
           </ul>
         )}
-      </section>
+      </section> : null}
 
-      <section className="admin__card">
+      {activeTab === "users" ? <section className="admin__card">
         <h2>사용자 ({status?.users_total ?? users.length})</h2>
         <ul className="admin__users">
           {users.map((u) => (
@@ -433,7 +475,7 @@ export default function AdminPage() {
             추가
           </button>
         </form>
-      </section>
+      </section> : null}
     </div>
   );
 }

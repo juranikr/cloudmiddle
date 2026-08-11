@@ -9,8 +9,10 @@ from sqlalchemy.orm import sessionmaker
 from app.agent.runner import count_unread
 from app.agent.tools import run_tool
 from app.db import Base
-from app.knowledge import upsert_knowledge
+from app.knowledge import rebuild_knowledge_base, upsert_knowledge
 from app.models import (
+    AgentKnowledge,
+    AgentKnowledgeArchive,
     AgentProposal,
     City,
     Marker,
@@ -19,6 +21,7 @@ from app.models import (
     PlaceEvent,
     PlaceEventAction,
     PlaceInsight,
+    PlaceChain,
 )
 
 
@@ -170,6 +173,77 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.assertEqual(result, {"ok": True, "changed": {}})
         self.assertEqual(self.db.query(PlaceEvent).count(), event_count)
+
+    def test_zone_and_chain_are_relationships_not_merges(self) -> None:
+        zone = Marker(
+            city_id=2,
+            category=MarkerCategory.tourist,
+            shape=MarkerShape.polygon,
+            title="중제·고궁권",
+            description="도보 관광 구역",
+            lat=41.79,
+            lng=123.45,
+            polygon=json.dumps([
+                {"lat": 41.78, "lng": 123.43},
+                {"lat": 41.81, "lng": 123.43},
+                {"lat": 41.81, "lng": 123.47},
+            ]),
+        )
+        self.db.add(zone)
+        self.db.flush()
+        place = self.db.query(Marker).filter(Marker.city_id == 2, Marker.shape == MarkerShape.point).one()
+        zoned = run_tool(
+            self.db,
+            "assign_place_zone",
+            {"place_id": place.id, "zone_id": zone.id, "reason": "중제 도보권"},
+            city_id=2,
+        )
+        self.assertTrue(zoned["changed"])
+        chained = run_tool(
+            self.db,
+            "assign_place_chain",
+            {
+                "place_id": place.id,
+                "chain_name_local": "测试品牌",
+                "chain_name_ko": "테스트 브랜드",
+                "branch_name": "중제점",
+                "reason": "동일 브랜드의 독립 지점",
+            },
+            city_id=2,
+        )
+        self.assertTrue(chained["changed"])
+        self.db.refresh(place)
+        self.assertEqual(place.zone_id, zone.id)
+        self.assertIsNotNone(place.chain_id)
+        self.assertIsNone(place.merged_into_id)
+        self.assertEqual(self.db.query(PlaceChain).count(), 1)
+
+    def test_description_append_is_rejected_in_favor_of_insights(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        before = place.description
+        result = run_tool(
+            self.db,
+            "update_place_fields",
+            {"place_id": place.id, "append_note": "운영시간을 덧붙입니다."},
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "structured_insight_required")
+        self.assertEqual(place.description, before)
+
+    def test_knowledge_rebuild_archives_journals_and_seeds_playbooks(self) -> None:
+        upsert_knowledge(
+            self.db,
+            topic="research_strategy",
+            title="누적 일지",
+            content="다음 사이클에는 계속 조사한다.\n---\n오래된 실행 로그",
+            city_id=2,
+        )
+        self.db.commit()
+        result = rebuild_knowledge_base(self.db)
+        self.assertGreaterEqual(result["archived"], 1)
+        self.assertEqual(result["active"], 5)
+        self.assertEqual(self.db.query(AgentKnowledgeArchive).count(), result["archived"])
+        self.assertEqual(self.db.query(AgentKnowledge).count(), 5)
 
 
 if __name__ == "__main__":

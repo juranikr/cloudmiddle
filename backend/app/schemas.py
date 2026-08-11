@@ -23,6 +23,7 @@ class CityOut(BaseModel):
     search_viewbox: str = ""
     status: str
     place_count: int = 0
+    zone_count: int = 0
 
 
 class GeocodeResult(BaseModel):
@@ -95,6 +96,9 @@ class MarkerCreate(BaseModel):
     coordinate_source_url: str = Field(default="", max_length=1000)
     coordinate_confidence: Optional[float] = Field(default=None, ge=0, le=1)
     coordinate_crs: str = Field(default="WGS84", max_length=20)
+    zone_id: Optional[int] = Field(default=None, gt=0)
+    chain_id: Optional[int] = Field(default=None, gt=0)
+    branch_name: str = Field(default="", max_length=120)
 
     @model_validator(mode="after")
     def validate_geometry(self) -> "MarkerCreate":
@@ -111,6 +115,9 @@ class MarkerUpdate(BaseModel):
     lat: Optional[float] = Field(default=None, ge=-90, le=90)
     lng: Optional[float] = Field(default=None, ge=-180, le=180)
     polygon: Optional[list[LatLng]] = None
+    zone_id: Optional[int] = Field(default=None, gt=0)
+    chain_id: Optional[int] = Field(default=None, gt=0)
+    branch_name: Optional[str] = Field(default=None, max_length=120)
 
 
 class PlaceImageOut(BaseModel):
@@ -133,6 +140,48 @@ class PlaceInsightOut(BaseModel):
     verified_at: Optional[datetime] = None
 
 
+class PlaceNoteCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+    visibility: str = Field(default="shared", pattern="^(shared|private)$")
+
+
+class PlaceNoteUpdate(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+    visibility: Optional[str] = Field(default=None, pattern="^(shared|private)$")
+
+
+class PlaceNoteOut(BaseModel):
+    id: int
+    place_id: int
+    user_id: int
+    author_name: str
+    body: str
+    visibility: str
+    is_mine: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlaceChainCreate(BaseModel):
+    name_local: str = Field(min_length=1, max_length=160)
+    name_ko: str = Field(default="", max_length=160)
+    category: str = Field(default="other", max_length=30)
+    aliases: list[str] = Field(default_factory=list)
+    description: str = Field(default="", max_length=2000)
+
+
+class PlaceChainOut(BaseModel):
+    id: int
+    name_local: str
+    name_ko: str
+    category: str
+    aliases: list[str] = Field(default_factory=list)
+    description: str = ""
+    branch_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
 class MarkerOut(BaseModel):
     id: int
     city_id: int
@@ -149,6 +198,12 @@ class MarkerOut(BaseModel):
     polygon: Optional[list[LatLng]] = None
     images: list[PlaceImageOut] = []
     insights: list[PlaceInsightOut] = []
+    zone_id: Optional[int] = None
+    zone_title: str = ""
+    chain_id: Optional[int] = None
+    chain_name: str = ""
+    branch_name: str = ""
+    note_count: int = 0
     coordinate_source: str = "manual"
     coordinate_external_id: str = ""
     coordinate_query: str = ""
@@ -185,6 +240,10 @@ class AgentRunResponse(BaseModel):
     unread_before: int
     unread_after: int
     city_id: int = 1
+    score: float = 0.0
+    performance: dict[str, int] = Field(default_factory=dict)
+    remaining_gaps: list[str] = Field(default_factory=list)
+    run_id: Optional[int] = None
 
 
 class UserMessageOut(BaseModel):
@@ -241,6 +300,14 @@ class AgentKnowledgeOut(BaseModel):
     scope: str = "global"
     city_id: Optional[int] = None
     place_id: Optional[int] = None
+    category: str = "playbook"
+    summary: str = ""
+    principles: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+    evidence_count: int = 0
+    quality_score: float = 0.0
+    status: str = "active"
+    version: int = 1
     created_at: datetime
     updated_at: datetime
 
