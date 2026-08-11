@@ -136,14 +136,20 @@ class _ForcedWriteCompletions:
                     id="write-1",
                     function=SimpleNamespace(
                         name="propose_place",
-                        arguments=json.dumps({"title": "喜茶中街店 (헤이티 중제점)"}, ensure_ascii=False),
+                        arguments=json.dumps(
+                            {"title": "喜茶中街店 (헤이티 중제점)", "lat": 41.8, "lng": 123.45},
+                            ensure_ascii=False,
+                        ),
                     ),
                 ),
                 SimpleNamespace(
                     id="write-2",
                     function=SimpleNamespace(
                         name="propose_place",
-                        arguments=json.dumps({"title": "茉酸奶中街店 (모어요거트 중제점)"}, ensure_ascii=False),
+                        arguments=json.dumps(
+                            {"title": "茉酸奶中街店 (모어요거트 중제점)", "lat": 41.8, "lng": 123.45},
+                            ensure_ascii=False,
+                        ),
                     ),
                 ),
             ]

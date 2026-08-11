@@ -320,6 +320,7 @@ def answer_travel_chat(
     write_succeeded = False
     successful_write_targets: set[str] = set()
     actionable_targets: set[str] = set()
+    verified_coordinates: list[tuple[float, float]] = []
 
     def writes_complete() -> bool:
         return write_succeeded and (
@@ -433,6 +434,12 @@ def answer_travel_chat(
                 _collect_tool_sources("geocode_place", geo_result, sources)
                 tool_results.append({"name": "geocode_place", "args": geo_args, "result": geo_result})
                 geo_hits = geo_result.get("results") or [] if isinstance(geo_result, dict) else []
+                for hit in geo_hits:
+                    if isinstance(hit, dict) and hit.get("storage_allowed") is not False:
+                        try:
+                            verified_coordinates.append((float(hit["lat"]), float(hit["lng"])))
+                        except (KeyError, TypeError, ValueError):
+                            continue
                 if search_items and geo_hits:
                     actionable_targets.add(target)
                 enrichment.append({
@@ -554,8 +561,46 @@ def answer_travel_chat(
             elif name not in allowed:
                 result = {"error": "이 대화에서 허용되지 않은 작업입니다"}
             else:
-                seen_tool_calls.add(signature)
-                result = run_tool(db, name, args, city_id=city_id)
+                unsupported_evidence: list[str] = []
+                coordinate_mismatch = False
+                if name == "propose_place":
+                    supplied_urls = [str(url) for url in (args.get("source_urls") or [])]
+                    supplied_urls.extend(
+                        str(item.get("source_url") or "")
+                        for item in (args.get("insights") or [])
+                        if isinstance(item, dict)
+                    )
+                    coordinate_url = str(args.get("coordinate_source_url") or "")
+                    if coordinate_url:
+                        supplied_urls.append(coordinate_url)
+                    unsupported_evidence = [
+                        url for url in supplied_urls if url and url not in sources
+                    ]
+                    if verified_coordinates:
+                        try:
+                            proposed_lat = float(args["lat"])
+                            proposed_lng = float(args["lng"])
+                            coordinate_mismatch = min(
+                                ((proposed_lat - lat) * 111_000) ** 2
+                                + ((proposed_lng - lng) * 85_000) ** 2
+                                for lat, lng in verified_coordinates
+                            ) ** 0.5 > 1_500
+                        except (KeyError, TypeError, ValueError):
+                            coordinate_mismatch = True
+                if unsupported_evidence:
+                    result = {
+                        "error": "unsupported_source_urls",
+                        "detail": "검색·페이지·지오코딩 결과에 실제로 있던 URL만 사용해 다시 호출하세요.",
+                        "unsupported": unsupported_evidence[:6],
+                    }
+                elif coordinate_mismatch:
+                    result = {
+                        "error": "coordinate_not_grounded",
+                        "detail": "제안 좌표가 서버 지오코딩 후보와 1.5km 이상 다릅니다. 확인된 후보 좌표로 다시 호출하세요.",
+                    }
+                else:
+                    seen_tool_calls.add(signature)
+                    result = run_tool(db, name, args, city_id=city_id)
             _collect_tool_sources(name, result, sources)
             tool_results.append({"name": name, "args": args, "result": result})
             if name in WRITE_TOOLS and isinstance(result, dict) and result.get("ok"):
