@@ -4,28 +4,33 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-# 지난시 대략 범위 (Nominatim viewbox: left, top, right, bottom)
-JINAN_VIEWBOX = "116.70,36.95,117.55,36.35"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "JinanTravelMap/0.1 (local travel notes; contact: local-dev)"
+USER_AGENT = "CloudmiddleTravelMap/0.2 (local travel notes; contact: local-dev)"
 
 
-def search_address(query: str, limit: int = 6) -> list[dict[str, Any]]:
+def search_address(
+    query: str,
+    limit: int = 6,
+    *,
+    viewbox: str = "",
+    city_name: str = "",
+) -> list[dict[str, Any]]:
     q = query.strip()
     if not q:
         return []
 
-    params = urllib.parse.urlencode(
-        {
-            "q": q,
+    search_query = f"{q}, {city_name}" if city_name and city_name not in q else q
+    values: dict[str, Any] = {
+            "q": search_query,
             "format": "json",
             "addressdetails": 1,
             "limit": max(1, min(limit, 10)),
-            "viewbox": JINAN_VIEWBOX,
-            "bounded": 0,  # 지난 우선, 결과 없으면 밖도 허용
+            "bounded": 0,
             "accept-language": "ko,zh-CN,en",
-        }
-    )
+    }
+    if viewbox:
+        values["viewbox"] = viewbox
+    params = urllib.parse.urlencode(values)
     req = urllib.request.Request(
         f"{NOMINATIM_URL}?{params}",
         headers={

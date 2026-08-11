@@ -13,6 +13,7 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session, joinedload
 
 from app import storage
+from app.config import settings
 
 from app.events import (
     diff_marker_fields,
@@ -32,6 +33,7 @@ from app.messages import (
 )
 from app.models import (
     AgentSearchLog,
+    AgentSearchResult,
     AgentWebVisit,
     Marker,
     MarkerCategory,
@@ -388,6 +390,15 @@ TOOLS: list[dict[str, Any]] = [
                     "topic": {"type": "string", "description": "영문/숫자 slug, 예: appeal_lessons, jinan_food"},
                     "title": {"type": "string"},
                     "content": {"type": "string", "description": "한국어로 정리된 지식 본문"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "city", "place"],
+                        "description": "공통 지식은 global, 지역 지식은 city, 장소 지식은 place",
+                    },
+                    "city_id": {
+                        "type": ["integer", "null"],
+                        "description": "도시 지식일 때 도시 ID",
+                    },
                     "place_id": {
                         "type": ["integer", "null"],
                         "description": "특정 장소와 연관된 지식일 때만. 없으면 생략하거나 null",
@@ -852,6 +863,8 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         return hits
 
     if name == "merge_places":
+        if not settings.agent_allow_auto_merge:
+            return {"error": "approval_required", "detail": "자동 병합이 비활성화되어 있습니다."}
         target_id = int(args["target_place_id"])
         source_id = int(args["source_place_id"])
         reason = str(args.get("reason") or "same place")
@@ -861,6 +874,8 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         source = db.query(Marker).filter(Marker.id == source_id, Marker.merged_into_id.is_(None)).first()
         if not target or not source:
             return {"error": "not_found"}
+        if target.city_id != source.city_id:
+            return {"error": "cross_city_merge_forbidden"}
         source_title = source.title
         before = {
             "target": marker_snapshot(target),
@@ -1101,6 +1116,8 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         return {"ok": True, "changed": changed}
 
     if name == "create_place":
+        if not settings.agent_allow_auto_create:
+            return {"error": "approval_required", "detail": "자동 장소 생성이 비활성화되어 있습니다."}
         title = str(args.get("title") or "추천 장소")[:200]
         desc = str(args.get("description") or "")[:2000]
         if not _has_hangul(title):
@@ -1126,6 +1143,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             cat = MarkerCategory.other
         m = Marker(
             user_id=None,
+            city_id=1,
             category=cat,
             shape=MarkerShape.point,
             title=title,
@@ -1299,6 +1317,8 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
                 "topic": r.topic,
                 "title": r.title,
                 "content": r.content,
+                "scope": r.scope,
+                "city_id": r.city_id,
                 "place_id": r.place_id,
                 "updated_at": r.updated_at.isoformat() if r.updated_at else None,
             }
@@ -1311,8 +1331,10 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             topic=str(args.get("topic") or "general"),
             title=str(args.get("title") or "교훈"),
             content=str(args.get("content") or ""),
+            scope=str(args.get("scope") or "global"),
+            city_id=int(args["city_id"]) if args.get("city_id") is not None else None,
             place_id=int(args["place_id"]) if args.get("place_id") is not None else None,
-            merge=bool(args.get("merge", True)),
+            merge=bool(args.get("merge", False)),
         )
         db.commit()
         return {"ok": True, "topic": row.topic, "id": row.id, "chars": len(row.content or "")}
@@ -1344,10 +1366,12 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             return {"error": str(exc), "results": []}
 
         hrefs = [r.get("href") or "" for r in results]
-        seen_urls = {
-            row.url
-            for row in db.query(AgentWebVisit.url).filter(AgentWebVisit.url.in_(hrefs)).all()
-        } if hrefs else set()
+        known_rows = (
+            db.query(AgentSearchResult).filter(AgentSearchResult.url.in_(hrefs)).all()
+            if hrefs else []
+        )
+        known_by_url = {row.url: row for row in known_rows}
+        seen_urls = set(known_by_url)
         out = [
             {
                 "title": r.get("title"),
@@ -1363,6 +1387,18 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             .order_by(AgentSearchLog.searched_at.desc())
             .all()
         )
+        for item in results:
+            url = item.get("href") or ""
+            if not url:
+                continue
+            existing = known_by_url.get(url)
+            if existing:
+                existing.seen_count += 1
+                existing.last_seen_at = datetime.now(timezone.utc)
+                if item.get("title") and not existing.title:
+                    existing.title = str(item["title"])[:300]
+            else:
+                db.add(AgentSearchResult(url=url[:1000], title=str(item.get("title") or "")[:300]))
         db.add(
             AgentSearchLog(
                 query=query[:300],

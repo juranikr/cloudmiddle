@@ -164,6 +164,8 @@ def admin_knowledge(
             topic=r.topic,
             title=r.title,
             content=r.content or "",
+            scope=r.scope,
+            city_id=r.city_id,
             place_id=r.place_id,
             created_at=r.created_at,
             updated_at=r.updated_at,

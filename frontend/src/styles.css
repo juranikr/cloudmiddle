@@ -1348,6 +1348,57 @@ textarea {
   margin-top: 2px;
 }
 .map-side__brand-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.city-select { display: grid; gap: 6px; margin-top: 12px; }
+.city-select span { color: #64748b; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; }
+.city-select select {
+  width: 100%;
+  border: 1px solid #d7dfdc;
+  border-radius: 12px;
+  background: #fff;
+  color: #17352f;
+  padding: 10px 12px;
+  font: inherit;
+  font-weight: 700;
+}
+
+.city-home {
+  min-height: 100dvh;
+  padding: clamp(28px, 6vw, 80px);
+  background:
+    radial-gradient(circle at 15% 15%, rgba(205, 232, 222, 0.85), transparent 34%),
+    linear-gradient(145deg, #f7f2e7 0%, #eef6f1 55%, #dbeae4 100%);
+  color: #17352f;
+}
+.city-home__header { display: flex; justify-content: space-between; gap: 24px; max-width: 1080px; margin: 0 auto 42px; }
+.city-home__header p { margin: 0 0 10px; color: #a35e35; font-size: 0.74rem; font-weight: 800; letter-spacing: 0.16em; }
+.city-home__header h1 { margin: 0 0 10px; font-size: clamp(2rem, 5vw, 4.3rem); line-height: 1.03; letter-spacing: -0.055em; }
+.city-home__header span { color: #54706a; }
+.city-home__error { max-width: 1080px; margin: 0 auto 20px; color: var(--danger); }
+.city-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; max-width: 1080px; margin: 0 auto; }
+.city-card {
+  min-height: 300px;
+  padding: clamp(24px, 4vw, 46px);
+  border: 1px solid rgba(23, 53, 47, 0.12);
+  border-radius: 28px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 22px 55px rgba(45, 70, 61, 0.12);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 180ms ease, box-shadow 180ms ease;
+}
+.city-card:hover { transform: translateY(-5px); box-shadow: 0 28px 70px rgba(45, 70, 61, 0.18); }
+.city-card__local { display: block; color: #a35e35; font-family: serif; font-size: clamp(2rem, 5vw, 4rem); }
+.city-card strong { display: block; margin-top: 4px; font-size: clamp(1.5rem, 3vw, 2.5rem); }
+.city-card small { display: block; margin-top: 18px; color: #0f766e; font-size: 0.9rem; font-weight: 800; }
+.city-card em { display: block; max-width: 25rem; margin-top: 42px; color: #637771; font-style: normal; line-height: 1.55; }
+@media (max-width: 680px) {
+  .city-home { padding: 24px 18px 40px; }
+  .city-home__header { align-items: flex-start; margin-bottom: 28px; }
+  .city-grid { grid-template-columns: 1fr; }
+  .city-card { min-height: 230px; }
+}
 .link-btn {
   border: 0;
   background: transparent;
@@ -1417,7 +1468,7 @@ textarea {
 }
 .gnb button.is-active { color: var(--teal-deep); background: rgba(15, 118, 110, 0.1); }
 .gnb__msg.has-unread span::after {
-  content: ";
+  content: "";
   display: inline-block;
   width: 6px;
   height: 6px;

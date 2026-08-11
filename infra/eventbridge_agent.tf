@@ -84,7 +84,7 @@ resource "aws_iam_role_policy" "events_ecs" {
 resource "aws_cloudwatch_event_rule" "agent_daily" {
   name                = "${local.name_prefix}-agent-daily"
   description         = "Daily Groq map curator"
-  schedule_expression = "cron(0 2,10,18 * * ? *)" # KST 11:00, 19:00, 03:00
+  schedule_expression = "cron(0 18 * * ? *)" # KST 03:00
 }
 
 resource "aws_cloudwatch_event_target" "agent_daily" {

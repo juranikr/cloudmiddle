@@ -31,7 +31,7 @@ import {
   saveLocateOn,
 } from "../mapStorage";
 import { getCategoryIcon, getSearchResultIcon } from "../markerIcons";
-import type { LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
+import type { City, LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape } from "../types";
 
 const JINAN_CENTER: [number, number] = [36.65, 117.12];
 const DEFAULT_ZOOM = 12;
@@ -90,6 +90,15 @@ function FlyToPoint({ target, zoom = 16 }: { target: LatLng | null; zoom?: numbe
   return null;
 }
 
+function CityViewport({ city }: { city: City | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!city) return;
+    map.setView([city.center_lat, city.center_lng], city.default_zoom, { animate: false });
+  }, [city, map]);
+  return null;
+}
+
 function centroid(points: LatLng[]): LatLng {
   const lat = points.reduce((s, p) => s + p.lat, 0) / points.length;
   const lng = points.reduce((s, p) => s + p.lng, 0) / points.length;
@@ -98,6 +107,11 @@ function centroid(points: LatLng[]): LatLng {
 
 export default function MapPage() {
   const { token, user, logout } = useAuth();
+  const [cities, setCities] = useState<City[]>([]);
+  const [selectedCityId, setSelectedCityId] = useState<number>(() => {
+    const saved = Number(window.localStorage.getItem("cloudmiddle.city_id"));
+    return Number.isInteger(saved) && saved > 0 ? saved : 0;
+  });
   const [markers, setMarkers] = useState<MarkerItem[]>([]);
   const [categoryFilter, setCategoryFilter] = useState<MarkerCategory | null>(null);
   const [favoritesOnly, setFavoritesOnly] = useState(false);
@@ -140,6 +154,33 @@ export default function MapPage() {
   }, []);
   const ignoreNextClick = useRef(false);
   const searchIcon = useMemo(() => getSearchResultIcon(), []);
+  const selectedCity = useMemo(
+    () => cities.find((city) => city.id === selectedCityId) ?? null,
+    [cities, selectedCityId],
+  );
+
+  useEffect(() => {
+    if (!token) return;
+    void api.fetchCities(token).then((data) => {
+      setCities(data);
+      if (selectedCityId > 0 && !data.some((city) => city.id === selectedCityId)) {
+        setSelectedCityId(0);
+      }
+    }).catch((err) => setError(err instanceof Error ? err.message : "도시 목록을 불러오지 못했습니다."));
+  }, [token]);
+
+  useEffect(() => {
+    if (selectedCityId > 0) {
+      window.localStorage.setItem("cloudmiddle.city_id", String(selectedCityId));
+    } else {
+      window.localStorage.removeItem("cloudmiddle.city_id");
+    }
+    setCategoryFilter(null);
+    setSearchHits([]);
+    setSearchPin(null);
+    setSelected(null);
+    setPanelMode(null);
+  }, [selectedCityId]);
 
   useEffect(() => {
     if (!token) return;
@@ -147,11 +188,12 @@ export default function MapPage() {
   }, [token]);
 
   const loadMarkers = useCallback(async () => {
-    if (!token) return;
+    if (!token || !selectedCityId) return;
     setLoading(true);
     setError("");
     try {
       const data = await api.fetchMarkers(token, {
+        cityId: selectedCityId,
         category: categoryFilter,
         favoritesOnly,
         agentSuggestedOnly,
@@ -162,7 +204,7 @@ export default function MapPage() {
     } finally {
       setLoading(false);
     }
-  }, [token, categoryFilter, favoritesOnly, agentSuggestedOnly]);
+  }, [token, selectedCityId, categoryFilter, favoritesOnly, agentSuggestedOnly]);
 
   useEffect(() => {
     void loadMarkers();
@@ -246,7 +288,7 @@ export default function MapPage() {
 
   async function handleCreate(payload: MarkerPayload) {
     if (!token) return;
-    await api.createMarker(token, payload);
+    await api.createMarker(token, { ...payload, city_id: selectedCityId });
     closePanel();
     await loadMarkers();
   }
@@ -557,6 +599,32 @@ export default function MapPage() {
     />
   ) : null;
 
+  if (!selectedCity) {
+    return (
+      <main className="city-home">
+        <header className="city-home__header">
+          <div>
+            <p>CHINA TRAVEL NOTES</p>
+            <h1>어느 도시를 여행할까요?</h1>
+            <span>{user?.display_name}님의 여행 지도를 선택하세요.</span>
+          </div>
+          <button type="button" className="link-btn" onClick={logout}>로그아웃</button>
+        </header>
+        {error ? <p className="city-home__error">{error}</p> : null}
+        <section className="city-grid" aria-label="여행 도시 선택">
+          {cities.map((city) => (
+            <button key={city.id} type="button" className="city-card" onClick={() => setSelectedCityId(city.id)}>
+              <span className="city-card__local">{city.name_local}</span>
+              <strong>{city.name_ko}</strong>
+              <small>{city.place_count > 0 ? `저장된 장소 ${city.place_count}곳` : "새 여행 준비하기"}</small>
+              <em>{city.slug === "shenyang" ? "청 왕조의 시작과 근대 동북의 역사" : "샘과 골목, 산둥의 오래된 도시"}</em>
+            </button>
+          ))}
+        </section>
+      </main>
+    );
+  }
+
   return (
     <div className={`map-app ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""}`}>
       <aside className="map-side">
@@ -575,12 +643,27 @@ export default function MapPage() {
               <button type="button" className="link-btn" onClick={() => setInboxOpen(true)}>
                 메시지{unreadMsg ? ` (${unreadMsg})` : ""}
               </button>
+              <button type="button" className="link-btn" onClick={() => setSelectedCityId(0)}>
+                도시 변경
+              </button>
               <button type="button" className="link-btn" onClick={logout}>
                 로그아웃
               </button>
             </div>
           </div>
-          {token ? <AddressSearch token={token} onResults={handleSearchResults} /> : null}
+          <label className="city-select">
+            <span>여행 도시</span>
+            <select value={selectedCityId} onChange={(e) => setSelectedCityId(Number(e.target.value))}>
+              {cities.map((city) => (
+                <option key={city.id} value={city.id}>
+                  {city.name_ko} {city.name_local} · {city.place_count}곳
+                </option>
+              ))}
+            </select>
+          </label>
+          {token && selectedCity ? (
+            <AddressSearch token={token} cityId={selectedCity.id} onResults={handleSearchResults} />
+          ) : null}
           {filterChips}
           {modeToggle}
           <div className="desktop-only">{toolsBlock}</div>
@@ -647,6 +730,7 @@ export default function MapPage() {
             maxNativeZoom={19}
           />
           <MapVisualFix />
+          <CityViewport city={selectedCity} />
           <MapViewPersistence />
           <FlyToPoint target={flyTarget} />
           <UserLocation
@@ -745,6 +829,9 @@ export default function MapPage() {
                 관리자
               </a>
             ) : null}
+            <button type="button" onClick={() => setSelectedCityId(0)}>
+              도시 변경
+            </button>
             <button type="button" onClick={logout}>
               로그아웃
             </button>

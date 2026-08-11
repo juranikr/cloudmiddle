@@ -182,9 +182,18 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         }
 
     unread_before = count_unread(db)
+    if unread_before == 0 and not settings.agent_autonomous_research:
+        return {
+            "ok": True,
+            "steps": 0,
+            "message": "처리할 사용자 작업이 없어 종료했습니다. 자율 웹 조사는 비활성화되어 있습니다.",
+            "unread_before": 0,
+            "unread_after": 0,
+            "tool_counts": {},
+        }
     queue = _work_queue(db)
     research_only = unread_before == 0
-    kb = knowledge_brief(db, limit=12)
+    kb = knowledge_brief(db, limit=12, city_id=1)
     kb_hint = json.dumps(kb, ensure_ascii=False)[:4000] if kb else "[]"
 
     from groq import Groq
@@ -198,7 +207,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         steps_limit = max(base_steps, 110)
     else:
         # 큐 처리 후 필수 웹 조사 분량(~30스텝) 포함
-        steps_limit = max(base_steps, min(140, 40 + unread_before * 4))
+        steps_limit = max(base_steps, min(48, 8 + unread_before * 4))
 
     if research_only:
         user_msg = (
@@ -253,8 +262,16 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "일부만 처리하고 끝내면 실패다."
         )
 
+    runtime_policy = ""
+    if not settings.agent_autonomous_research:
+        runtime_policy = (
+            "\n\n【현재 운영 안전 모드 — 위의 연구 할당보다 우선】\n"
+            "- 사용자 작업 큐만 처리한다. 자율 웹 조사, 신규 장소 발굴, 사진 보강, 작업량 채우기를 하지 않는다.\n"
+            "- 자동 장소 생성과 자동 병합은 비활성화되어 있다. 해당 조치가 필요하면 근거만 요약한다.\n"
+            "- 큐가 비면 즉시 종료한다. 스텝을 채우는 것은 목표가 아니다.\n"
+        )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": SYSTEM + runtime_policy},
         {"role": "user", "content": user_msg},
     ]
 
@@ -322,7 +339,12 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                         }
                     )
                     continue
-                if "fetch_page" not in used_tools and research_nudges < 2 and steps < steps_limit:
+                if (
+                    settings.agent_autonomous_research
+                    and "fetch_page" not in used_tools
+                    and research_nudges < 2
+                    and steps < steps_limit
+                ):
                     research_nudges += 1
                     messages.append(
                         {
@@ -351,7 +373,11 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                     )
                     continue
                 # 스텝 여유가 큰데 조기 종료하려는 경우: 잔여 할당량을 채우도록 계속시킨다
-                if volume_nudges < 3 and steps < int(steps_limit * 0.6):
+                if (
+                    settings.agent_autonomous_research
+                    and volume_nudges < 3
+                    and steps < int(steps_limit * 0.6)
+                ):
                     volume_nudges += 1
                     done_brief = ", ".join(
                         f"{t} {c}회"

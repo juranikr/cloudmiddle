@@ -77,6 +77,25 @@ class User(Base):
     favorites: Mapped[list["PlaceFavorite"]] = relationship(back_populates="user")
 
 
+class City(Base):
+    __tablename__ = "cities"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
+    name_ko: Mapped[str] = mapped_column(String(100), nullable=False)
+    name_local: Mapped[str] = mapped_column(String(100), nullable=False)
+    country_code: Mapped[str] = mapped_column(String(2), default="CN", nullable=False)
+    center_lat: Mapped[float] = mapped_column(Float, nullable=False)
+    center_lng: Mapped[float] = mapped_column(Float, nullable=False)
+    default_zoom: Mapped[int] = mapped_column(Integer, default=12, nullable=False)
+    search_viewbox: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    markers: Mapped[list["Marker"]] = relationship(back_populates="city")
+
+
 class Marker(Base):
     """공유 장소(핀/구역). 단일 소유자 모델이 아니라 기여자 집합으로 관리."""
 
@@ -86,6 +105,9 @@ class Marker(Base):
     # 최초 등록자(참고용). 수정 권한은 로그인 사용자 전원.
     user_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    city_id: Mapped[int] = mapped_column(
+        ForeignKey("cities.id", ondelete="RESTRICT"), index=True, nullable=False, default=1
     )
     category: Mapped[MarkerCategory] = mapped_column(
         Enum(
@@ -126,6 +148,7 @@ class Marker(Base):
     )
 
     creator: Mapped[Optional[User]] = relationship(back_populates="markers")
+    city: Mapped[City] = relationship(back_populates="markers")
     contributors: Mapped[list["PlaceContributor"]] = relationship(
         back_populates="place", cascade="all, delete-orphan"
     )
@@ -264,6 +287,10 @@ class AgentKnowledge(Base):
     topic: Mapped[str] = mapped_column(String(120), unique=True, index=True, nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    scope: Mapped[str] = mapped_column(String(20), default="global", nullable=False, index=True)
+    city_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("cities.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     place_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
     )
@@ -284,6 +311,21 @@ class AgentSearchLog(Base):
     new_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     searched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class AgentSearchResult(Base):
+    """URLs observed in search results, including pages the agent did not open."""
+
+    __tablename__ = "agent_search_results"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    url: Mapped[str] = mapped_column(String(1000), unique=True, index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    seen_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 

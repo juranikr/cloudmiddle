@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.admin_api import router as admin_router
@@ -25,6 +26,7 @@ from app.geocode import search_address
 from app.messages import create_appeal
 from app.migrate import ensure_schema
 from app.models import (
+    City,
     PlaceFavorite,
     Marker,
     MarkerCategory,
@@ -44,6 +46,7 @@ from app.schemas import (
     AgentRunResponse,
     AppealCreate,
     AppealOut,
+    CityOut,
     GeocodeResult,
     ImageReorderRequest,
     ImageUploadRequest,
@@ -65,7 +68,7 @@ from app.seed import seed_data
 from app.share_import import import_share_text
 from app import storage
 
-app = FastAPI(title="Jinan Travel Map API", version="0.2.0")
+app = FastAPI(title="Cloudmiddle China Travel Map API", version="0.3.0")
 app.include_router(admin_router)
 
 app.add_middleware(
@@ -121,6 +124,7 @@ def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
     ]
     return MarkerOut(
         id=marker.id,
+        city_id=marker.city_id,
         user_id=marker.user_id,
         author_name=names[0] if names else (marker.creator.display_name if marker.creator else "공유"),
         contributor_names=names,
@@ -158,14 +162,52 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/api/cities", response_model=list[CityOut])
+def list_cities(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[CityOut]:
+    _ = current_user
+    counts = dict(
+        db.query(Marker.city_id, func.count(Marker.id))
+        .filter(Marker.merged_into_id.is_(None))
+        .group_by(Marker.city_id)
+        .all()
+    )
+    rows = db.query(City).filter(City.status == "active").order_by(City.sort_order, City.id).all()
+    return [
+        CityOut(
+            id=city.id,
+            slug=city.slug,
+            name_ko=city.name_ko,
+            name_local=city.name_local,
+            country_code=city.country_code,
+            center_lat=city.center_lat,
+            center_lng=city.center_lng,
+            default_zoom=city.default_zoom,
+            status=city.status,
+            place_count=int(counts.get(city.id, 0)),
+        )
+        for city in rows
+    ]
+
+
 @app.get("/api/geocode", response_model=list[GeocodeResult])
 def geocode(
     q: str = Query(..., min_length=1, max_length=200),
+    city_id: int = Query(1, gt=0),
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[GeocodeResult]:
     _ = current_user
+    city = db.query(City).filter(City.id == city_id, City.status == "active").first()
+    if city is None:
+        raise HTTPException(status_code=404, detail="도시를 찾을 수 없습니다")
     try:
-        return [GeocodeResult(**item) for item in search_address(q)]
+        return [
+            GeocodeResult(**item)
+            for item in search_address(q, viewbox=city.search_viewbox, city_name=city.name_local)
+        ]
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -217,6 +259,7 @@ def me(current_user: User = Depends(get_current_user)) -> UserOut:
 
 @app.get("/api/markers", response_model=list[MarkerOut])
 def list_markers(
+    city_id: int = Query(1, gt=0),
     category: Optional[MarkerCategory] = Query(None),
     favorites_only: bool = Query(False),
     agent_suggested_only: bool = Query(False),
@@ -235,6 +278,7 @@ def list_markers(
             joinedload(Marker.images),
         )
         .filter(Marker.merged_into_id.is_(None))
+        .filter(Marker.city_id == city_id)
     )
     if category is not None:
         q = q.filter(Marker.category == category)
@@ -254,6 +298,8 @@ def create_marker(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> MarkerOut:
+    if db.query(City.id).filter(City.id == body.city_id, City.status == "active").first() is None:
+        raise HTTPException(status_code=404, detail="도시를 찾을 수 없습니다")
     lat, lng = body.lat, body.lng
     polygon_json: Optional[str] = None
     if body.shape == MarkerShape.polygon and body.polygon:
@@ -262,6 +308,7 @@ def create_marker(
 
     marker = Marker(
         user_id=current_user.id,
+        city_id=body.city_id,
         category=body.category,
         shape=body.shape,
         title=body.title.strip(),

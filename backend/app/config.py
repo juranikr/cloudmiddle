@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
     agent_max_steps: int = 12
+    agent_autonomous_research: bool = False
+    agent_allow_auto_create: bool = False
+    agent_allow_auto_merge: bool = False
     # 쉼표 구분. 기본: 성주한
     admin_emails: str = "joohan92@naver.com"
 

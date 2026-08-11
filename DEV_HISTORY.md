@@ -4,13 +4,13 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-07-27 (KST) — 사이클당 작업량 대폭 확대 (스텝 110/140)
+최종 갱신: 2026-08-11 (KST) — 로컬 복구, 도시 분리, 에이전트 안전 모드
 
 ---
 
 ## 1) 한 줄 요약
 
-한국 여행자를 위한 **중국 지난(济南) 중심 공유 여행 지도** 웹앱.  
+한국 여행자를 위한 **중국 도시별 공유 여행 지도** 웹앱. 지난(济南)과 선양(沈阳)을 지원.
 핀/구역 마커, JWT 로그인, 로컬 SQLite / AWS Postgres, CloudFront HTTPS로 원격 서비스 중.
 
 ---
@@ -174,6 +174,17 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-08-11 — 로컬 기준선 복구 + 지난/선양 분리 + 에이전트 안전 모드
+- 원인 확인: Cursor가 `%TEMP%` 임시 clone에서 32개 커밋을 push해 원래 `cloudmiddle` 로컬만 뒤처짐
+- 로컬 `main`을 `origin/main` `ca4a620`으로 fast-forward; 미추적 `backend/scripts/` 보존
+- `cities` 테이블과 `markers.city_id` 추가; 기존 운영 장소는 지난(id=1)으로 자동 백필
+- 지난·선양 도시 API, 도시 선택 UI, 도시별 장소 목록·지도 중심·검색 viewbox 적용
+- 에이전트 안전 기본값: 무작업 자율 조사 중단, 자동 장소 생성/병합 차단, 큐 스텝 상한 축소
+- 검색 결과 URL 전체를 `agent_search_results`에 저장해 반복 검색의 가짜 `new_count` 수정
+- `cycle_*` 지식을 `operations_lessons`로 통합하고 기본 append 누적 중단
+- EventBridge 에이전트 스케줄 하루 3회 → KST 03:00 하루 1회
+- 검증: Python compileall, 로컬 SQLite 레거시 마이그레이션, 실제 FastAPI 도시/장소 API, 프런트 프로덕션 빌드 성공
 
 ### 2026-07-27 — 사이클당 작업량 대폭 확대
 - 스텝 한도: 연구 사이클 45 → 110, 큐 사이클 상한 56 → 140 (40 + 건당 4)

@@ -2,6 +2,7 @@ import type {
   AdminAgentAction,
   AdminKnowledge,
   AdminStatus,
+  City,
   MarkerItem,
   MarkerPayload,
   PlaceEventItem,
@@ -74,15 +75,21 @@ export async function fetchMe(token: string): Promise<User> {
 
 export async function fetchMarkers(
   token: string,
-  opts?: { category?: string | null; favoritesOnly?: boolean; agentSuggestedOnly?: boolean },
+  opts: { cityId: number; category?: string | null; favoritesOnly?: boolean; agentSuggestedOnly?: boolean },
 ): Promise<MarkerItem[]> {
   const q = new URLSearchParams();
+  q.set("city_id", String(opts.cityId));
   if (opts?.category) q.set("category", opts.category);
   if (opts?.favoritesOnly) q.set("favorites_only", "true");
   if (opts?.agentSuggestedOnly) q.set("agent_suggested_only", "true");
   const qs = q.toString();
   const res = await request(`/api/markers${qs ? `?${qs}` : ""}`, { headers: authHeaders(token) });
   return handle<MarkerItem[]>(res);
+}
+
+export async function fetchCities(token: string): Promise<City[]> {
+  const res = await request("/api/cities", { headers: authHeaders(token) });
+  return handle<City[]>(res);
 }
 
 export async function uploadPlaceImage(
@@ -156,8 +163,8 @@ export async function fetchMarkerEvents(token: string, id: number): Promise<Plac
   return handle<PlaceEventItem[]>(res);
 }
 
-export async function geocode(token: string, q: string): Promise<GeocodeHit[]> {
-  const params = new URLSearchParams({ q });
+export async function geocode(token: string, q: string, cityId: number): Promise<GeocodeHit[]> {
+  const params = new URLSearchParams({ q, city_id: String(cityId) });
   const res = await request(`/api/geocode?${params}`, {
     headers: authHeaders(token),
   });

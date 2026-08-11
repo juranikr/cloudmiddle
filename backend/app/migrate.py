@@ -9,8 +9,44 @@ def ensure_schema() -> None:
     tables = set(insp.get_table_names())
 
     with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            conn.execute(text("""
+                INSERT INTO cities (id, slug, name_ko, name_local, country_code, center_lat, center_lng,
+                                    default_zoom, search_viewbox, status, sort_order)
+                VALUES
+                  (1, 'jinan', '지난', '济南', 'CN', 36.6512, 117.1201, 12,
+                   '116.70,36.95,117.55,36.35', 'active', 10),
+                  (2, 'shenyang', '선양', '沈阳', 'CN', 41.8057, 123.4315, 12,
+                   '122.85,42.15,123.85,41.45', 'active', 20)
+                ON CONFLICT (id) DO UPDATE SET
+                  slug = EXCLUDED.slug, name_ko = EXCLUDED.name_ko, name_local = EXCLUDED.name_local,
+                  center_lat = EXCLUDED.center_lat, center_lng = EXCLUDED.center_lng,
+                  default_zoom = EXCLUDED.default_zoom, search_viewbox = EXCLUDED.search_viewbox,
+                  status = EXCLUDED.status, sort_order = EXCLUDED.sort_order
+            """))
+            conn.execute(text("""
+                SELECT setval(pg_get_serial_sequence('cities', 'id'),
+                              GREATEST((SELECT max(id) FROM cities), 1), true)
+            """))
+        else:
+            conn.execute(text("""
+                INSERT OR IGNORE INTO cities
+                  (id, slug, name_ko, name_local, country_code, center_lat, center_lng,
+                   default_zoom, search_viewbox, status, sort_order)
+                VALUES
+                  (1, 'jinan', '지난', '济南', 'CN', 36.6512, 117.1201, 12,
+                   '116.70,36.95,117.55,36.35', 'active', 10),
+                  (2, 'shenyang', '선양', '沈阳', 'CN', 41.8057, 123.4315, 12,
+                   '122.85,42.15,123.85,41.45', 'active', 20)
+            """))
         if "markers" in tables:
             cols = {c["name"] for c in insp.get_columns("markers")}
+            if "city_id" not in cols:
+                conn.execute(text("ALTER TABLE markers ADD COLUMN city_id INTEGER DEFAULT 1"))
+                conn.execute(text("UPDATE markers SET city_id = 1 WHERE city_id IS NULL"))
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("ALTER TABLE markers ALTER COLUMN city_id SET NOT NULL"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_markers_city_id ON markers (city_id)"))
             if "shape" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN shape VARCHAR(20) DEFAULT 'point' NOT NULL"))
             if "polygon" not in cols:
@@ -34,6 +70,15 @@ def ensure_schema() -> None:
                         f"ALTER TABLE markers ADD COLUMN is_agent_suggested BOOLEAN DEFAULT {default} NOT NULL"
                     )
                 )
+
+        if "agent_knowledge" in tables:
+            knowledge_cols = {c["name"] for c in insp.get_columns("agent_knowledge")}
+            if "scope" not in knowledge_cols:
+                conn.execute(text("ALTER TABLE agent_knowledge ADD COLUMN scope VARCHAR(20) DEFAULT 'global' NOT NULL"))
+            if "city_id" not in knowledge_cols:
+                conn.execute(text("ALTER TABLE agent_knowledge ADD COLUMN city_id INTEGER"))
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_knowledge_city_id ON agent_knowledge (city_id)"))
 
         # 기여자 백필: 기존 markers.user_id → place_contributors
         tables_now = set(inspect(engine).get_table_names())

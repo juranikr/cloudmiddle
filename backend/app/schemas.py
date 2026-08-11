@@ -11,6 +11,19 @@ class LatLng(BaseModel):
     lng: float = Field(ge=-180, le=180)
 
 
+class CityOut(BaseModel):
+    id: int
+    slug: str
+    name_ko: str
+    name_local: str
+    country_code: str
+    center_lat: float
+    center_lng: float
+    default_zoom: int
+    status: str
+    place_count: int = 0
+
+
 class GeocodeResult(BaseModel):
     display_name: str
     lat: float
@@ -57,6 +70,7 @@ class UserOut(BaseModel):
 
 
 class MarkerCreate(BaseModel):
+    city_id: int = Field(default=1, gt=0)
     category: MarkerCategory
     title: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
@@ -92,6 +106,7 @@ class PlaceImageOut(BaseModel):
 
 class MarkerOut(BaseModel):
     id: int
+    city_id: int
     user_id: Optional[int] = None
     author_name: str = ""
     contributor_names: list[str] = []
@@ -185,6 +200,8 @@ class AgentKnowledgeOut(BaseModel):
     topic: str
     title: str
     content: str
+    scope: str = "global"
+    city_id: Optional[int] = None
     place_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime

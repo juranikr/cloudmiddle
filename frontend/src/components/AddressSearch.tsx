@@ -4,11 +4,12 @@ import type { GeocodeHit } from "../api";
 
 interface Props {
   token: string;
+  cityId: number;
   onResults: (hits: GeocodeHit[], error: string) => void;
   onQueryChange?: (q: string) => void;
 }
 
-export default function AddressSearch({ token, onResults, onQueryChange }: Props) {
+export default function AddressSearch({ token, cityId, onResults, onQueryChange }: Props) {
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -18,7 +19,7 @@ export default function AddressSearch({ token, onResults, onQueryChange }: Props
     if (!query) return;
     setBusy(true);
     try {
-      const data = await api.geocode(token, query);
+      const data = await api.geocode(token, query, cityId);
       onResults(data, data.length === 0 ? "검색 결과가 없습니다. 지명·영문명을 섞어 보세요." : "");
     } catch (err) {
       onResults([], err instanceof Error ? err.message : "검색 실패");

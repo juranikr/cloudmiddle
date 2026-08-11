@@ -15,6 +15,19 @@ export interface LatLng {
   lng: number;
 }
 
+export interface City {
+  id: number;
+  slug: string;
+  name_ko: string;
+  name_local: string;
+  country_code: string;
+  center_lat: number;
+  center_lng: number;
+  default_zoom: number;
+  status: string;
+  place_count: number;
+}
+
 export interface User {
   id: number;
   email: string;
@@ -77,6 +90,7 @@ export interface PlaceImage {
 
 export interface MarkerItem {
   id: number;
+  city_id: number;
   user_id: number | null;
   author_name: string;
   contributor_names: string[];
@@ -96,6 +110,7 @@ export interface MarkerItem {
 }
 
 export interface MarkerPayload {
+  city_id?: number;
   category: MarkerCategory;
   title: string;
   description: string;
@@ -122,6 +137,8 @@ export interface AdminKnowledge {
   topic: string;
   title: string;
   content: string;
+  scope?: "global" | "city" | "place";
+  city_id?: number | null;
   place_id: number | null;
   created_at: string;
   updated_at: string;
