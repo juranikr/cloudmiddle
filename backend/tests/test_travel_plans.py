@@ -122,6 +122,8 @@ class SharedTravelPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(result.days, [])
+        self.assertIsNone(result.start_date)
+        self.assertIsNone(result.end_date)
         self.assertEqual([row.id for row in result.unscheduled_items], [item.id])
         stored = self.db.get(TravelPlanItem, item.id)
         self.assertIsNone(stored.plan_day_id if stored else None)

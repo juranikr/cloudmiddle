@@ -191,6 +191,24 @@ def ensure_schema() -> None:
                         "REFERENCES travel_plans(id) ON DELETE CASCADE"
                     )
                 )
+
+            # Keep denormalized post/listing date bounds derived from the real
+            # date rows, including after an older deployment removed a day.
+            conn.execute(
+                text(
+                    """
+                    UPDATE travel_plans
+                    SET start_date = (
+                          SELECT MIN(d.calendar_date) FROM travel_plan_days d
+                          WHERE d.plan_id = travel_plans.id
+                        ),
+                        end_date = (
+                          SELECT MAX(d.calendar_date) FROM travel_plan_days d
+                          WHERE d.plan_id = travel_plans.id
+                        )
+                    """
+                )
+            )
             if "plan_day_id" not in plan_item_cols:
                 conn.execute(
                     text(

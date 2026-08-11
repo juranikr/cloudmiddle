@@ -1221,10 +1221,14 @@ def _get_city_shared_plan(db: Session, city_id: int, current_user: User) -> Trav
     return plan
 
 
-def _sync_plan_date_bounds(plan: TravelPlan) -> None:
-    dates = [day.calendar_date for day in plan.days]
-    plan.start_date = min(dates) if dates else None
-    plan.end_date = max(dates) if dates else None
+def _sync_plan_date_bounds(db: Session, plan: TravelPlan) -> None:
+    start_date, end_date = (
+        db.query(func.min(TravelPlanDay.calendar_date), func.max(TravelPlanDay.calendar_date))
+        .filter(TravelPlanDay.plan_id == plan.id)
+        .one()
+    )
+    plan.start_date = start_date
+    plan.end_date = end_date
     plan.updated_at = datetime.now(timezone.utc)
 
 
@@ -1374,7 +1378,7 @@ def create_travel_plan_day(
         raise HTTPException(status_code=409, detail="이미 일정표에 추가된 날짜입니다") from exc
     plan = _load_travel_plan(db, plan.id)
     assert plan is not None
-    _sync_plan_date_bounds(plan)
+    _sync_plan_date_bounds(db, plan)
     db.commit()
     plan = _load_travel_plan(db, plan.id)
     assert plan is not None
@@ -1403,7 +1407,7 @@ def update_travel_plan_day(
         raise HTTPException(status_code=409, detail="이미 일정표에 추가된 날짜입니다") from exc
     plan = _load_travel_plan(db, plan.id)
     assert plan is not None
-    _sync_plan_date_bounds(plan)
+    _sync_plan_date_bounds(db, plan)
     db.commit()
     plan = _load_travel_plan(db, plan.id)
     assert plan is not None
@@ -1428,7 +1432,7 @@ def delete_travel_plan_day(
     db.flush()
     plan = _load_travel_plan(db, plan.id)
     assert plan is not None
-    _sync_plan_date_bounds(plan)
+    _sync_plan_date_bounds(db, plan)
     db.commit()
     plan = _load_travel_plan(db, plan.id)
     assert plan is not None
