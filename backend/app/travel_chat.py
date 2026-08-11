@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
-from app.models import City, Marker, MarkerShape, TravelChatMessage, TravelPlanItem
+from app.models import City, Marker, MarkerShape, TravelChatMessage, TravelPlan, TravelPlanItem
 from app.personalization import build_user_travel_profile, profile_prompt_context
 
 
@@ -574,18 +574,31 @@ def _marker_context(db: Session, city_id: int) -> tuple[list[Marker], str]:
 def _plan_context(db: Session, *, user_id: int, city_id: int) -> str:
     rows = (
         db.query(TravelPlanItem)
-        .options(joinedload(TravelPlanItem.place).joinedload(Marker.zone))
-        .filter(TravelPlanItem.user_id == user_id, TravelPlanItem.city_id == city_id)
-        .order_by(TravelPlanItem.day, TravelPlanItem.sort_order, TravelPlanItem.id)
+        .join(TravelPlan, TravelPlan.id == TravelPlanItem.plan_id)
+        .options(
+            joinedload(TravelPlanItem.place).joinedload(Marker.zone),
+            joinedload(TravelPlanItem.plan_day),
+            joinedload(TravelPlanItem.creator),
+        )
+        .filter(
+            TravelPlanItem.city_id == city_id,
+            TravelPlan.visibility == "city_shared",
+            TravelPlan.status != "archived",
+        )
+        .order_by(TravelPlanItem.plan_day_id, TravelPlanItem.start_time, TravelPlanItem.sort_order, TravelPlanItem.id)
         .all()
     )
     return json.dumps(
         [
             {
-                "day": row.day,
-                "slot": row.slot,
+                "date": row.plan_day.calendar_date.isoformat() if row.plan_day else None,
+                "start_time": row.start_time.isoformat(timespec="minutes") if row.start_time else None,
+                "end_time": row.end_time.isoformat(timespec="minutes") if row.end_time else None,
+                "legacy_day": row.day if row.plan_day is None else None,
+                "legacy_slot": row.slot if row.plan_day is None else None,
                 "place_id": row.place_id,
                 "title": row.place.title if row.place else "",
+                "added_by": row.creator.display_name if row.creator else "",
                 "zone": row.place.zone.title if row.place and row.place.zone else "",
                 "lat": round(row.place.lat, 6) if row.place else None,
                 "lng": round(row.place.lng, 6) if row.place else None,
@@ -686,7 +699,7 @@ def answer_travel_chat(
 - 근거가 부족하면 모른다고 말하고 확인 방법을 제시한다. 도구의 내부 JSON은 노출하지 않는다.
 
 현재 지도 DB: {map_context}
-현재 사용자 일정: {_plan_context(db, user_id=user_id, city_id=city_id)}
+현재 도시 공용 일정표: {_plan_context(db, user_id=user_id, city_id=city_id)}
 현재 사용자 여행 행동 프로필: {profile_prompt_context(travel_profile)}
 현재 선택 장소 ID: {selected_place_id or '없음'}
 """

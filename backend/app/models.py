@@ -1,16 +1,18 @@
 import enum
-from datetime import datetime
+from datetime import date, datetime, time
 from typing import Optional
 
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Date,
     Enum,
     Float,
     ForeignKey,
     Integer,
     String,
     Text,
+    Time,
     UniqueConstraint,
     func,
 )
@@ -589,20 +591,114 @@ class AgentTask(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class TravelPlanItem(Base):
-    """A user's lightweight, city-scoped itinerary item."""
+class TravelPlan(Base):
+    """A shareable itinerary document, ready for private/public/member modes."""
 
-    __tablename__ = "travel_plan_items"
-    __table_args__ = (
-        UniqueConstraint("user_id", "city_id", "place_id", name="uq_plan_user_city_place"),
-    )
+    __tablename__ = "travel_plans"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    owner_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # city_shared: every signed-in user can edit the city's common board.
+    # private/shared/public are reserved for personal drafts, invited members,
+    # and published itinerary posts respectively.
+    visibility: Mapped[str] = mapped_column(String(20), default="city_shared", index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(60), default="Asia/Shanghai", nullable=False)
+    cover_image_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    owner: Mapped[Optional[User]] = relationship(foreign_keys=[owner_user_id])
+    members: Mapped[list["TravelPlanMember"]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan"
+    )
+    days: Mapped[list["TravelPlanDay"]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan", order_by="TravelPlanDay.calendar_date"
+    )
+    items: Mapped[list["TravelPlanItem"]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan"
+    )
+
+
+class TravelPlanMember(Base):
+    """Explicit itinerary membership for invited sharing and future posts."""
+
+    __tablename__ = "travel_plan_members"
+    __table_args__ = (UniqueConstraint("plan_id", "user_id", name="uq_travel_plan_member"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("travel_plans.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(20), default="viewer", nullable=False)
+    invitation_status: Mapped[str] = mapped_column(String(20), default="accepted", index=True, nullable=False)
+    invited_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    plan: Mapped[TravelPlan] = relationship(back_populates="members")
+    user: Mapped[User] = relationship(foreign_keys=[user_id])
+    invited_by: Mapped[Optional[User]] = relationship(foreign_keys=[invited_by_user_id])
+
+
+class TravelPlanDay(Base):
+    """A freely chosen calendar date inside an itinerary."""
+
+    __tablename__ = "travel_plan_days"
+    __table_args__ = (UniqueConstraint("plan_id", "calendar_date", name="uq_travel_plan_calendar_date"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("travel_plans.id", ondelete="CASCADE"), index=True)
+    calendar_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    plan: Mapped[TravelPlan] = relationship(back_populates="days")
+    creator: Mapped[Optional[User]] = relationship(foreign_keys=[created_by_user_id])
+    items: Mapped[list["TravelPlanItem"]] = relationship(back_populates="plan_day")
+
+
+class TravelPlanItem(Base):
+    """A place scheduled at an optional exact time on a shareable plan."""
+
+    __tablename__ = "travel_plan_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("travel_plans.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    plan_day_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("travel_plan_days.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # Retained as the creator identity so existing personalization history is
+    # preserved while the plan itself becomes shared.
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
     place_id: Mapped[int] = mapped_column(ForeignKey("markers.id", ondelete="CASCADE"), index=True)
     day: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     slot: Mapped[str] = mapped_column(String(20), default="afternoon", nullable=False)
+    start_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    end_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     note: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -610,6 +706,9 @@ class TravelPlanItem(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    plan: Mapped[Optional[TravelPlan]] = relationship(back_populates="items")
+    plan_day: Mapped[Optional[TravelPlanDay]] = relationship(back_populates="items")
+    creator: Mapped[User] = relationship(foreign_keys=[user_id])
     place: Mapped[Marker] = relationship()
 
 

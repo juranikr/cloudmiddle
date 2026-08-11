@@ -16,6 +16,7 @@ import boto3
 
 from app.agent.runner import run_agent
 from app.db import Base, SessionLocal, engine
+from app.migrate import ensure_schema
 from app.models import City
 
 
@@ -102,6 +103,7 @@ def _selected_cities(db: Any) -> list[City]:
 
 def run_scheduled_agent() -> list[dict[str, Any]]:
     Base.metadata.create_all(bind=engine)
+    ensure_schema()
     db = SessionLocal()
     try:
         return [run_agent(db, city_id=city.id) for city in _selected_cities(db)]

@@ -295,13 +295,63 @@ export interface AdminAgentTask {
 
 export interface TravelPlanItem {
   id: number;
+  plan_id: number;
+  plan_day_id: number | null;
   city_id: number;
   place_id: number;
+  created_by_user_id: number;
+  creator_name: string;
   day: number;
-  slot: "morning" | "afternoon" | "evening";
+  slot: "morning" | "afternoon" | "evening" | string;
+  start_time: string | null;
+  end_time: string | null;
   sort_order: number;
   note: string;
+  legacy_day: number | null;
+  legacy_slot: string;
   place: MarkerItem;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TravelPlanDay {
+  id: number;
+  plan_id: number;
+  calendar_date: string;
+  title: string;
+  note: string;
+  sort_order: number;
+  created_by_user_id: number | null;
+  items: TravelPlanItem[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TravelPlanMember {
+  user_id: number;
+  display_name: string;
+  role: "owner" | "editor" | "viewer" | string;
+  invitation_status: "accepted" | "invited" | string;
+}
+
+export interface TravelPlan {
+  id: number;
+  city_id: number;
+  owner_user_id: number | null;
+  owner_name: string;
+  title: string;
+  description: string;
+  visibility: "private" | "shared" | "city_shared" | "public";
+  status: "draft" | "published" | "archived";
+  timezone: string;
+  cover_image_url: string;
+  start_date: string | null;
+  end_date: string | null;
+  can_edit: boolean;
+  can_manage: boolean;
+  members: TravelPlanMember[];
+  days: TravelPlanDay[];
+  unscheduled_items: TravelPlanItem[];
   created_at: string;
   updated_at: string;
 }

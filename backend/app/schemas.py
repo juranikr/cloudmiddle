@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime, time
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
@@ -329,27 +329,116 @@ class FavoriteToggleOut(BaseModel):
 
 class TravelPlanItemCreate(BaseModel):
     place_id: int = Field(gt=0)
-    day: int = Field(default=1, ge=1, le=14)
-    slot: str = Field(default="afternoon", pattern="^(morning|afternoon|evening)$")
+    plan_day_id: Optional[int] = Field(default=None, gt=0)
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
     note: str = Field(default="", max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "TravelPlanItemCreate":
+        if self.end_time and not self.start_time:
+            raise ValueError("종료 시간을 쓰려면 시작 시간도 필요합니다")
+        if self.start_time and self.end_time and self.end_time <= self.start_time:
+            raise ValueError("종료 시간은 시작 시간보다 뒤여야 합니다")
+        return self
 
 
 class TravelPlanItemUpdate(BaseModel):
-    day: Optional[int] = Field(default=None, ge=1, le=14)
-    slot: Optional[str] = Field(default=None, pattern="^(morning|afternoon|evening)$")
+    plan_day_id: Optional[int] = Field(default=None, gt=0)
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
     sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
     note: Optional[str] = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "TravelPlanItemUpdate":
+        if self.start_time and self.end_time and self.end_time <= self.start_time:
+            raise ValueError("종료 시간은 시작 시간보다 뒤여야 합니다")
+        return self
 
 
 class TravelPlanItemOut(BaseModel):
     id: int
+    plan_id: int
+    plan_day_id: Optional[int] = None
     city_id: int
     place_id: int
-    day: int
-    slot: str
+    created_by_user_id: int
+    creator_name: str
+    day: int = 1
+    slot: str = "afternoon"
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
     sort_order: int
     note: str = ""
+    legacy_day: Optional[int] = None
+    legacy_slot: str = ""
     place: MarkerOut
+    created_at: datetime
+    updated_at: datetime
+
+
+class TravelPlanDayCreate(BaseModel):
+    calendar_date: date
+    title: str = Field(default="", max_length=160)
+    note: str = Field(default="", max_length=1000)
+
+
+class TravelPlanDayUpdate(BaseModel):
+    calendar_date: Optional[date] = None
+    title: Optional[str] = Field(default=None, max_length=160)
+    note: Optional[str] = Field(default=None, max_length=1000)
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class TravelPlanDayOut(BaseModel):
+    id: int
+    plan_id: int
+    calendar_date: date
+    title: str = ""
+    note: str = ""
+    sort_order: int
+    created_by_user_id: Optional[int] = None
+    items: list[TravelPlanItemOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class TravelPlanMemberOut(BaseModel):
+    user_id: int
+    display_name: str
+    role: str
+    invitation_status: str
+
+
+class TravelPlanUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=240)
+    description: Optional[str] = Field(default=None, max_length=4000)
+    visibility: Optional[str] = Field(default=None, pattern="^(private|shared|city_shared|public)$")
+    status: Optional[str] = Field(default=None, pattern="^(draft|published|archived)$")
+    cover_image_url: Optional[str] = Field(default=None, max_length=1000)
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+
+class TravelPlanOut(BaseModel):
+    id: int
+    city_id: int
+    owner_user_id: Optional[int] = None
+    owner_name: str = ""
+    title: str
+    description: str = ""
+    visibility: str
+    status: str
+    timezone: str
+    cover_image_url: str = ""
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    can_edit: bool = False
+    can_manage: bool = False
+    members: list[TravelPlanMemberOut] = Field(default_factory=list)
+    days: list[TravelPlanDayOut] = Field(default_factory=list)
+    unscheduled_items: list[TravelPlanItemOut] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 

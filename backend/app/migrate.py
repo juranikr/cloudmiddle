@@ -178,6 +178,116 @@ def ensure_schema() -> None:
 
         # 기여자 백필: 기존 markers.user_id → place_contributors
         tables_now = set(inspect(engine).get_table_names())
+
+        # Legacy personal DAY/slot rows become entries in one city-shared,
+        # publishable itinerary document. Existing day/slot values are retained
+        # as migration hints until a collaborator chooses a real date/time.
+        if "travel_plan_items" in tables_now and "travel_plans" in tables_now:
+            plan_item_cols = {c["name"] for c in inspect(engine).get_columns("travel_plan_items")}
+            if "plan_id" not in plan_item_cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE travel_plan_items ADD COLUMN plan_id INTEGER "
+                        "REFERENCES travel_plans(id) ON DELETE CASCADE"
+                    )
+                )
+            if "plan_day_id" not in plan_item_cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE travel_plan_items ADD COLUMN plan_day_id INTEGER "
+                        "REFERENCES travel_plan_days(id) ON DELETE SET NULL"
+                    )
+                )
+            if "start_time" not in plan_item_cols:
+                conn.execute(text("ALTER TABLE travel_plan_items ADD COLUMN start_time TIME"))
+            if "end_time" not in plan_item_cols:
+                conn.execute(text("ALTER TABLE travel_plan_items ADD COLUMN end_time TIME"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_travel_plan_items_plan_id ON travel_plan_items (plan_id)"))
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_travel_plan_items_plan_day_id ON travel_plan_items (plan_day_id)")
+            )
+
+            # The old constraint represented a private list. It both permitted
+            # cross-user duplicates and prevented valid repeat visits.
+            if engine.dialect.name == "postgresql":
+                conn.execute(text("ALTER TABLE travel_plan_items DROP CONSTRAINT IF EXISTS uq_plan_user_city_place"))
+
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO travel_plans
+                      (city_id, owner_user_id, title, description, visibility, status,
+                       timezone, cover_image_url, published_at)
+                    SELECT
+                      c.id,
+                      COALESCE(
+                        (SELECT MIN(t.user_id) FROM travel_plan_items t WHERE t.city_id = c.id),
+                        (SELECT MIN(u.id) FROM users u)
+                      ),
+                      c.name_ko || ' 함께 만드는 여행',
+                      '이 도시를 여행하는 사용자들이 함께 편집하는 공용 일정표입니다.',
+                      'city_shared',
+                      'published',
+                      'Asia/Shanghai',
+                      '',
+                      CURRENT_TIMESTAMP
+                    FROM cities c
+                    WHERE c.status = 'active'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM travel_plans p
+                        WHERE p.city_id = c.id
+                          AND p.visibility = 'city_shared'
+                          AND p.status != 'archived'
+                      )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE travel_plan_items
+                    SET plan_id = (
+                      SELECT p.id FROM travel_plans p
+                      WHERE p.city_id = travel_plan_items.city_id
+                        AND p.visibility = 'city_shared'
+                        AND p.status != 'archived'
+                      ORDER BY p.id ASC
+                      LIMIT 1
+                    )
+                    WHERE plan_id IS NULL
+                    """
+                )
+            )
+
+            if "travel_plan_members" in tables_now:
+                member_insert = "INSERT OR IGNORE" if engine.dialect.name == "sqlite" else "INSERT"
+                member_conflict = "" if engine.dialect.name == "sqlite" else " ON CONFLICT (plan_id, user_id) DO NOTHING"
+                conn.execute(
+                    text(
+                        f"""
+                        {member_insert} INTO travel_plan_members
+                          (plan_id, user_id, role, invitation_status, invited_by_user_id)
+                        SELECT p.id, p.owner_user_id, 'owner', 'accepted', p.owner_user_id
+                        FROM travel_plans p
+                        WHERE p.owner_user_id IS NOT NULL
+                        {member_conflict}
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        {member_insert} INTO travel_plan_members
+                          (plan_id, user_id, role, invitation_status, invited_by_user_id)
+                        SELECT DISTINCT t.plan_id, t.user_id, 'editor', 'accepted', p.owner_user_id
+                        FROM travel_plan_items t
+                        JOIN travel_plans p ON p.id = t.plan_id
+                        WHERE t.plan_id IS NOT NULL AND t.user_id != COALESCE(p.owner_user_id, -1)
+                        {member_conflict}
+                        """
+                    )
+                )
+
         if "markers" in tables_now and "place_contributors" in tables_now:
             conn.execute(
                 text(

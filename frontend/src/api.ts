@@ -16,6 +16,8 @@ import type {
   UserMessage,
   TravelChatMessage,
   TravelProfile,
+  TravelPlan,
+  TravelPlanDay,
   TravelPlanItem,
 } from "./types";
 
@@ -462,17 +464,51 @@ export async function removeFavorite(token: string, placeId: number): Promise<{ 
   return handle(res);
 }
 
-export async function fetchTravelPlan(token: string, cityId: number): Promise<TravelPlanItem[]> {
-  const res = await request(`/api/plans/${cityId}`, { headers: authHeaders(token) });
-  return handle<TravelPlanItem[]>(res);
+export async function fetchTravelPlan(token: string, cityId: number): Promise<TravelPlan> {
+  const res = await request(`/api/travel-plans/shared?city_id=${cityId}`, { headers: authHeaders(token) });
+  return handle<TravelPlan>(res);
+}
+
+export async function addTravelPlanDay(
+  token: string,
+  planId: number,
+  body: { calendar_date: string; title?: string; note?: string },
+): Promise<TravelPlan> {
+  const res = await request(`/api/travel-plans/${planId}/days`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return handle<TravelPlan>(res);
+}
+
+export async function updateTravelPlanDay(
+  token: string,
+  dayId: number,
+  body: Partial<Pick<TravelPlanDay, "calendar_date" | "title" | "note" | "sort_order">>,
+): Promise<TravelPlan> {
+  const res = await request(`/api/travel-plan-days/${dayId}`, {
+    method: "PATCH",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return handle<TravelPlan>(res);
+}
+
+export async function deleteTravelPlanDay(token: string, dayId: number): Promise<TravelPlan> {
+  const res = await request(`/api/travel-plan-days/${dayId}`, {
+    method: "DELETE",
+    headers: authHeaders(token),
+  });
+  return handle<TravelPlan>(res);
 }
 
 export async function addTravelPlanItem(
   token: string,
-  cityId: number,
-  body: { place_id: number; day: number; slot: TravelPlanItem["slot"]; note?: string },
+  planId: number,
+  body: { place_id: number; plan_day_id?: number | null; start_time?: string | null; end_time?: string | null; note?: string },
 ): Promise<TravelPlanItem> {
-  const res = await request(`/api/plans/${cityId}/items`, {
+  const res = await request(`/api/travel-plans/${planId}/items`, {
     method: "POST",
     headers: authHeaders(token),
     body: JSON.stringify(body),
@@ -483,7 +519,7 @@ export async function addTravelPlanItem(
 export async function updateTravelPlanItem(
   token: string,
   itemId: number,
-  body: Partial<Pick<TravelPlanItem, "day" | "slot" | "sort_order" | "note">>,
+  body: Partial<Pick<TravelPlanItem, "plan_day_id" | "start_time" | "end_time" | "sort_order" | "note">>,
 ): Promise<TravelPlanItem> {
   const res = await request(`/api/plan-items/${itemId}`, {
     method: "PATCH",
