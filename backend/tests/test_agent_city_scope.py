@@ -10,6 +10,7 @@ from app.agent.runner import (
     _ensure_gap_tasks,
     _is_material_change,
     _new_evidence_keys,
+    _step_detail_json,
     _tool_signature,
     count_unread,
 )
@@ -111,6 +112,16 @@ class AgentCityScopeTests(unittest.TestCase):
             _tool_signature("web_search", {"limit": 5, "query": "沈阳"}),
             _tool_signature("web_search", {"query": "沈阳", "limit": 5}),
         )
+
+        detail = _step_detail_json(
+            {"query": "沈阳"},
+            {"results": [{"href": f"https://example.test/{index}", "text": "가" * 5000} for index in range(8)]},
+            {"new_evidence": 8},
+            max_chars=3000,
+        )
+        parsed = json.loads(detail)
+        self.assertTrue(parsed["truncated"])
+        self.assertLessEqual(len(detail), 3000)
 
     def test_batch_gap_tasks_are_measurable_and_deduplicated(self) -> None:
         first = _ensure_gap_tasks(

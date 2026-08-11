@@ -452,6 +452,63 @@ def _material_change_summary(sequence: int, name: str, args: dict[str, Any], res
     }
 
 
+def _step_detail_json(
+    args: dict[str, Any],
+    result: Any,
+    progress: dict[str, Any],
+    *,
+    max_chars: int = 12000,
+) -> str:
+    """Keep run history useful and valid without turning it into a raw-data dump."""
+    payload = {"args": args, "result": result, "progress": progress}
+    encoded = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return encoded
+
+    if isinstance(result, dict):
+        compact_result = {
+            key: result[key]
+            for key in (
+                "ok", "error", "detail", "status", "proposal_id", "place_id", "task_id",
+                "changed", "created", "marked", "merged", "resolved", "url", "title",
+                "already_visited",
+            )
+            if key in result
+        }
+        rows = result.get("results")
+        if isinstance(rows, list):
+            compact_result["result_count"] = len(rows)
+            compact_result["results_preview"] = rows[:5]
+    elif isinstance(result, list):
+        compact_result = {"result_count": len(result), "results_preview": result[:5]}
+    else:
+        compact_result = {"preview": str(result)[:2000]}
+
+    compact_payload = {
+        "args": args,
+        "result": compact_result,
+        "progress": progress,
+        "truncated": True,
+    }
+    encoded = json.dumps(compact_payload, ensure_ascii=False, default=str)
+    if len(encoded) <= max_chars:
+        return encoded
+    # Even unusually large arguments/previews remain valid JSON.
+    fallback = json.dumps(
+        {
+            "args_preview": json.dumps(args, ensure_ascii=False, default=str)[:max(200, max_chars // 5)],
+            "result_preview": json.dumps(compact_result, ensure_ascii=False, default=str)[:max(500, max_chars // 2)],
+            "progress": progress,
+            "truncated": True,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    if len(fallback) <= max_chars:
+        return fallback
+    return json.dumps({"progress": progress, "truncated": True}, ensure_ascii=False, default=str)
+
+
 def _ensure_gap_tasks(db: Session, *, city_id: int, run_id: int, gaps: list[str]) -> list[int]:
     """Persist measurable follow-up work so the next cycle has a concrete objective."""
     gap_set = set(gaps)
@@ -882,22 +939,19 @@ def run_agent(
                         tool=name,
                         outcome=outcome,
                         score_delta=score_delta,
-                        detail=json.dumps(
+                        detail=_step_detail_json(
+                            args,
+                            result,
                             {
-                                "args": args,
-                                "result": result,
-                                "progress": {
-                                    "material_change": material_change,
-                                    "new_evidence": len(new_evidence),
-                                    "score": current_score,
-                                    "no_material_actions": no_material_actions,
-                                },
+                                "material_change": material_change,
+                                "new_evidence": len(new_evidence),
+                                "score": current_score,
+                                "no_material_actions": no_material_actions,
                             },
-                            ensure_ascii=False,
-                            default=str,
-                        )[:3000],
+                        ),
                     )
                 )
+                agent_run.score = current_score
                 db.commit()
                 messages.append(
                     {
