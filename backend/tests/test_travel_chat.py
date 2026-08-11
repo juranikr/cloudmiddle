@@ -13,6 +13,7 @@ from app.config import settings
 from app.db import Base
 from app.models import City, Marker, MarkerCategory, TravelChatMessage
 from app.travel_chat import (
+    CITY_FOOD_DETAIL_SOURCES,
     RESEARCH_TOOLS,
     WRITE_TOOLS,
     _brand_source_urls,
@@ -30,6 +31,12 @@ from app.travel_chat import (
 
 
 class TravelChatRoutingTests(unittest.TestCase):
+    def test_shenyang_food_bootstrap_uses_auditable_detail_pages(self) -> None:
+        urls = CITY_FOOD_DETAIL_SOURCES["shenyang"]
+
+        self.assertGreaterEqual(len(urls), 2)
+        self.assertTrue(all("ctrip.com" in url or "qunar.com" in url for url in urls))
+
     def test_simple_map_question_skips_web_tools(self) -> None:
         write_intent, tools = _chat_capabilities("내 일정의 이동 동선을 줄여줘")
 

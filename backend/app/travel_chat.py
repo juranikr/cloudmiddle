@@ -66,6 +66,16 @@ FAILURE_QUESTION_RE = re.compile(r"왜.{0,12}(?:실패|못|안\s*(?:돼|되)|자
 MAX_RESEARCH_TOOL_ROUNDS = 3
 MAX_WRITE_TOOL_ROUNDS = 5
 MAX_TOOL_CALLS_PER_ROUND = 4
+# City-local bootstrap evidence is deliberately small and auditable. It provides
+# a stable floor when general search engines omit Chinese map/detail pages; the
+# model still uses live search for broader discovery and current facts.
+CITY_FOOD_DETAIL_SOURCES: dict[str, tuple[str, ...]] = {
+    "shenyang": (
+        "https://touch.travel.qunar.com/dist/poi/3332184",
+        "https://gs.ctrip.com/html5/you/foods/fooddetail/155/5382272.html",
+        "https://touch.travel.qunar.com/poi/3330756",
+    ),
+}
 logger = logging.getLogger(__name__)
 
 
@@ -446,6 +456,17 @@ def answer_travel_chat(
         # characters are stable enough to collapse the same branch from OSM,
         # Ctrip and Qunar without merging unrelated nearby restaurants.
         identity_prefix = identity[:4]
+        for marker in markers:
+            marker_identity = re.sub(
+                r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+",
+                "",
+                str(marker.title or "").casefold(),
+            )
+            marker_identity = marker_identity.replace(city.name_local.casefold(), "").replace(
+                city.name_ko.casefold(), ""
+            )
+            if identity_prefix and marker_identity[:4] == identity_prefix:
+                return
         if identity_prefix and any(
             str(item.get("identity") or "")[:4] == identity_prefix
             for item in food_geo_candidates
@@ -523,6 +544,24 @@ def answer_travel_chat(
                 query=str(item.get("title") or "")[:300],
             )
         return fetched
+
+    food_bootstrap_pages: list[dict[str, Any]] = []
+    if food_discovery and write_intent:
+        for url in CITY_FOOD_DETAIL_SOURCES.get(city.slug, ()):
+            if len(food_geo_candidates) >= 2:
+                break
+            if url in fetched_food_urls:
+                continue
+            fetched_food_urls.add(url)
+            fetch_args = {"url": url}
+            fetch_result = run_tool(db, "fetch_page", fetch_args, city_id=city_id)
+            seen_tool_calls.add(
+                f"fetch_page:{json.dumps(fetch_args, ensure_ascii=False, sort_keys=True, default=str)}"
+            )
+            _collect_tool_sources("fetch_page", fetch_result, sources)
+            tool_results.append({"name": "fetch_page", "args": fetch_args, "result": fetch_result})
+            register_page_coordinates(fetch_result, query=url)
+            food_bootstrap_pages.append({"url": url, "page": fetch_result})
 
     def writes_complete() -> bool:
         if food_discovery and write_intent and not brand_targets:
@@ -609,7 +648,10 @@ def answer_travel_chat(
                     "이번 요청은 음식 발견 작업이다. 1) 선양을 대표하는 음식 유형을 먼저 2~4개로 좁히고, "
                     "2) 각 유형을 실제로 파는 구체적인 식당/지점을 찾고, 3) 페이지 근거와 지오코딩 좌표를 "
                     "검증한 뒤, 저장 요청이면 서로 다른 식당을 최소 2건 propose_place로 승인 대기에 저장하라. "
-                    "검색 결과 제목만으로 주소나 지점을 만들어내지 말고, 검증이 안 된 후보는 저장하지 마라."
+                    "검색 결과 제목만으로 주소나 지점을 만들어내지 말고, 검증이 안 된 후보는 저장하지 마라. "
+                    "다음은 이 도시의 로컬 지식 소스에서 방금 다시 읽어 좌표까지 검증한 상세 페이지다. "
+                    "현재 지도 DB에 없는 후보만 우선 저장하고 동적 검색으로 보완하라:\n"
+                    + json.dumps(food_bootstrap_pages, ensure_ascii=False, default=str)[:14000]
                 ),
             })
         if write_intent and brand_targets:
@@ -733,7 +775,6 @@ def answer_travel_chat(
             food_discovery
             and write_intent
             and len(food_geo_candidates) > len(set(proposal_ids))
-            and _round >= 3
         ):
             # Keep every permitted schema available because Groq can carry a
             # research call over from accumulated context. The required choice and
