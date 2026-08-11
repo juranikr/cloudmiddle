@@ -1026,7 +1026,17 @@ def _decode_html(raw: bytes, content_type: str) -> str:
 
 
 def _extract_page_text(url: str) -> dict[str, Any]:
-    req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_UA})
+    parsed = urllib.parse.urlsplit(url)
+    safe_url = urllib.parse.urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc.encode("idna").decode("ascii"),
+            urllib.parse.quote(urllib.parse.unquote(parsed.path), safe="/%:@"),
+            urllib.parse.quote(urllib.parse.unquote(parsed.query), safe="=&%:+,;@/?"),
+            "",
+        )
+    )
+    req = urllib.request.Request(safe_url, headers={"User-Agent": _IMAGE_UA})
     with urllib.request.urlopen(req, timeout=20) as resp:
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if "html" not in ctype and "text" not in ctype:

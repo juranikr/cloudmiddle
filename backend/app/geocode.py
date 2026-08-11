@@ -599,6 +599,51 @@ def search_address(
             except Exception as exc:  # 공급자 하나의 장애가 전체 검색을 깨지 않게 한다.
                 logger.warning("Unexpected geocode provider %s failure: %s", provider, exc)
 
+    # Chinese POI searches often arrive as "city + brand + branch + street number".
+    # Open data providers may index only the short storefront name, so retry a small,
+    # deterministic set of progressively simpler variants before giving up.
+    if not any(hit.get("storage_allowed") for hit in all_hits):
+        without_city = q.replace(city_name, " ").strip() if city_name else q
+        first_chunk = re.split(r"\s+", without_city, maxsplit=1)[0].strip()
+        stripped_suffix = re.sub(r"(?:旗舰)?(?:分)?(?:店|馆|門店|门店)$", "", first_chunk).strip()
+        variants: list[str] = []
+        for variant in (without_city, first_chunk, stripped_suffix):
+            if len(_normalize(variant)) >= 2 and variant != q and variant not in variants:
+                variants.append(variant)
+        for variant in variants[:3]:
+            fallback_hits: list[dict[str, Any]] = []
+            fallback_providers: list[tuple[str, Callable[[], list[dict[str, Any]]]]] = [
+                ("nominatim", lambda variant=variant: _search_nominatim(
+                    variant, limit=limit, bounds=bounds, city_name=city_name
+                )),
+                ("wikidata", lambda variant=variant: _search_wikidata(
+                    variant, limit=limit, bounds=bounds
+                )),
+            ]
+            if api_key or include_display_only:
+                fallback_providers.append(("arcgis", lambda variant=variant: _search_arcgis(
+                    variant,
+                    limit=limit,
+                    bounds=bounds,
+                    city_name=city_name,
+                    city_context=city_context,
+                    api_key=api_key,
+                )))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(fallback_providers)) as executor:
+                futures = {executor.submit(loader): name for name, loader in fallback_providers}
+                for future in concurrent.futures.as_completed(futures):
+                    provider = futures[future]
+                    try:
+                        fallback_hits.extend(future.result())
+                    except Exception as exc:
+                        logger.warning("Fallback geocode provider %s failed: %s", provider, exc)
+            for hit in fallback_hits:
+                hit["matched_query"] = variant
+                hit["query"] = q
+            all_hits.extend(fallback_hits)
+            if any(hit.get("storage_allowed") for hit in fallback_hits):
+                break
+
     if not include_display_only:
         all_hits = [hit for hit in all_hits if hit.get("storage_allowed")]
     return _merge_hits(all_hits, limit)
