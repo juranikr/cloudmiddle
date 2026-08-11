@@ -17,6 +17,7 @@ from app.travel_chat import (
     WRITE_TOOLS,
     _brand_source_urls,
     _chat_capabilities,
+    _food_detail_recovery_query,
     _missing_brand_targets,
     _needs_answer_retry,
     _research_seed_queries,
@@ -80,6 +81,34 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertIn("모어요거트와 헤이티", resolved)
         self.assertTrue(write_intent)
         self.assertEqual(tools, RESEARCH_TOOLS | WRITE_TOOLS)
+
+    def test_search_more_followup_skips_meta_question_and_inherits_food_request(self) -> None:
+        rows = [
+            SimpleNamespace(
+                role="user",
+                content="선양에서 먹어야 되는 음식 종류를 찾고 그 식당을 지도에 등록해줬으면 좋겠어",
+            ),
+            SimpleNamespace(role="assistant", content="저장 기준을 충족하지 못했습니다."),
+            SimpleNamespace(role="user", content="충족하지 못한 기준이 무엇인데?"),
+            SimpleNamespace(role="assistant", content="주소와 좌표가 필요합니다."),
+        ]
+
+        resolved = _resolve_context_message("검색 충분히 해서 지도에 추가해줘.", rows)
+        city = City(name_local="沈阳")
+
+        self.assertIn("먹어야 되는 음식 종류", resolved)
+        self.assertNotIn("충족하지 못한 기준", resolved)
+        self.assertEqual(
+            _research_seed_queries(city, resolved),
+            ["沈阳 必吃 特色美食 传统小吃", "沈阳 老字号 特色餐厅 推荐"],
+        )
+
+    def test_food_coordinate_recovery_searches_by_business_not_bad_address(self) -> None:
+        city = City(name_ko="선양", name_local="沈阳")
+
+        query = _food_detail_recovery_query(city, "马家烧麦 沈阳市沈河区中街路195号")
+
+        self.assertEqual(query, "沈阳 马家烧麦 去哪儿攻略")
 
     def test_brand_seed_queries_use_correct_chinese_names(self) -> None:
         city = City(name_local="沈阳")
@@ -248,6 +277,10 @@ class TravelChatLoopTests(unittest.TestCase):
         self.assertEqual(result["row"].content, "확인한 세 지점을 가까운 순서로 정리했습니다.")
         self.assertEqual(len(completions.requests), 4)
         self.assertIn("tools", completions.requests[0])
+        self.assertIn(
+            "web_search",
+            {item["function"]["name"] for item in completions.requests[0]["tools"]},
+        )
         self.assertEqual(tool.call_args_list[0].args[1], "web_search")
         self.assertIn("沈阳", tool.call_args_list[0].args[2]["query"])
         self.assertNotIn("tools", completions.requests[-1])

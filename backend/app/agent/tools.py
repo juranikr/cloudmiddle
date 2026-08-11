@@ -29,6 +29,7 @@ from app.events import (
     summary_for_changes,
 )
 from app.geocode import search_address
+from app.gcj02 import gcj02_to_wgs84
 from app.knowledge import list_knowledge, upsert_knowledge
 from app.messages import (
     list_open_appeals,
@@ -1044,6 +1045,51 @@ def _decode_html(raw: bytes, content_type: str) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
+def _extract_embedded_coordinates(html_text: str, url: str) -> list[dict[str, Any]]:
+    """Extract a primary POI coordinate from supported detail-page metadata."""
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.netloc.casefold()
+    path = parsed.path.casefold()
+    source = ""
+    lat_gcj: float
+    lng_gcj: float
+    if "ctrip.com" in host and re.search(r"/(?:food|foods|fooddetail)/", path):
+        # Do not turn a stale search-engine hit into a map proposal.
+        if "营业提示：暂停营业" in html_text:
+            return []
+        match = re.search(
+            r'"GDCoord"\s*:\s*\{\s*"Lat"\s*:\s*(-?\d+(?:\.\d+)?)\s*,\s*"Lng"\s*:\s*(-?\d+(?:\.\d+)?)',
+            html_text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return []
+        lat_gcj, lng_gcj = float(match.group(1)), float(match.group(2))
+        source = "ctrip_embedded_gdcoord"
+    elif host.endswith("qunar.com") and re.fullmatch(r"/(?:dist/)?poi/\d+", path.rstrip("/")):
+        lat_match = re.search(r"\bPOI_LAT\s*=\s*(-?\d+(?:\.\d+)?)", html_text, re.IGNORECASE)
+        lng_match = re.search(r"\bPOI_LNG\s*=\s*(-?\d+(?:\.\d+)?)", html_text, re.IGNORECASE)
+        if not lat_match or not lng_match:
+            return []
+        lat_gcj, lng_gcj = float(lat_match.group(1)), float(lng_match.group(1))
+        source = "qunar_embedded_poi"
+    else:
+        return []
+    if not (-90 <= lat_gcj <= 90 and -180 <= lng_gcj <= 180):
+        return []
+    lat, lng = gcj02_to_wgs84(lat_gcj, lng_gcj)
+    return [{
+        "lat": round(lat, 7),
+        "lng": round(lng, 7),
+        "source": source,
+        "source_url": url,
+        "source_crs": "GCJ-02",
+        "storage_crs": "WGS84",
+        "confidence": 0.86,
+        "storage_allowed": True,
+    }]
+
+
 def _extract_page_text(url: str) -> dict[str, Any]:
     parsed = urllib.parse.urlsplit(url)
     safe_url = urllib.parse.urlunsplit(
@@ -1068,7 +1114,11 @@ def _extract_page_text(url: str) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 — 깨진 HTML은 파싱된 데까지만 사용
         pass
     body = "\n".join(parser.parts)
-    return {"title": parser.title.strip()[:300], "text": body[:7000]}
+    return {
+        "title": parser.title.strip()[:300],
+        "text": body[:7000],
+        "coordinate_candidates": _extract_embedded_coordinates(html_text, url),
+    }
 
 
 def _record_visit(db: Session, url: str, title: str = "", city_id: Optional[int] = None) -> bool:
@@ -2419,8 +2469,45 @@ def run_tool(
             except ImportError:  # 구버전 환경 호환
                 from duckduckgo_search import DDGS
 
+            # The library's automatic meta-backend can wait on many engines and
+            # discard otherwise good results when the last engine times out. Merge
+            # two bounded engines instead: Yahoo is fast for Chinese text and
+            # Yandex often exposes Chinese POI detail pages Yahoo omits.
+            results: list[dict[str, Any]] = []
+            search_backends: list[str] = []
+            backend_batches: list[list[dict[str, Any]]] = []
+            backend_errors: list[str] = []
             with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
+                for backend in ("yahoo", "yandex"):
+                    try:
+                        backend_results = list(ddgs.text(
+                            query,
+                            max_results=max_results,
+                            backend=backend,
+                        ))
+                    except Exception as backend_exc:  # noqa: BLE001
+                        backend_errors.append(f"{backend}: {backend_exc}")
+                        continue
+                    if backend_results:
+                        search_backends.append(backend)
+                        backend_batches.append(backend_results)
+            seen_result_urls: set[str] = set()
+            for index in range(max_results):
+                for batch in backend_batches:
+                    if index >= len(batch):
+                        continue
+                    item = batch[index]
+                    item_url = str(item.get("href") or "")
+                    if item_url in seen_result_urls:
+                        continue
+                    seen_result_urls.add(item_url)
+                    results.append(item)
+                    if len(results) >= max_results:
+                        break
+                if len(results) >= max_results:
+                    break
+            if not results:
+                raise RuntimeError("; ".join(backend_errors) or "no search results")
         except Exception as exc:  # noqa: BLE001
             db.add(
                 AgentSearchLog(
@@ -2491,6 +2578,7 @@ def run_tool(
         db.commit()
         return {
             "results": out,
+            "backend": "+".join(search_backends),
             "past_searches": {
                 "times": len(past),
                 "last_at": past[0].searched_at.isoformat() if past else None,
@@ -2517,6 +2605,7 @@ def run_tool(
             "url": url,
             "title": page.get("title") or "",
             "text": page.get("text") or "",
+            "coordinate_candidates": page.get("coordinate_candidates") or [],
             "already_visited": already_visited,
             "last_visited_at": (
                 prior.last_visited_at.isoformat()

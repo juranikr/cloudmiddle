@@ -55,6 +55,13 @@ SHORT_FOLLOWUP_RE = re.compile(
     r"^(?:(?:그거|그것|둘\s*다|전부|모두|찾은\s*것|위\s*장소)(?:를|도|부터)?\s*)?"
     r"(?:지도에\s*)?(?:추가|등록|저장|넣)(?:해|하|해줘|해주세요|시켜줘)?[.!?\s]*$"
 )
+CONTEXTUAL_WRITE_FOLLOWUP_RE = re.compile(
+    r"^(?=.{1,100}$)(?=.*(?:추가|등록|저장|넣))(?=.*(?:검색|찾|충분|다시|더|계속|제대로|그럼)).*$"
+)
+META_FOLLOWUP_RE = re.compile(
+    r"(?:충족|통과).{0,12}(?:기준|조건)|(?:기준|조건).{0,12}(?:무엇|뭐)|"
+    r"왜.{0,16}(?:실패|못|안\s*(?:돼|되))|뭐가.{0,12}(?:부족|문제)"
+)
 FAILURE_QUESTION_RE = re.compile(r"왜.{0,12}(?:실패|못|안\s*(?:돼|되)|자료.{0,5}부족)|자꾸.{0,10}(?:실패|못|안\s*(?:돼|되))")
 MAX_RESEARCH_TOOL_ROUNDS = 3
 MAX_WRITE_TOOL_ROUNDS = 5
@@ -90,15 +97,56 @@ def _recent_user_requests(rows: list[TravelChatMessage], *, limit: int = 8) -> l
     ][-limit:]
 
 
+def _is_contextual_write_followup(content: str) -> bool:
+    """True when a write command depends on a target stated earlier."""
+    if not CONTEXTUAL_WRITE_FOLLOWUP_RE.search(content.strip()):
+        return False
+    folded = content.casefold()
+    has_brand = any(
+        alias.casefold() in folded
+        for aliases in BRAND_ANSWER_ALIASES.values()
+        for alias in aliases
+    )
+    return not has_brand and not FOOD_DISCOVERY_RE.search(content)
+
+
 def _resolve_context_message(message: str, rows: list[TravelChatMessage]) -> str:
     """Attach the previous concrete user request to short commands such as `추가해줘`."""
-    if not SHORT_FOLLOWUP_RE.search(message.strip()):
+    if not (
+        SHORT_FOLLOWUP_RE.search(message.strip())
+        or _is_contextual_write_followup(message)
+    ):
         return message
     previous = _recent_user_requests(rows, limit=8)
     for content in reversed(previous):
-        if not SHORT_FOLLOWUP_RE.search(content) and not FAILURE_QUESTION_RE.search(content):
+        if (
+            not SHORT_FOLLOWUP_RE.search(content)
+            and not _is_contextual_write_followup(content)
+            and not FAILURE_QUESTION_RE.search(content)
+            and not META_FOLLOWUP_RE.search(content)
+        ):
             return f"이전 사용자 요청: {content}\n현재 후속 지시: {message}"
     return message
+
+
+def _food_detail_recovery_query(city: City, query: str) -> str:
+    """Reduce an address-heavy geocode query back to its business name."""
+    cleaned = re.sub(r"\s+", " ", query).strip()
+    business = ""
+    city_tokens = [f"{city.name_local}市", city.name_local, city.name_ko]
+    for token in city_tokens:
+        position = cleaned.find(token)
+        if position > 0:
+            business = cleaned[:position].strip()
+            break
+    if not business:
+        business = cleaned
+        for token in city_tokens:
+            business = business.replace(token, " ")
+        business = re.sub(r"\s+", " ", business).strip()
+    business = re.split(r"\s+(?:地址|位于|주소|辽宁省|[\u4e00-\u9fff]{1,6}[区县])", business, maxsplit=1)[0]
+    business = business.strip(" ,，:：-·")[:80]
+    return f"{city.name_local} {business} 去哪儿攻略" if business else ""
 
 
 def _brand_targets(message: str) -> list[str]:
@@ -363,12 +411,105 @@ def answer_travel_chat(
     seen_tool_calls: set[str] = set()
     tool_results: list[dict[str, Any]] = []
     proposal_ids: list[int] = []
+    proposal_titles: list[str] = []
     write_attempted = False
     write_succeeded = bool(existing_target_places)
     successful_write_targets: set[str] = set(existing_target_places)
     actionable_targets: set[str] = set()
     verified_coordinates: list[tuple[float, float]] = []
     target_business_sources: dict[str, list[str]] = {}
+    fetched_food_urls: set[str] = set()
+    food_detail_queries: set[str] = set()
+    food_geo_candidates: list[dict[str, Any]] = []
+
+    def add_food_geo_candidate(query: str, results: list[dict[str, Any]]) -> None:
+        if not results:
+            return
+        label = str(results[0].get("display_name") or query)
+        identity = re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", label.casefold())
+        identity = identity.replace(city.name_local.casefold(), "").replace(city.name_ko.casefold(), "")
+        identity = re.sub(r"^(?:20\d{2})+", "", identity)
+        # Detail-page titles contain long SEO suffixes. The first four Han/Hangul
+        # characters are stable enough to collapse the same branch from OSM,
+        # Ctrip and Qunar without merging unrelated nearby restaurants.
+        identity_prefix = identity[:4]
+        if identity_prefix and any(
+            str(item.get("identity") or "")[:4] == identity_prefix
+            for item in food_geo_candidates
+        ):
+            return
+        food_geo_candidates.append({
+            "query": query[:300],
+            "identity": identity,
+            "results": results[:3],
+        })
+
+    def register_page_coordinates(fetch_result: Any, *, query: str) -> None:
+        coordinate_rows = (
+            fetch_result.get("coordinate_candidates") or []
+            if isinstance(fetch_result, dict)
+            else []
+        )
+        grounded: list[dict[str, Any]] = []
+        for coordinate in coordinate_rows:
+            if not isinstance(coordinate, dict) or coordinate.get("storage_allowed") is False:
+                continue
+            try:
+                point = (float(coordinate["lat"]), float(coordinate["lng"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            verified_coordinates.append(point)
+            grounded.append({
+                "display_name": str(fetch_result.get("title") or query)[:300],
+                **coordinate,
+            })
+        add_food_geo_candidate(query, grounded)
+
+    def fetch_food_evidence(search_result: Any, *, limit: int = 2) -> list[dict[str, Any]]:
+        """Read promising search hits immediately so research cannot stall at snippets."""
+        if not food_discovery or not isinstance(search_result, dict):
+            return []
+        fetched: list[dict[str, Any]] = []
+        search_items = [item for item in (search_result.get("results") or []) if isinstance(item, dict)]
+
+        def evidence_priority(item: dict[str, Any]) -> tuple[int, int]:
+            url = str(item.get("href") or "").casefold()
+            title = str(item.get("title") or "")
+            score = 0
+            if "ctrip.com/food" in url or "ctrip.com/html5/you/foods/fooddetail" in url:
+                score += 12
+            if "qunar.com" in url and "/poi/" in url:
+                score += 12
+            if any(host in url for host in ("bendibao.com", "maigoo.com", "gov.cn")):
+                score += 4
+            if any(term in title for term in ("地址", "攻略", "餐厅", "饭店", "老字号")):
+                score += 2
+            return (-score, search_items.index(item))
+
+        for item in sorted(search_items, key=evidence_priority):
+            if len(fetched) >= limit or len(fetched_food_urls) >= 12:
+                break
+            url = str(item.get("href") or "")
+            if not url.startswith(("http://", "https://")) or url in fetched_food_urls:
+                continue
+            fetched_food_urls.add(url)
+            fetch_args = {"url": url}
+            fetch_result = run_tool(db, "fetch_page", fetch_args, city_id=city_id)
+            seen_tool_calls.add(
+                f"fetch_page:{json.dumps(fetch_args, ensure_ascii=False, sort_keys=True, default=str)}"
+            )
+            _collect_tool_sources("fetch_page", fetch_result, sources)
+            tool_results.append({"name": "fetch_page", "args": fetch_args, "result": fetch_result})
+            fetched.append({
+                "search_title": str(item.get("title") or "")[:300],
+                "url": url,
+                "page": fetch_result,
+            })
+            register_page_coordinates(
+                fetch_result,
+                query=str(item.get("title") or "")[:300],
+            )
+        return fetched
 
     def writes_complete() -> bool:
         if food_discovery and write_intent and not brand_targets:
@@ -433,7 +574,11 @@ def answer_travel_chat(
             seen_tool_calls.add(
                 f"web_search:{json.dumps(seed_args, ensure_ascii=False, sort_keys=True, default=str)}"
             )
-            seed_results.append({"query": seed_query, "result": seed_result})
+            seed_results.append({
+                "query": seed_query,
+                "result": seed_result,
+                "fetched_pages": fetch_food_evidence(seed_result),
+            })
             tool_results.append({"name": "web_search", "args": seed_args, "result": seed_result})
         messages.append({
             "role": "system",
@@ -543,7 +688,11 @@ def answer_travel_chat(
             })
 
     force_required = False
-    tool_round_limit = MAX_WRITE_TOOL_ROUNDS if write_intent else MAX_RESEARCH_TOOL_ROUNDS
+    tool_round_limit = (
+        12 if food_discovery and write_intent and not brand_targets
+        else MAX_WRITE_TOOL_ROUNDS if write_intent
+        else MAX_RESEARCH_TOOL_ROUNDS
+    )
     for _round in range(tool_round_limit if allowed else 0):
         structured_brand_write = write_intent and bool(brand_targets)
         if structured_brand_write:
@@ -567,11 +716,48 @@ def answer_travel_chat(
                     "도구가 오류를 반환하면 내용을 고쳐 다음 호출에서 재시도하라."
                 ),
             })
+        elif (
+            food_discovery
+            and write_intent
+            and len(food_geo_candidates) > len(set(proposal_ids))
+            and _round >= 3
+        ):
+            # Keep every permitted schema available because Groq can carry a
+            # research call over from accumulated context. The required choice and
+            # phase prompt still demand an action, while drift no longer becomes a 400.
+            round_tools = set(allowed)
+            round_choice = (
+                {"type": "function", "function": {"name": "propose_place"}}
+                if len(food_geo_candidates) >= 2
+                else "required"
+            )
+            pending_geo = food_geo_candidates[len(set(proposal_ids)):]
+            messages.append({
+                "role": "system",
+                "content": (
+                    "검증 가능한 식당 좌표가 준비됐다. 이제 검색을 더 하지 말고 propose_place로 관리자 승인 대기에 "
+                    "실제 저장하라. title은 '중국어 원명 (한국어 음역·지점명)' 형식으로 쓰고 中街는 중제라고 "
+                    "표기한다. category=restaurant, travel_role=food로 쓰고, 자동으로 "
+                    "읽은 페이지의 실제 URL을 source_urls와 최소 2개 insights에 넣어라. 아직 저장하지 않은 후보만 "
+                    f"처리한다. 좌표 후보: {json.dumps(pending_geo[-2:], ensure_ascii=False, default=str)[:9000]}"
+                ),
+            })
         else:
-            round_tools = set(allowed) - {"web_search"}
-            if not round_tools:
-                round_tools = set(allowed)
+            # Initial server-side search is only a seed. Multi-hop requests such as
+            # food type -> restaurant -> exact branch need targeted searches the
+            # model discovers later; hiding web_search caused Groq 400s.
+            round_tools = set(allowed)
             round_choice = "required" if force_required else "auto"
+            if food_discovery and write_intent and _round >= 2:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "넓은 음식 종류 검색만 반복하지 마라. 지금까지 읽은 페이지에서 구체적인 식당명을 하나 골라 "
+                        "정확한 지점명·주소를 검색/fetch_page로 확인하고 geocode_place를 실행하라. 이미 한 후보를 "
+                        "저장했다면 서로 다른 두 번째 식당을 같은 순서로 처리하라. web_search 인자는 query와 "
+                        "max_results만 사용한다."
+                    ),
+                })
         try:
             response = complete(tool_names=round_tools, tool_choice=round_choice)
         except Exception as exc:  # noqa: BLE001
@@ -718,8 +904,54 @@ def answer_travel_chat(
                 else:
                     seen_tool_calls.add(signature)
                     result = run_tool(db, name, args, city_id=city_id)
+                    if name == "web_search" and isinstance(result, dict):
+                        result = dict(result)
+                        result["auto_fetched_pages"] = fetch_food_evidence(result)
             _collect_tool_sources(name, result, sources)
             tool_results.append({"name": name, "args": args, "result": result})
+            if name == "fetch_page":
+                register_page_coordinates(result, query=str(args.get("url") or ""))
+            if name == "geocode_place" and isinstance(result, dict):
+                grounded_hits: list[dict[str, Any]] = []
+                for hit in result.get("results") or []:
+                    if not isinstance(hit, dict) or hit.get("storage_allowed") is False:
+                        continue
+                    try:
+                        coordinate = (float(hit["lat"]), float(hit["lng"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    verified_coordinates.append(coordinate)
+                    grounded_hits.append(hit)
+                if grounded_hits:
+                    add_food_geo_candidate(str(args.get("query") or ""), grounded_hits)
+                elif food_discovery and write_intent:
+                    original_query = str(args.get("query") or "").strip()
+                    recovery_query = _food_detail_recovery_query(city, original_query)[:300]
+                    if original_query and recovery_query and recovery_query not in food_detail_queries:
+                        food_detail_queries.add(recovery_query)
+                        recovery_args = {"query": recovery_query, "max_results": 8}
+                        recovery_result = run_tool(
+                            db,
+                            "web_search",
+                            recovery_args,
+                            city_id=city_id,
+                        )
+                        seen_tool_calls.add(
+                            f"web_search:{json.dumps(recovery_args, ensure_ascii=False, sort_keys=True, default=str)}"
+                        )
+                        _collect_tool_sources("web_search", recovery_result, sources)
+                        tool_results.append({
+                            "name": "web_search",
+                            "args": recovery_args,
+                            "result": recovery_result,
+                        })
+                        fetched_pages = fetch_food_evidence(recovery_result, limit=3)
+                        result = dict(result)
+                        result["coordinate_recovery"] = {
+                            "query": recovery_query,
+                            "results": recovery_result,
+                            "fetched_pages": fetched_pages,
+                        }
             if name in WRITE_TOOLS and isinstance(result, dict) and result.get("ok"):
                 write_succeeded = True
                 serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
@@ -731,6 +963,9 @@ def answer_travel_chat(
                         successful_write_targets.add(target)
                 if result.get("proposal_id") is not None:
                     proposal_ids.append(int(result["proposal_id"]))
+                    proposal_title = str(args.get("title") or "").strip()
+                    if proposal_title and proposal_title not in proposal_titles:
+                        proposal_titles.append(proposal_title)
             logger.info(
                 "travel_chat tool user=%s city=%s round=%s tool=%s ok=%s error=%s",
                 user_id,
@@ -814,11 +1049,11 @@ def answer_travel_chat(
         final_text = complete_text(final_text)
 
     if _needs_answer_retry(final_text):
-        target_text = "·".join(brand_targets) or "요청한 장소"
+        target_text = "·".join(proposal_titles or brand_targets) or "요청 장소"
         if writes_complete():
             if proposal_ids:
                 final_text = (
-                    f"{target_text}을 관리자 승인 대기 제안 #{', #'.join(map(str, sorted(set(proposal_ids))))}로 실제 저장했습니다. "
+                    f"{target_text}: 관리자 승인 대기 제안 #{', #'.join(map(str, sorted(set(proposal_ids))))}로 실제 저장했습니다. "
                     "관리자가 승인하면 지도에 반영됩니다."
                 )
             else:
@@ -845,11 +1080,11 @@ def answer_travel_chat(
             final_text = "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다. 필요한 대상이나 조건 한 가지만 더 알려 주세요."
 
     if write_intent:
-        target_text = "·".join(brand_targets) or "요청한 장소"
+        target_text = "·".join(proposal_titles or brand_targets) or "요청 장소"
         if writes_complete():
             if proposal_ids:
                 final_text = (
-                    f"{target_text}을 관리자 승인 대기 제안 #{', #'.join(map(str, sorted(set(proposal_ids))))}로 실제 저장했습니다. "
+                    f"{target_text}: 관리자 승인 대기 제안 #{', #'.join(map(str, sorted(set(proposal_ids))))}로 실제 저장했습니다. "
                     "관리자가 승인하면 지도에 반영됩니다."
                 )
             elif existing_target_places:

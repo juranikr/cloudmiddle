@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+from app.agent.tools import _extract_embedded_coordinates
+from app.gcj02 import gcj02_to_wgs84
 from app.geocode import _local_hits, _merge_hits, parse_viewbox
 
 
@@ -32,6 +34,65 @@ def hit(
 
 
 class GeocodeMergeTests(unittest.TestCase):
+    def test_ctrip_food_detail_coordinate_is_converted_for_storage(self) -> None:
+        html = '<script>{"GDCoord":{"Lat":41.7890215,"Lng":123.4169422}}</script>'
+
+        rows = _extract_embedded_coordinates(
+            html,
+            "https://gs.ctrip.com/html5/you/foods/fooddetail/155/5382272.html",
+        )
+        expected_lat, expected_lng = gcj02_to_wgs84(41.7890215, 123.4169422)
+
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["lat"], expected_lat, places=6)
+        self.assertAlmostEqual(rows[0]["lng"], expected_lng, places=6)
+        self.assertEqual(rows[0]["source_crs"], "GCJ-02")
+        self.assertEqual(rows[0]["storage_crs"], "WGS84")
+        self.assertTrue(rows[0]["storage_allowed"])
+
+    def test_embedded_coordinate_ignores_unsupported_pages(self) -> None:
+        html = '<script>{"GDCoord":{"Lat":41.7890215,"Lng":123.4169422}}</script>'
+
+        rows = _extract_embedded_coordinates(html, "https://example.com/food/place")
+
+        self.assertEqual(rows, [])
+
+    def test_qunar_poi_coordinate_is_converted_for_storage(self) -> None:
+        html = "<script>var POI_LAT=41.8012176000;var POI_LNG=123.4632683000;</script>"
+
+        rows = _extract_embedded_coordinates(html, "https://touch.go.qunar.com/poi/16834135")
+        expected_lat, expected_lng = gcj02_to_wgs84(41.8012176, 123.4632683)
+
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["lat"], expected_lat, places=6)
+        self.assertAlmostEqual(rows[0]["lng"], expected_lng, places=6)
+        self.assertEqual(rows[0]["source"], "qunar_embedded_poi")
+        self.assertTrue(rows[0]["storage_allowed"])
+
+    def test_qunar_dist_poi_coordinate_is_supported(self) -> None:
+        html = "<script>var POI_LAT=41.801503;var POI_LNG=123.4606888;</script>"
+
+        rows = _extract_embedded_coordinates(
+            html,
+            "https://touch.travel.qunar.com/dist/poi/3332184",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "qunar_embedded_poi")
+
+    def test_paused_ctrip_restaurant_is_not_storable(self) -> None:
+        html = (
+            "营业提示：暂停营业"
+            '<script>{"GDCoord":{"Lat":41.7890215,"Lng":123.4169422}}</script>'
+        )
+
+        rows = _extract_embedded_coordinates(
+            html,
+            "https://gs.ctrip.com/html5/you/foods/fooddetail/155/5382272.html",
+        )
+
+        self.assertEqual(rows, [])
+
     def test_nominatim_viewbox_order_is_normalized(self) -> None:
         bounds = parse_viewbox("122.85,42.15,123.85,41.45")
         self.assertIsNotNone(bounds)
