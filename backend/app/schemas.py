@@ -99,6 +99,10 @@ class MarkerCreate(BaseModel):
     zone_id: Optional[int] = Field(default=None, gt=0)
     chain_id: Optional[int] = Field(default=None, gt=0)
     branch_name: str = Field(default="", max_length=120)
+    travel_role: str = Field(
+        default="general",
+        pattern="^(history|food|market_night|neighborhood|nature|shopping|rest|practical|general)$",
+    )
 
     @model_validator(mode="after")
     def validate_geometry(self) -> "MarkerCreate":
@@ -118,6 +122,10 @@ class MarkerUpdate(BaseModel):
     zone_id: Optional[int] = Field(default=None, gt=0)
     chain_id: Optional[int] = Field(default=None, gt=0)
     branch_name: Optional[str] = Field(default=None, max_length=120)
+    travel_role: Optional[str] = Field(
+        default=None,
+        pattern="^(history|food|market_night|neighborhood|nature|shopping|rest|practical|general)$",
+    )
 
 
 class PlaceImageOut(BaseModel):
@@ -203,6 +211,7 @@ class MarkerOut(BaseModel):
     chain_id: Optional[int] = None
     chain_name: str = ""
     branch_name: str = ""
+    travel_role: str = "general"
     note_count: int = 0
     coordinate_source: str = "manual"
     coordinate_external_id: str = ""
@@ -315,3 +324,52 @@ class AgentKnowledgeOut(BaseModel):
 class FavoriteToggleOut(BaseModel):
     place_id: int
     is_favorite: bool
+
+
+class TravelPlanItemCreate(BaseModel):
+    place_id: int = Field(gt=0)
+    day: int = Field(default=1, ge=1, le=14)
+    slot: str = Field(default="afternoon", pattern="^(morning|afternoon|evening)$")
+    note: str = Field(default="", max_length=1000)
+
+
+class TravelPlanItemUpdate(BaseModel):
+    day: Optional[int] = Field(default=None, ge=1, le=14)
+    slot: Optional[str] = Field(default=None, pattern="^(morning|afternoon|evening)$")
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class TravelPlanItemOut(BaseModel):
+    id: int
+    city_id: int
+    place_id: int
+    day: int
+    slot: str
+    sort_order: int
+    note: str = ""
+    place: MarkerOut
+    created_at: datetime
+    updated_at: datetime
+
+
+class TravelChatRequest(BaseModel):
+    city_id: int = Field(gt=0)
+    message: str = Field(min_length=1, max_length=3000)
+    selected_place_id: Optional[int] = Field(default=None, gt=0)
+
+
+class TravelChatMessageOut(BaseModel):
+    id: int
+    city_id: int
+    role: str
+    content: str
+    sources: list[str] = Field(default_factory=list)
+    place_ids: list[int] = Field(default_factory=list)
+    created_at: datetime
+
+
+class TravelChatResponse(BaseModel):
+    message: TravelChatMessageOut
+    model: str
+    grounded_place_ids: list[int] = Field(default_factory=list)

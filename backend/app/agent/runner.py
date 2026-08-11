@@ -19,6 +19,7 @@ from app.models import (
     AgentTask,
     City,
     Marker,
+    MarkerShape,
     PlaceAppeal,
     PlaceAppealStatus,
     PlaceEvent,
@@ -150,8 +151,8 @@ def _system_for_city(city: City) -> str:
 def _research_themes(city: City) -> str:
     if city.slug == "shenyang":
         return (
-            "沈阳故宫·张氏帅府·九一八历史博物馆·北陵/东陵·中街·西塔·"
-            "中国工业博物馆·辽宁省博物馆, 동선·운영시간·역사 사건을 우선 조사"
+            "서탑·중가·노북시장·채탑야시장 같은 먹거리/야간, 오래 걷기 좋은 동네, 공원과 강변, "
+            "현지 쇼핑·카페·휴식, 교통/예약 실용정보를 우선한다. 고궁·박물관은 이미 충분하면 추가하지 않는다"
         )
     return f"{city.name_local} 대표 명소·현지 음식·역사·교통·야간 동선"
 
@@ -236,7 +237,7 @@ def _queue_brief(queue: dict[str, Any]) -> str:
 
 
 def _performance_snapshot(db: Session, city_id: int) -> dict[str, int]:
-    return {
+    snapshot = {
         "unread": count_unread(db, city_id),
         "proposals": db.query(AgentProposal).filter(AgentProposal.city_id == city_id).count(),
         "insights": (
@@ -259,6 +260,29 @@ def _performance_snapshot(db: Session, city_id: int) -> dict[str, int]:
             AgentTask.city_id == city_id, AgentTask.status == "completed"
         ).count(),
     }
+    roles = ["history", "food", "market_night", "neighborhood", "nature", "shopping", "rest", "practical"]
+    pending_payloads = db.query(AgentProposal.payload).filter(
+        AgentProposal.city_id == city_id,
+        AgentProposal.action == "create_place",
+        AgentProposal.status == "pending",
+    ).all()
+    proposed_roles: dict[str, int] = {}
+    for row in pending_payloads:
+        try:
+            role = str(json.loads(row.payload or "{}").get("travel_role") or "general")
+        except (json.JSONDecodeError, AttributeError):
+            role = "general"
+        proposed_roles[role] = proposed_roles.get(role, 0) + 1
+    for role in roles:
+        active = db.query(Marker).filter(
+            Marker.city_id == city_id,
+            Marker.shape == MarkerShape.point,
+            Marker.travel_role == role,
+            Marker.merged_into_id.is_(None),
+        ).count()
+        snapshot[f"role_{role}"] = active + proposed_roles.get(role, 0)
+    snapshot["role_diversity"] = sum(1 for role in roles if snapshot[f"role_{role}"] > 0)
+    return snapshot
 
 
 def _performance_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
@@ -270,9 +294,15 @@ def _performance_delta(before: dict[str, int], after: dict[str, int]) -> dict[st
 
 
 def _performance_score(delta: dict[str, int], tool_counts: dict[str, int]) -> float:
+    role_gain = sum(
+        max(0, delta.get(f"role_{role}", 0))
+        for role in ("history", "food", "market_night", "neighborhood", "nature", "shopping", "rest", "practical")
+    )
     return round(
         delta.get("unread_cleared", 0) * 8
-        + delta.get("proposals", 0) * 12
+        + delta.get("proposals", 0) * 3
+        + role_gain * 10
+        + max(0, delta.get("role_diversity", 0)) * 15
         + delta.get("insights", 0) * 3
         + delta.get("zoned_places", 0) * 2
         + delta.get("chained_places", 0) * 2
@@ -284,7 +314,7 @@ def _performance_score(delta: dict[str, int], tool_counts: dict[str, int]) -> fl
 
 
 def _research_gaps(
-    delta: dict[str, int], tool_counts: dict[str, int]
+    delta: dict[str, int], tool_counts: dict[str, int], snapshot: dict[str, int]
 ) -> list[str]:
     gaps: list[str] = []
     if tool_counts.get("list_agent_tasks", 0) == 0:
@@ -293,8 +323,22 @@ def _research_gaps(
         gaps.append("구역 현황 확인")
     if tool_counts.get("fetch_page", 0) < 4:
         gaps.append(f"근거 페이지 4개 이상 정독(현재 {tool_counts.get('fetch_page', 0)})")
-    if delta.get("proposals", 0) < 6:
-        gaps.append(f"승인 제안 6건 이상(현재 +{delta.get('proposals', 0)})")
+    targets = {
+        "history": 2, "food": 3, "market_night": 2, "neighborhood": 2,
+        "nature": 2, "shopping": 1, "rest": 1, "practical": 1,
+    }
+    labels = {
+        "history": "역사", "food": "음식", "market_night": "시장·야간",
+        "neighborhood": "동네 산책", "nature": "자연·공원", "shopping": "쇼핑",
+        "rest": "휴식", "practical": "교통·실용",
+    }
+    missing = [
+        f"{labels[role]} {snapshot.get(f'role_{role}', 0)}/{target}"
+        for role, target in targets.items()
+        if snapshot.get(f"role_{role}", 0) < target
+    ]
+    if missing:
+        gaps.append("여행 역할 균형: " + ", ".join(missing))
     if tool_counts.get("upsert_knowledge", 0) == 0:
         gaps.append("재사용 원칙 최신 합성")
     if tool_counts.get("upsert_agent_task", 0) == 0:
@@ -379,7 +423,9 @@ def run_agent(
             f"우선 조사 테마: {_research_themes(city)}\n"
             f"기존 지식베이스 요약: {kb_hint}\n"
             "필수: 시작 list_knowledge·list_agent_tasks·list_zones, 종료 전 upsert_knowledge와 upsert_agent_task.\n"
-            "1) list_knowledge / list_agent_tasks / list_zones / list_places로 현황과 구역별 정보 공백 파악\n"
+            "1) list_knowledge / list_agent_tasks / list_zones / list_places로 현황을 읽고, "
+            "history·food·market_night·neighborhood·nature·shopping·rest·practical 역할별 보유 수를 센다. "
+            "이미 충분한 역할(특히 박물관/역사)은 신규 발굴을 중단하고 부족 역할만 조사한다.\n"
             "2) 언어 정비: list_places에서 설명에 한국어가 없거나 중국어/영어 위주인 장소를 "
             "전부 찾아 언어 규칙대로 재작성 — 설명에 한국어가 전혀 없으면(사용자 작성 포함) "
             "replace_description으로 원문 정보를 번역해 한국어 재작성(중국어 주소·명칭은 병기 유지). "
@@ -388,10 +434,14 @@ def run_agent(
             "3) 중복 스캔: list_places 전체 목록에서 동명·표기변형(한글/한자/병음) 장소를 찾아 "
             "같은 실체면 거리와 무관하게 merge_places (거리 기준으로 건너뛰지 말 것)\n"
             "4) 웹 조사(필수): list_research_history로 과거 검색어·열람 이력 확인 → "
-            "덜 판 검색어 심화 + 새 테마 키워드 2~3개 조사 → web_search에서 seen=false 결과 위주로 "
+            "중국어 원명과 2026·营业时间·最新地址·闭店·预约를 조합해 부족 역할 키워드 2~3개 조사 → "
+            "공식 시/구청·관광지·교통·문화기관을 1순위, Trip.com·马蜂窝·去哪儿·大众点评/高德 공유 링크를 2순위, "
+            "小红书·Bilibili·개인 블로그는 현지 팁 보조 근거로만 사용한다. web_search에서 seen=false 결과 위주로 "
             "fetch_page 4~8개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
             "5) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
-            "geocode_place → propose_place 승인 제안 6~12개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
+            "geocode_place → propose_place 승인 제안. 건수 할당량을 채우지 말고 역할별 목표 "
+            "(역사2·음식3·시장/야간2·동네2·자연2·쇼핑1·휴식1·실용1)의 부족분만 제안하며 travel_role을 반드시 지정한다. "
+            "제목은 '中文名 (한국어 명칭)', 설명은 한국어+중국어 주소 형식으로 작성한다. "
             "propose_place는 즉시 생성이 아니라 승인 대기 저장이므로 망설이지 말 것. 신규 장소 후보를 "
             "upsert_agent_task에 '승인 제안'으로 대신 적으면 실패이며 도구도 거부한다. "
             "이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·별칭)는 "
@@ -406,8 +456,9 @@ def run_agent(
             "재확인 → verify_place(valid|closed|moved|uncertain + note). "
             "이전(搬迁) 의심이면 같은 지점의 이전인지 다른 지점(분점)인지 반드시 구분하고, "
             "같은 지점 이전이 확실할 때만 좌표를 갱신할 것\n"
-            "8) 사진 보강: image_count가 0인 장소 3~6곳을 골라 search_place_images(중국어 명칭) → "
-            "attach_image_from_url로 업로드 (자유 라이선스만, source에 출처·라이선스 기록)\n"
+            "8) 사진 보강: image_count가 0인 장소 3~6곳을 골라 search_place_images(query, place_id) → "
+            "관련성 점수가 높은 실제 장소 사진만 attach_image_from_url로 업로드한다. 로고·지도·인물 중심 이미지는 제외하고 "
+            "자유 라이선스와 출처를 기록한다.\n"
             "끝나면 한 줄 요약."
         )
     else:
@@ -514,7 +565,7 @@ def run_agent(
                     continue
                 current_snapshot = _performance_snapshot(db, city_id)
                 current_delta = _performance_delta(performance_before, current_snapshot)
-                gaps = _research_gaps(current_delta, tool_counts) if allow_research else []
+                gaps = _research_gaps(current_delta, tool_counts, current_snapshot) if allow_research else []
                 current_score = _performance_score(current_delta, tool_counts)
                 if gaps and progress_nudges < 8 and no_progress_actions < 18 and steps < steps_limit:
                     progress_nudges += 1
@@ -654,7 +705,7 @@ def run_agent(
     performance_after = _performance_snapshot(db, city_id)
     performance_delta = _performance_delta(performance_before, performance_after)
     current_score = _performance_score(performance_delta, tool_counts)
-    gaps = _research_gaps(performance_delta, tool_counts) if allow_research else []
+    gaps = _research_gaps(performance_delta, tool_counts, performance_after) if allow_research else []
     ok = unread_after == 0
     summary = final_text or "에이전트 사이클 완료"
     if tool_counts:

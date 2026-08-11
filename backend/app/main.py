@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.admin_api import router as admin_router
@@ -40,6 +41,8 @@ from app.models import (
     PlaceInsight,
     PlaceNote,
     PlaceChain,
+    TravelChatMessage,
+    TravelPlanItem,
     User,
     UserMessage,
     UserMessageKind,
@@ -73,6 +76,12 @@ from app.schemas import (
     TokenResponse,
     UserMessageOut,
     UserOut,
+    TravelChatMessageOut,
+    TravelChatRequest,
+    TravelChatResponse,
+    TravelPlanItemCreate,
+    TravelPlanItemOut,
+    TravelPlanItemUpdate,
 )
 from app.seed import seed_data
 from app.share_import import import_share_text
@@ -192,6 +201,7 @@ def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
         chain_id=marker.chain_id,
         chain_name=chain_name,
         branch_name=marker.branch_name or "",
+        travel_role=marker.travel_role or "general",
         note_count=len(marker.notes or []),
         coordinate_source=marker.coordinate_source or "manual",
         coordinate_external_id=marker.coordinate_external_id or "",
@@ -442,6 +452,7 @@ def create_marker(
         zone_id=body.zone_id if body.shape == MarkerShape.point else None,
         chain_id=body.chain_id if body.shape == MarkerShape.point else None,
         branch_name=body.branch_name.strip() if body.shape == MarkerShape.point else "",
+        travel_role=body.travel_role if body.shape == MarkerShape.point else "general",
     )
     db.add(marker)
     db.flush()
@@ -1076,6 +1087,193 @@ def my_appeals(
         )
         for a in rows
     ]
+
+
+def _plan_item_to_out(row: TravelPlanItem, *, favorite_ids: set[int] | None = None) -> TravelPlanItemOut:
+    return TravelPlanItemOut(
+        id=row.id,
+        city_id=row.city_id,
+        place_id=row.place_id,
+        day=row.day,
+        slot=row.slot,
+        sort_order=row.sort_order,
+        note=row.note or "",
+        place=marker_to_out(row.place, is_favorite=row.place_id in (favorite_ids or set())),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@app.get("/api/plans/{city_id}", response_model=list[TravelPlanItemOut])
+def list_plan_items(
+    city_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[TravelPlanItemOut]:
+    favorite_ids = {
+        item.place_id
+        for item in db.query(PlaceFavorite.place_id).filter(PlaceFavorite.user_id == current_user.id).all()
+    }
+    rows = (
+        db.query(TravelPlanItem)
+        .options(
+            joinedload(TravelPlanItem.place).joinedload(Marker.images),
+            joinedload(TravelPlanItem.place).joinedload(Marker.insights),
+            joinedload(TravelPlanItem.place).joinedload(Marker.zone),
+            joinedload(TravelPlanItem.place).joinedload(Marker.chain),
+            joinedload(TravelPlanItem.place).joinedload(Marker.creator),
+            joinedload(TravelPlanItem.place).joinedload(Marker.contributors).joinedload(PlaceContributor.user),
+        )
+        .filter(TravelPlanItem.user_id == current_user.id, TravelPlanItem.city_id == city_id)
+        .order_by(TravelPlanItem.day, TravelPlanItem.sort_order, TravelPlanItem.id)
+        .all()
+    )
+    return [_plan_item_to_out(row, favorite_ids=favorite_ids) for row in rows]
+
+
+@app.post("/api/plans/{city_id}/items", response_model=TravelPlanItemOut, status_code=status.HTTP_201_CREATED)
+def create_plan_item(
+    city_id: int,
+    body: TravelPlanItemCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TravelPlanItemOut:
+    place = _load_place(db, body.place_id)
+    if place is None or place.city_id != city_id or place.shape != MarkerShape.point:
+        raise HTTPException(status_code=404, detail="이 도시의 장소를 찾을 수 없습니다")
+    max_order = (
+        db.query(func.max(TravelPlanItem.sort_order))
+        .filter(
+            TravelPlanItem.user_id == current_user.id,
+            TravelPlanItem.city_id == city_id,
+            TravelPlanItem.day == body.day,
+        )
+        .scalar()
+        or 0
+    )
+    row = TravelPlanItem(
+        user_id=current_user.id,
+        city_id=city_id,
+        place_id=body.place_id,
+        day=body.day,
+        slot=body.slot,
+        sort_order=max_order + 10,
+        note=body.note.strip(),
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="이미 일정에 담긴 장소입니다") from exc
+    db.refresh(row)
+    row.place = place
+    return _plan_item_to_out(row)
+
+
+@app.patch("/api/plan-items/{item_id}", response_model=TravelPlanItemOut)
+def update_plan_item(
+    item_id: int,
+    body: TravelPlanItemUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TravelPlanItemOut:
+    row = (
+        db.query(TravelPlanItem)
+        .options(joinedload(TravelPlanItem.place))
+        .filter(TravelPlanItem.id == item_id, TravelPlanItem.user_id == current_user.id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="일정 항목을 찾을 수 없습니다")
+    for key, value in body.model_dump(exclude_unset=True).items():
+        setattr(row, key, value.strip() if key == "note" and value is not None else value)
+    db.commit()
+    db.refresh(row)
+    place = _load_place(db, row.place_id)
+    assert place is not None
+    row.place = place
+    return _plan_item_to_out(row)
+
+
+@app.delete("/api/plan-items/{item_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+def delete_plan_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    row = (
+        db.query(TravelPlanItem)
+        .filter(TravelPlanItem.id == item_id, TravelPlanItem.user_id == current_user.id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="일정 항목을 찾을 수 없습니다")
+    db.delete(row)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _chat_message_to_out(row: TravelChatMessage) -> TravelChatMessageOut:
+    try:
+        sources = json.loads(row.sources or "[]")
+    except json.JSONDecodeError:
+        sources = []
+    try:
+        place_ids = json.loads(row.place_ids or "[]")
+    except json.JSONDecodeError:
+        place_ids = []
+    return TravelChatMessageOut(
+        id=row.id,
+        city_id=row.city_id,
+        role=row.role,
+        content=row.content,
+        sources=sources if isinstance(sources, list) else [],
+        place_ids=place_ids if isinstance(place_ids, list) else [],
+        created_at=row.created_at,
+    )
+
+
+@app.get("/api/travel-chat", response_model=list[TravelChatMessageOut])
+def list_travel_chat(
+    city_id: int = Query(..., gt=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[TravelChatMessageOut]:
+    rows = (
+        db.query(TravelChatMessage)
+        .filter(TravelChatMessage.user_id == current_user.id, TravelChatMessage.city_id == city_id)
+        .order_by(TravelChatMessage.id.desc())
+        .limit(80)
+        .all()
+    )
+    rows.reverse()
+    return [_chat_message_to_out(row) for row in rows]
+
+
+@app.post("/api/travel-chat", response_model=TravelChatResponse)
+def post_travel_chat(
+    body: TravelChatRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TravelChatResponse:
+    from app.travel_chat import answer_travel_chat
+
+    try:
+        result = answer_travel_chat(
+            db,
+            user_id=current_user.id,
+            city_id=body.city_id,
+            message=body.message.strip(),
+            selected_place_id=body.selected_place_id,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return TravelChatResponse(
+        message=_chat_message_to_out(result["row"]),
+        model=result["model"],
+        grounded_place_ids=result["place_ids"],
+    )
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

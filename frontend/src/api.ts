@@ -13,6 +13,8 @@ import type {
   PlaceChain,
   User,
   UserMessage,
+  TravelChatMessage,
+  TravelPlanItem,
 } from "./types";
 
 export interface GeocodeHit {
@@ -449,5 +451,61 @@ export async function addFavorite(token: string, placeId: number): Promise<{ pla
 
 export async function removeFavorite(token: string, placeId: number): Promise<{ place_id: number; is_favorite: boolean }> {
   const res = await request(`/api/favorites/${placeId}`, { method: "DELETE", headers: authHeaders(token) });
+  return handle(res);
+}
+
+export async function fetchTravelPlan(token: string, cityId: number): Promise<TravelPlanItem[]> {
+  const res = await request(`/api/plans/${cityId}`, { headers: authHeaders(token) });
+  return handle<TravelPlanItem[]>(res);
+}
+
+export async function addTravelPlanItem(
+  token: string,
+  cityId: number,
+  body: { place_id: number; day: number; slot: TravelPlanItem["slot"]; note?: string },
+): Promise<TravelPlanItem> {
+  const res = await request(`/api/plans/${cityId}/items`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return handle<TravelPlanItem>(res);
+}
+
+export async function updateTravelPlanItem(
+  token: string,
+  itemId: number,
+  body: Partial<Pick<TravelPlanItem, "day" | "slot" | "sort_order" | "note">>,
+): Promise<TravelPlanItem> {
+  const res = await request(`/api/plan-items/${itemId}`, {
+    method: "PATCH",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  return handle<TravelPlanItem>(res);
+}
+
+export async function deleteTravelPlanItem(token: string, itemId: number): Promise<void> {
+  const res = await request(`/api/plan-items/${itemId}`, {
+    method: "DELETE",
+    headers: authHeaders(token),
+  });
+  await handle<void>(res);
+}
+
+export async function fetchTravelChat(token: string, cityId: number): Promise<TravelChatMessage[]> {
+  const res = await request(`/api/travel-chat?city_id=${cityId}`, { headers: authHeaders(token) });
+  return handle<TravelChatMessage[]>(res);
+}
+
+export async function sendTravelChat(
+  token: string,
+  body: { city_id: number; message: string; selected_place_id?: number | null },
+): Promise<{ message: TravelChatMessage; model: string; grounded_place_ids: number[] }> {
+  const res = await request("/api/travel-chat", {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
   return handle(res);
 }

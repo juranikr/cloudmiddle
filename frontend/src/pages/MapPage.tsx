@@ -22,6 +22,11 @@ import MessageInbox from "../components/MessageInbox";
 import ShareImport from "../components/ShareImport";
 import UserLocation, { type LocateStatus } from "../components/UserLocation";
 import ZoneDrawer from "../components/ZoneDrawer";
+import BrandMark from "../components/BrandMark";
+import PlaceFeed from "../components/PlaceFeed";
+import TravelAgent from "../components/TravelAgent";
+import TravelPlanner from "../components/TravelPlanner";
+import WorkspaceNav, { type WorkspaceView } from "../components/WorkspaceNav";
 import {
   canUseGeolocation,
   formatGeoError,
@@ -157,6 +162,9 @@ export default function MapPage() {
   const [moreOpen, setMoreOpen] = useState(false);
   const [sideCollapsed, setSideCollapsed] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("map");
+  const [controlsOpen, setControlsOpen] = useState(false);
+  const [plannerPlace, setPlannerPlace] = useState<MarkerItem | null>(null);
   const [isDesktop, setIsDesktop] = useState(() =>
     typeof window !== "undefined" ? window.matchMedia("(min-width: 860px)").matches : true,
   );
@@ -198,6 +206,8 @@ export default function MapPage() {
     setSearchPin(null);
     setSelected(null);
     setPanelMode(null);
+    setWorkspaceView("map");
+    setControlsOpen(false);
   }, [selectedCityId]);
 
   useEffect(() => {
@@ -703,9 +713,10 @@ export default function MapPage() {
       <main className="city-home">
         <header className="city-home__header">
           <div>
-            <p>CHINA TRAVEL NOTES</p>
-            <h1>어느 도시를 여행할까요?</h1>
-            <span>{user?.display_name}님의 여행 지도를 선택하세요.</span>
+            <BrandMark />
+            <p>CHINA, ONE CITY AT A TIME</p>
+            <h1>먼 곳의 친구를 만나러 갑니다.</h1>
+            <span>{user?.display_name}님, 이번에는 어느 도시를 걸어볼까요?</span>
           </div>
           <button type="button" className="link-btn" onClick={logout}>로그아웃</button>
         </header>
@@ -725,8 +736,9 @@ export default function MapPage() {
   }
 
   return (
-    <div className={`map-app ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""} ${sideCollapsed ? "map-app--side-collapsed" : ""}`}>
-      <aside className="map-side">
+    <div className={`map-app wonrae-app map-app--${workspaceView} ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""} ${sideCollapsed ? "map-app--side-collapsed" : ""}`}>
+      <WorkspaceNav value={workspaceView} cityLabel={`${selectedCity.name_ko} ${selectedCity.name_local}`} onChange={(view) => { if (view !== "map") { setCategoryFilter(null); setFavoritesOnly(false); setAgentSuggestedOnly(false); setZoneFilter(null); } setWorkspaceView(view); setControlsOpen(false); }} />
+      <aside className={`map-side ${controlsOpen ? "map-side--open" : ""}`}>
         <button
           type="button"
           className="side-collapse-btn desktop-only"
@@ -738,10 +750,10 @@ export default function MapPage() {
         </button>
         <div className="map-side__top">
           <div className="map-side__brand">
-            <div>
-              <strong>지난 여행 지도</strong>
-              <span>{user?.display_name}</span>
-            </div>
+            <BrandMark compact />
+            <button type="button" className="map-controls-toggle mobile-only" onClick={() => setControlsOpen((value) => !value)} aria-expanded={controlsOpen}>
+              {controlsOpen ? "닫기" : "검색·필터"}
+            </button>
             <div className="map-side__brand-actions desktop-only">
               {user?.is_admin ? (
                 <a className="link-btn" href="/admin">
@@ -883,12 +895,13 @@ export default function MapPage() {
                 pathOptions={{
                   color: CATEGORY_META[m.category].color,
                   fillColor: CATEGORY_META[m.category].color,
-                  fillOpacity: 0.22,
-                  weight: 2,
+                  fillOpacity: zoneFilter === m.id ? 0.28 : 0.08,
+                  weight: zoneFilter === m.id ? 3 : 1.5,
                 }}
-                interactive={false}
+                interactive
+                eventHandlers={{ click: () => setZoneFilter((current) => current === m.id ? null : m.id) }}
               >
-                <Tooltip permanent direction="center" className="zone-label" opacity={1}>
+                <Tooltip permanent={zoneFilter === m.id} sticky direction="center" className="zone-label" opacity={1}>
                   {m.title}
                 </Tooltip>
               </Polygon>
@@ -915,6 +928,20 @@ export default function MapPage() {
           ) : null}
         </MapContainer>
       </div>
+
+      {workspaceView !== "map" ? (
+        <div className="workspace-content">
+          {workspaceView === "feed" ? (
+            <PlaceFeed city={selectedCity} markers={markers} onOpen={(marker) => { setWorkspaceView("map"); openView(marker); setFlyTarget({ lat: marker.lat, lng: marker.lng }); }} onPlan={(marker) => { setPlannerPlace(marker); setWorkspaceView("plan"); }} />
+          ) : null}
+          {workspaceView === "plan" && token ? (
+            <TravelPlanner token={token} city={selectedCity} markers={markers} initialPlace={plannerPlace} onOpen={(marker) => { setWorkspaceView("map"); openView(marker); setFlyTarget({ lat: marker.lat, lng: marker.lng }); }} />
+          ) : null}
+          {workspaceView === "agent" && token ? (
+            <TravelAgent token={token} city={selectedCity} selected={selected} onOpen={(placeId) => { const marker = markers.find((item) => item.id === placeId); if (marker) { setWorkspaceView("map"); openView(marker); setFlyTarget({ lat: marker.lat, lng: marker.lng }); } }} />
+          ) : null}
+        </div>
+      ) : null}
 
       {guideOpen ? (
         <section className="city-guide-screen" aria-label={`${selectedCity.name_ko} 이틀 여행 가이드`}>
@@ -1000,7 +1027,7 @@ export default function MapPage() {
         </div>
       ) : null}
 
-      <nav className="gnb mobile-only" aria-label="하단 메뉴">
+      <nav className="gnb legacy-gnb" aria-label="하단 메뉴">
         <button
           type="button"
           className={mobileTab === "map" && !inboxOpen && !moreOpen ? "is-active" : ""}

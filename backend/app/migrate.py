@@ -63,6 +63,17 @@ def ensure_schema() -> None:
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_markers_chain_id ON markers (chain_id)"))
             if "branch_name" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN branch_name VARCHAR(120) DEFAULT '' NOT NULL"))
+            if "travel_role" not in cols:
+                conn.execute(text("ALTER TABLE markers ADD COLUMN travel_role VARCHAR(30) DEFAULT 'general' NOT NULL"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_markers_travel_role ON markers (travel_role)"))
+                # Backfill a useful baseline without pretending category and travel role are identical.
+                conn.execute(text("UPDATE markers SET travel_role = 'food' WHERE category IN ('restaurant', 'drink')"))
+                conn.execute(text("UPDATE markers SET travel_role = 'rest' WHERE category = 'lodging'"))
+                conn.execute(text("UPDATE markers SET travel_role = 'shopping' WHERE category = 'shopping'"))
+                conn.execute(text("UPDATE markers SET travel_role = 'practical' WHERE category IN ('transport', 'convenience')"))
+                conn.execute(text("UPDATE markers SET travel_role = 'history' WHERE category = 'tourist' AND (title LIKE '%博物馆%' OR title LIKE '%博物館%' OR title LIKE '%故宫%' OR title LIKE '%宫%' OR title LIKE '%역사%' OR title LIKE '%박물관%')"))
+                conn.execute(text("UPDATE markers SET travel_role = 'market_night' WHERE title LIKE '%市场%' OR title LIKE '%夜市%' OR title LIKE '%시장%'"))
+                conn.execute(text("UPDATE markers SET travel_role = 'nature' WHERE title LIKE '%公园%' OR title LIKE '%山%' OR title LIKE '%공원%'"))
             if "shape" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN shape VARCHAR(20) DEFAULT 'point' NOT NULL"))
             if "polygon" not in cols:

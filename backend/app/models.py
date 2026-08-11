@@ -118,6 +118,9 @@ class Marker(Base):
         ForeignKey("place_chains.id", ondelete="SET NULL"), index=True, nullable=True
     )
     branch_name: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    # A place's role in a balanced trip. Kept separate from the map icon category so
+    # research can measure whether a city has more than just attractions/museums.
+    travel_role: Mapped[str] = mapped_column(String(30), default="general", index=True, nullable=False)
     category: Mapped[MarkerCategory] = mapped_column(
         Enum(
             MarkerCategory,
@@ -584,4 +587,43 @@ class AgentTask(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TravelPlanItem(Base):
+    """A user's lightweight, city-scoped itinerary item."""
+
+    __tablename__ = "travel_plan_items"
+    __table_args__ = (
+        UniqueConstraint("user_id", "city_id", "place_id", name="uq_plan_user_city_place"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    place_id: Mapped[int] = mapped_column(ForeignKey("markers.id", ondelete="CASCADE"), index=True)
+    day: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    slot: Mapped[str] = mapped_column(String(20), default="afternoon", nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    place: Mapped[Marker] = relationship()
+
+
+class TravelChatMessage(Base):
+    """Grounded travel-agent conversation history, separated by user and city."""
+
+    __tablename__ = "travel_chat_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    sources: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    place_ids: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 

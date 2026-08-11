@@ -9,6 +9,16 @@ export type MarkerCategory =
   | "other";
 
 export type MarkerShape = "point" | "polygon";
+export type TravelRole =
+  | "history"
+  | "food"
+  | "market_night"
+  | "neighborhood"
+  | "nature"
+  | "shopping"
+  | "rest"
+  | "practical"
+  | "general";
 
 export interface LatLng {
   lat: number;
@@ -149,6 +159,7 @@ export interface MarkerItem {
   chain_id: number | null;
   chain_name: string;
   branch_name: string;
+  travel_role: TravelRole;
   note_count: number;
   coordinate_source: string;
   coordinate_external_id: string;
@@ -181,6 +192,7 @@ export interface MarkerPayload {
   zone_id?: number | null;
   chain_id?: number | null;
   branch_name?: string;
+  travel_role?: TravelRole;
 }
 
 export interface UserMessage {
@@ -259,4 +271,27 @@ export interface AdminAgentTask {
   result: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface TravelPlanItem {
+  id: number;
+  city_id: number;
+  place_id: number;
+  day: number;
+  slot: "morning" | "afternoon" | "evening";
+  sort_order: number;
+  note: string;
+  place: MarkerItem;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TravelChatMessage {
+  id: number;
+  city_id: number;
+  role: "user" | "assistant";
+  content: string;
+  sources: string[];
+  place_ids: number[];
+  created_at: string;
 }

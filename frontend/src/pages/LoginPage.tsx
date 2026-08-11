@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useAuth } from "../auth";
+import BrandMark from "../components/BrandMark";
 
 export default function LoginPage() {
   const { login } = useAuth();
@@ -25,11 +26,10 @@ export default function LoginPage() {
     <div className="login">
       <div className="login__bg" aria-hidden />
       <div className="login__card">
-        <p className="login__eyebrow">China Travel Notes</p>
-        <h1 className="login__title">지난 여행 지도</h1>
+        <BrandMark />
+        <p className="login__eyebrow">CHINA TRAVEL, CURATED TOGETHER</p>
         <p className="login__lead">
-          한국 여행자들이 도시별로 모아 두는 중국 여행 스팟 기록. 로그인 후 도시를 골라 마커를 남기고
-          다른 사람의 핀도 함께 보세요.
+          지도, 장소 기록, 여행 일정과 현지 조사를 한곳에. 먼 곳에서 온 친구처럼 도시를 천천히 알아갑니다.
         </p>
 
         <form className="login__form" onSubmit={onSubmit}>

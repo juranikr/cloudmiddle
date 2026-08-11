@@ -262,6 +262,11 @@ TOOLS: list[dict[str, Any]] = [
                         ),
                     },
                     "category": {"type": "string"},
+                    "travel_role": {
+                        "type": "string",
+                        "enum": ["history", "food", "market_night", "neighborhood", "nature", "shopping", "rest", "practical", "general"],
+                        "description": "이틀 여행에서 이 장소가 채우는 역할. 박물관은 history, 식당은 food처럼 실제 목적 기준",
+                    },
                 },
                 "required": ["place_id"],
             },
@@ -297,6 +302,11 @@ TOOLS: list[dict[str, Any]] = [
                     "chain_name_local": {"type": "string", "description": "체인점이면 브랜드 현지명"},
                     "chain_name_ko": {"type": "string"},
                     "branch_name": {"type": "string", "description": "체인점의 실제 지점명"},
+                    "travel_role": {
+                        "type": "string",
+                        "enum": ["history", "food", "market_night", "neighborhood", "nature", "shopping", "rest", "practical", "general"],
+                        "description": "여행 경험에서 맡는 역할. history만 반복하지 말고 현재 도시의 부족 역할을 우선",
+                    },
                     "evidence": {
                         "type": "string",
                         "description": "왜 이 장소를 추가해야 하는지와 교차 확인한 근거를 한국어로 요약",
@@ -587,6 +597,7 @@ TOOLS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "장소 명칭 (중국어 권장)"},
+                    "place_id": {"type": "integer", "description": "등록 장소 ID. 명칭 변형과 좌표 주변 사진을 함께 검색"},
                     "limit": {"type": "integer", "default": 5},
                 },
                 "required": ["query"],
@@ -805,6 +816,7 @@ def _place_brief(m: Marker) -> dict[str, Any]:
         "city_id": m.city_id,
         "title": m.title,
         "category": m.category.value if m.category else None,
+        "travel_role": m.travel_role or "general",
         "shape": m.shape.value if m.shape else None,
         "lat": m.lat,
         "lng": m.lng,
@@ -1090,9 +1102,108 @@ def _wikimedia_image_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
                 "height": ii.get("thumbheight") or ii.get("height"),
                 "license": license_name,
                 "page_url": ii.get("descriptionurl") or "",
+                "provider": "Wikimedia Commons",
             }
         )
     return out
+
+
+def _wikimedia_geosearch(lat: float, lng: float, limit: int = 8) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode(
+        {
+            "action": "query",
+            "format": "json",
+            "generator": "geosearch",
+            "ggsprimary": "all",
+            "ggsnamespace": 6,
+            "ggsradius": 10000,
+            "ggscoord": f"{lat}|{lng}",
+            "ggslimit": max(1, min(limit, 20)),
+            "prop": "imageinfo",
+            "iiprop": "url|size|extmetadata",
+            "iiurlwidth": 1280,
+        }
+    )
+    req = urllib.request.Request(f"{_WIKIMEDIA_API}?{params}", headers={"User-Agent": _IMAGE_UA})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    out: list[dict[str, Any]] = []
+    for page in (data.get("query", {}).get("pages") or {}).values():
+        infos = page.get("imageinfo") or []
+        if not infos:
+            continue
+        ii = infos[0]
+        thumb = ii.get("thumburl") or ii.get("url") or ""
+        if not str(thumb).lower().rsplit("?", 1)[0].endswith((".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        meta = ii.get("extmetadata") or {}
+        out.append(
+            {
+                "title": page.get("title", ""),
+                "image_url": thumb,
+                "width": ii.get("thumbwidth") or ii.get("width"),
+                "height": ii.get("thumbheight") or ii.get("height"),
+                "license": ((meta.get("LicenseShortName") or {}).get("value") or "")[:100],
+                "page_url": ii.get("descriptionurl") or "",
+                "provider": "Wikimedia Commons nearby",
+            }
+        )
+    return out
+
+
+def _openverse_image_search(query: str, limit: int = 8) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode({"q": query, "page_size": max(1, min(limit, 20))})
+    req = urllib.request.Request(
+        f"https://api.openverse.org/v1/images/?{params}",
+        headers={"User-Agent": _IMAGE_UA, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=18) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    allowed = {"cc0", "pdm", "by", "by-sa"}
+    out: list[dict[str, Any]] = []
+    for item in data.get("results") or []:
+        license_code = str(item.get("license") or "").lower()
+        if license_code not in allowed:
+            continue
+        image_url = item.get("thumbnail") or item.get("url") or ""
+        if not str(image_url).lower().startswith("https://"):
+            continue
+        out.append(
+            {
+                "title": item.get("title") or "",
+                "image_url": image_url,
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "license": f"{license_code.upper()} {item.get('license_version') or ''}".strip(),
+                "page_url": item.get("foreign_landing_url") or item.get("detail_url") or "",
+                "provider": f"Openverse · {item.get('source') or item.get('provider') or 'open media'}",
+            }
+        )
+    return out
+
+
+def _image_relevance(item: dict[str, Any], query: str) -> float:
+    haystack = f"{item.get('title', '')} {item.get('page_url', '')}".casefold()
+    tokens = [token.casefold() for token in re.findall(r"[\w\u3400-\u9fff]{2,}", query)]
+    score = 24.0 if item.get("provider", "").startswith("Wikimedia") else 18.0
+    score += sum(16.0 for token in set(tokens) if token in haystack)
+    width = int(item.get("width") or 0)
+    height = int(item.get("height") or 0)
+    if width >= 1200:
+        score += 12
+    elif width >= 800:
+        score += 7
+    elif width and width < 500:
+        score -= 20
+    if width and height:
+        ratio = width / max(height, 1)
+        if 0.75 <= ratio <= 2.0:
+            score += 8
+        elif ratio < 0.45 or ratio > 3.0:
+            score -= 16
+    if re.search(r"logo|icon|map|地图|portrait|person|旗|徽|seal|diagram", haystack):
+        score -= 36
+    return round(score, 1)
 
 
 def run_tool(
@@ -1507,6 +1618,11 @@ def run_tool(
                     changed["category"] = m.category.value
             except ValueError:
                 pass
+        role = str(args.get("travel_role") or "").strip()
+        valid_roles = {"history", "food", "market_night", "neighborhood", "nature", "shopping", "rest", "practical", "general"}
+        if role in valid_roles and role != (m.travel_role or "general"):
+            m.travel_role = role
+            changed["travel_role"] = role
         if not changed:
             return {"ok": True, "changed": {}}
         after = marker_field_snapshot(m)
@@ -1584,6 +1700,7 @@ def run_tool(
             "title": title,
             "description": desc,
             "category": cat.value,
+            "travel_role": str(args.get("travel_role") or "general")[:30],
             "lat": float(args["lat"]),
             "lng": float(args["lng"]),
             "context": str(args.get("context") or "")[:8000],
@@ -1641,6 +1758,7 @@ def run_tool(
             coordinate_crs="WGS84",
             coordinate_verified_at=datetime.now(timezone.utc),
             is_agent_suggested=True,
+            travel_role=payload["travel_role"],
         )
         if payload["zone_id"] is not None:
             zone = db.query(Marker).filter(
@@ -2365,8 +2483,53 @@ def run_tool(
         query = str(args.get("query") or "").strip()
         if not query:
             return {"results": []}
+        limit = max(1, min(int(args.get("limit") or 8), 20))
         try:
-            return {"results": _wikimedia_image_search(query, limit=int(args.get("limit") or 5))}
+            marker = None
+            if args.get("place_id") is not None:
+                marker = db.query(Marker).filter(
+                    Marker.id == int(args["place_id"]),
+                    Marker.city_id == city_id,
+                    Marker.merged_into_id.is_(None),
+                ).first()
+            queries = [query]
+            if marker is not None:
+                local = marker.title.split("(", 1)[0].strip()
+                if local and local.casefold() != query.casefold():
+                    queries.append(local)
+                city = db.get(City, city_id)
+                if city:
+                    queries.append(f"{city.slug} {local or query}")
+                    if city.name_local not in query:
+                        queries.append(f"{city.name_local} {local or query}")
+            candidates: list[dict[str, Any]] = []
+            errors: list[str] = []
+            for candidate_query in queries[:3]:
+                try:
+                    candidates.extend(_wikimedia_image_search(candidate_query, limit=max(5, limit)))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"commons:{exc}"[:180])
+                try:
+                    candidates.extend(_openverse_image_search(candidate_query, limit=max(5, limit)))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"openverse:{exc}"[:180])
+            if marker is not None:
+                try:
+                    nearby = _wikimedia_geosearch(marker.lat, marker.lng, limit=max(8, limit))
+                    for item in nearby:
+                        item["nearby"] = True
+                    candidates.extend(nearby)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"geosearch:{exc}"[:180])
+            unique: dict[str, dict[str, Any]] = {}
+            for item in candidates:
+                url = str(item.get("image_url") or "")
+                if not url or url in unique:
+                    continue
+                item["score"] = _image_relevance(item, query) + (5 if item.get("nearby") else 0)
+                unique[url] = item
+            ranked = sorted(unique.values(), key=lambda item: item.get("score", 0), reverse=True)
+            return {"results": ranked[:limit], "pool_size": len(ranked), "queries": queries[:3], "warnings": errors[:4]}
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)[:300], "results": []}
 
@@ -2392,6 +2555,13 @@ def run_tool(
             return {"error": "not_found"}
         if len(m.images) >= 8:
             return {"error": "too_many_images"}
+        duplicate = db.query(PlaceEvent.id).filter(
+            PlaceEvent.place_id == pid,
+            PlaceEvent.action == PlaceEventAction.image_add,
+            PlaceEvent.payload.contains(url),
+        ).first()
+        if duplicate:
+            return {"error": "duplicate_image_source"}
         try:
             req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_UA})
             with urllib.request.urlopen(req, timeout=25) as resp:
