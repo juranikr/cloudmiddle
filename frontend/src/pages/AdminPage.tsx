@@ -341,7 +341,7 @@ export default function AdminPage() {
           </button>
         </div>
         <p className="panel__meta">
-          매일 새벽 03:00(KST)에도 자동 실행됩니다. API 키는 AWS Secrets Manager
+          매일 03:00·11:00·19:00(KST)에 성과 기반 자동 실행됩니다. API 키는 AWS Secrets Manager
           (`tourmiddle-dev/app`의 GROQ_*)에서 관리합니다.
         </p>
       </section> : null}

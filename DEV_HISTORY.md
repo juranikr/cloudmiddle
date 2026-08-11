@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-11 (KST) — 도시별 근거 기반 에이전트·구조화 장소 지식·승인 UX
+최종 갱신: 2026-08-12 (KST) — 성과 기반 배치 에이전트·실행 가시성·지도 핀 클러스터
 
 ---
 
@@ -34,7 +34,7 @@
 | App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`, `GROQ_API_KEY`, `GROQ_MODEL`, `ARCGIS_API_KEY`) |
 | 이미지 S3 | `tourmiddle-dev-place-images-155557574983` |
 | 이미지 CDN | https://d3qw5zq6yb15c.cloudfront.net |
-| 에이전트 스케줄 | EventBridge `cron(0 18 * * ? *)` = 매일 03:00 KST → ECS task `tourmiddle-dev-agent` |
+| 에이전트 스케줄 | EventBridge `cron(0 2,10,18 * * ? *)` = 매일 11:00/19:00/03:00 KST → ECS task `tourmiddle-dev-agent` |
 
 **트래픽 경로:** 브라우저 → CloudFront(HTTPS) → ALB(HTTP, CloudFront prefix만 허용) → ECS Fargate → RDS
 
@@ -57,11 +57,12 @@
 ## 3) 제품·기능
 
 - 지도: Leaflet + OSM, 도시 선택에 따라 중심·검색·GPS 유효 범위 전환
+- 가까운 point 마커는 현재 줌의 화면 거리 기준으로 숫자 클러스터에 묶고, 클릭 시 카테고리·구역을 보며 장소를 선택
 - 마커: point(핀) / polygon(구역), 카테고리: tourist, lodging, restaurant, transport, shopping, drink, convenience, other
 - UX: 핀 모드 → 드래프트 + ConfirmBar(입력/취소); 구역 모드 → 탭 선택(점-in-폴리곤), 드래그로 그리기; 핀 모드에서는 구역이 클릭을 가로채지 않음
 - 장소는 **공유 모델**: 단일 소유자 없음, `place_contributors` + 로그인 사용자 전원 수정/삭제. **「내 마커」필터 제거**
 - 이력: `place_events` (create/update/delete/merge/image_*/context_*/agent_create/**rollback**) + `groq_read_at`
-- **Groq ReAct+tools** (`backend/app/agent/`): 도시별 미읽음 이벤트·이의신청·롤백 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/admin/agent/run`, 매일 새벽은 활성 도시별 실행
+- **Groq ReAct+tools** (`backend/app/agent/`): 도시별 미읽음 이벤트를 우선 처리하고, 실제 DB 변화·새 근거·측정 가능한 성과 공백을 기준으로 조사 전략을 조정. 수동 `POST /api/admin/agent/run`, 매일 3회 활성 도시별 실행
   - `city_id`를 러너와 모든 장소 도구에 강제 전달해 제남/선양 큐·장소·지식·검색 이력이 섞이지 않음
   - 자동 생성·병합 비활성 상태에서도 `agent_proposals`에 근거·출처 URL·신뢰도를 저장하고 `/admin`에서 승인/거절
   - 도시/장소 지식 topic을 `city:{id}:...` / `place:{id}:...`로 분리해 같은 `research_strategy`가 덮어써지지 않음
@@ -72,8 +73,10 @@
   - UI/설명은 한국어, **명칭·주소는 현지 표기 유지**
   - 에이전트 변경은 `before` 스냅샷 저장 → 관리자 롤백 가능
   - `list_recent_rollbacks`: 롤백 교훈을 읽고 **같은 방향 수정 반복 금지**
+  - 실행별 실제 DB 변화·새 근거·반복 호출·성과 점수·남은 공백을 `agent_runs`/`agent_run_steps`에 기록하고 관리자 UI에서 단계별 확인
+  - 동일 조사 호출 차단, 새 근거 없는 행동 감지, 측정 가능한 후속 과제와 자동 공백 해소로 고정 스텝 대신 성과 기반 종료
 - **메시지함** UI (상단) + 장소 상세/메시지에서 이의신청
-- **관리자** `/admin` (성주한 `joohan92@naver.com`만, `ADMIN_EMAILS`): 에이전트 수동 실행, **에이전트 변경 이력·롤백**, 사용자 CRUD, 미읽음/Groq 상태. API 키는 Secrets Manager
+- **관리자** `/admin` (성주한 `joohan92@naver.com`만, `ADMIN_EMAILS`): 에이전트 수동 실행, 실행별 DB 증감·실제 변경·전체 도구 과정, **에이전트 변경 이력·롤백**, 사용자 CRUD, 미읽음/Groq 상태. API 키는 Secrets Manager
 - 기존 마커에 `place_events`가 없으면 기동 시 **create 미읽음 백필**
 - **이미지**: S3 presigned PUT + CloudFront URL, 상세 상단 슬라이드 (`ImageSlideshow`)
 - 주소·장소 검색: 백엔드 `/api/geocode`가 **운영 DB → ArcGIS → Nominatim → Wikidata** 후보를 도시 경계 안에서 병렬 조회·근접 병합
