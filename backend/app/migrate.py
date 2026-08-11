@@ -165,6 +165,17 @@ def ensure_schema() -> None:
                 conn.execute(text("ALTER TABLE agent_web_visits ADD COLUMN city_id INTEGER"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_web_visits_city_id ON agent_web_visits (city_id)"))
 
+        if "travel_chat_messages" in tables:
+            chat_cols = {c["name"] for c in insp.get_columns("travel_chat_messages")}
+            if "candidates" not in chat_cols:
+                conn.execute(
+                    text("ALTER TABLE travel_chat_messages ADD COLUMN candidates TEXT DEFAULT '[]' NOT NULL")
+                )
+            if "tool_trace" not in chat_cols:
+                conn.execute(
+                    text("ALTER TABLE travel_chat_messages ADD COLUMN tool_trace TEXT DEFAULT '[]' NOT NULL")
+                )
+
         # 기여자 백필: 기존 markers.user_id → place_contributors
         tables_now = set(inspect(engine).get_table_names())
         if "markers" in tables_now and "place_contributors" in tables_now:

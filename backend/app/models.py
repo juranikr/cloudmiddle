@@ -625,5 +625,12 @@ class TravelChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     sources: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     place_ids: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # Research candidates are kept separately from assistant prose.  A short
+    # follow-up such as "등록해줘" can therefore refer to the exact grounded
+    # business without trusting or reparsing an earlier natural-language claim.
+    candidates: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # Compact, inspectable system history for this turn.  It intentionally keeps
+    # tool names, arguments, outcomes and evidence URLs rather than model tokens.
+    tool_trace: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 

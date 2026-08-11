@@ -37,7 +37,7 @@ import {
   saveLocateOn,
 } from "../mapStorage";
 import { getSearchResultIcon } from "../markerIcons";
-import type { City, LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape, PlaceChain } from "../types";
+import type { City, LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape, PlaceChain, TravelChatCandidate } from "../types";
 
 const JINAN_CENTER: [number, number] = [36.65, 117.12];
 const DEFAULT_ZOOM = 12;
@@ -417,6 +417,40 @@ export default function MapPage() {
     setAwaitingImportPick(true);
     clearDraft();
     setPanelMode(null);
+  }
+
+  function handleChatCandidate(candidate: TravelChatCandidate) {
+    const candidateCategory = CATEGORY_LIST.includes(candidate.category as MarkerCategory)
+      ? candidate.category as MarkerCategory
+      : "other";
+    setWorkspaceView("map");
+    setToolMode("pin");
+    setSelected(null);
+    setMoreOpen(false);
+    setCreateDefaults({
+      title: candidate.title,
+      description: [
+        candidate.address ? `주소: ${candidate.address}` : "",
+        "대화 에이전트가 출처와 함께 보존한 장소 후보입니다.",
+      ].filter(Boolean).join("\n"),
+      category: candidateCategory,
+      coordinateSource: candidate.lat != null && candidate.lng != null ? "agent_research" : "manual",
+      coordinateQuery: [candidate.title, candidate.address].filter(Boolean).join(" "),
+      coordinateSourceUrl: candidate.source_urls[0] ?? "",
+      coordinateConfidence: candidate.confidence || null,
+    });
+    if (candidate.lat != null && candidate.lng != null) {
+      pendingImportPick.current = false;
+      setAwaitingImportPick(false);
+      setFlyTarget({ lat: candidate.lat, lng: candidate.lng });
+      placePinDraft(candidate.lat, candidate.lng, { openCreate: true });
+      return;
+    }
+    pendingImportPick.current = true;
+    setAwaitingImportPick(true);
+    clearDraft();
+    setPanelMode(null);
+    setError(`${candidate.title}의 정확한 위치를 지도에서 탭하면 조사한 이름과 주소로 등록 화면이 열립니다.`);
   }
 
   function handleLocateStatus(status: LocateStatus, message: string) {
@@ -931,7 +965,7 @@ export default function MapPage() {
             <TravelPlanner token={token} city={selectedCity} markers={markers} initialPlace={plannerPlace} onOpen={(marker) => { setWorkspaceView("map"); openView(marker); setFlyTarget({ lat: marker.lat, lng: marker.lng }); }} />
           ) : null}
           {workspaceView === "agent" && token ? (
-            <TravelAgent token={token} city={selectedCity} selected={selected} onOpen={(placeId) => { const marker = markers.find((item) => item.id === placeId); if (marker) { setWorkspaceView("map"); openView(marker); setFlyTarget({ lat: marker.lat, lng: marker.lng }); } }} />
+            <TravelAgent token={token} city={selectedCity} selected={selected} onOpen={(placeId) => { const marker = markers.find((item) => item.id === placeId); if (marker) { setWorkspaceView("map"); openView(marker); setFlyTarget({ lat: marker.lat, lng: marker.lng }); } }} onLocateCandidate={handleChatCandidate} />
           ) : null}
         </div>
       ) : null}

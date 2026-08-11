@@ -360,6 +360,19 @@ class TravelChatRequest(BaseModel):
     selected_place_id: Optional[int] = Field(default=None, gt=0)
 
 
+class TravelChatCandidateOut(BaseModel):
+    key: str
+    title: str
+    address: str = ""
+    category: str = "other"
+    status: str = "grounded"
+    source_urls: list[str] = Field(default_factory=list)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    confidence: float = 0.0
+    proposal_id: Optional[int] = None
+
+
 class TravelChatMessageOut(BaseModel):
     id: int
     city_id: int
@@ -367,6 +380,7 @@ class TravelChatMessageOut(BaseModel):
     content: str
     sources: list[str] = Field(default_factory=list)
     place_ids: list[int] = Field(default_factory=list)
+    candidates: list[TravelChatCandidateOut] = Field(default_factory=list)
     created_at: datetime
 
 

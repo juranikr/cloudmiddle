@@ -1224,6 +1224,10 @@ def _chat_message_to_out(row: TravelChatMessage) -> TravelChatMessageOut:
         place_ids = json.loads(row.place_ids or "[]")
     except json.JSONDecodeError:
         place_ids = []
+    try:
+        candidates = json.loads(row.candidates or "[]")
+    except (AttributeError, json.JSONDecodeError):
+        candidates = []
     return TravelChatMessageOut(
         id=row.id,
         city_id=row.city_id,
@@ -1231,6 +1235,7 @@ def _chat_message_to_out(row: TravelChatMessage) -> TravelChatMessageOut:
         content=row.content,
         sources=sources if isinstance(sources, list) else [],
         place_ids=place_ids if isinstance(place_ids, list) else [],
+        candidates=candidates if isinstance(candidates, list) else [],
         created_at=row.created_at,
     )
 

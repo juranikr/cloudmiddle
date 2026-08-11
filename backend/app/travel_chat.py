@@ -1,6 +1,8 @@
+import hashlib
 import json
 import logging
 import re
+import urllib.parse
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
@@ -127,6 +129,13 @@ def _resolve_context_message(message: str, rows: list[TravelChatMessage]) -> str
         or _is_contextual_write_followup(message)
     ):
         return message
+    candidate = _latest_chat_candidate(rows)
+    if candidate:
+        return (
+            "이전 도구 조사에서 구조화해 보존한 장소 후보: "
+            + json.dumps(candidate, ensure_ascii=False, default=str)
+            + f"\n현재 후속 지시: {message}"
+        )
     previous = _recent_user_requests(rows, limit=8)
     for content in reversed(previous):
         if (
@@ -137,6 +146,282 @@ def _resolve_context_message(message: str, rows: list[TravelChatMessage]) -> str
         ):
             return f"이전 사용자 요청: {content}\n현재 후속 지시: {message}"
     return message
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _latest_chat_candidate(rows: list[TravelChatMessage]) -> dict[str, Any] | None:
+    """Return the newest structured candidate, never an assistant prose guess."""
+    for row in reversed(rows):
+        if getattr(row, "role", "") != "assistant":
+            continue
+        candidates = _json_list(getattr(row, "candidates", "[]"))
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not str(candidate.get("title") or "").strip():
+                continue
+            if str(candidate.get("status") or "") in {"mapped", "dismissed"}:
+                continue
+            return dict(candidate)
+        # Only the latest assistant turn may bind a short command.  Looking past
+        # an intervening answer can silently register an older, unrelated place.
+        return None
+    return None
+
+
+def _candidate_seed_query(city: City, candidate: dict[str, Any]) -> str:
+    parts = [city.name_local, str(candidate.get("title") or "").strip()]
+    address = str(candidate.get("address") or "").strip()
+    if address:
+        parts.append(address)
+    parts.append("地址")
+    return re.sub(r"\s+", " ", " ".join(part for part in parts if part)).strip()[:300]
+
+
+def _compact_candidate_text(value: str) -> str:
+    return re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", (value or "").casefold())
+
+
+def _candidate_title_from_page(value: str) -> str:
+    title = re.sub(r"\s+", " ", value or "").strip()
+    bracket = re.match(r"^[【\[]([^】\]]{3,120})[】\]]", title)
+    if bracket:
+        title = bracket.group(1).strip()
+    else:
+        title = re.split(r"\s*(?:[-—_|｜]|_电话|电话_地址|地址_价格)\s*", title, maxsplit=1)[0].strip()
+    title = re.sub(r"^(?:沈阳)?(?:SPA)?", "", title, flags=re.IGNORECASE).strip()
+    return title[:160]
+
+
+def _candidate_category(message: str) -> str:
+    folded = message.casefold()
+    if any(term in folded for term in ("마사지", "按摩", "spa", "스파", "足疗", "洗浴")):
+        return "other"
+    if any(term in folded for term in ("음료", "카페", "奶茶", "咖啡", "요거트", "喜茶")):
+        return "drink"
+    if any(term in folded for term in ("식당", "맛집", "음식", "餐厅", "饭店", "美食")):
+        return "restaurant"
+    if any(term in folded for term in ("호텔", "숙소", "酒店", "宾馆")):
+        return "lodging"
+    if any(term in folded for term in ("역", "지하철", "공항", "站", "机场")):
+        return "transport"
+    return "tourist"
+
+
+def _extract_address(*values: str) -> str:
+    for value in values:
+        match = re.search(r"(?:주소|地址)\s*[:：]\s*([^\n。；;]{4,140})", value or "")
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip(" ,，")[:180]
+    return ""
+
+
+def _source_host_quality(url: str) -> float:
+    host = (urllib.parse.urlsplit(url).hostname or "").casefold()
+    if any(host == item or host.endswith(f".{item}") for item in (
+        "dianping.com", "meituan.com", "ctrip.com", "qunar.com", "trip.com",
+        "shenyang.gov.cn", "ln.gov.cn", "bendibao.com", "maigoo.com",
+    )):
+        return 0.9
+    return 0.55
+
+
+def _candidate_matches_answer(title: str, answer: str) -> bool:
+    title_key = _compact_candidate_text(title)
+    answer_key = _compact_candidate_text(answer)
+    if len(title_key) < 4 or not answer_key:
+        return False
+    if title_key in answer_key:
+        return True
+    # Search titles often add a city or category prefix.  Require a long shared
+    # entity fragment so generic words such as "中街店" cannot create a candidate.
+    for size in range(min(len(title_key), 18), 5, -1):
+        if any(title_key[start:start + size] in answer_key for start in range(len(title_key) - size + 1)):
+            return True
+    return False
+
+
+def _extract_grounded_candidates(
+    answer: str,
+    tool_results: list[dict[str, Any]],
+    *,
+    message: str,
+    locked_candidate: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+
+    def add_candidate(title: str, url: str, text: str = "", quality: float = 0.0) -> None:
+        clean_title = _candidate_title_from_page(title)
+        if not clean_title or not _candidate_matches_answer(clean_title, answer):
+            return
+        key_text = _compact_candidate_text(clean_title)
+        if len(key_text) < 4:
+            return
+        # Collapse SEO/title variants of the same business by a stable shared core.
+        existing_key = next(
+            (
+                key for key in grouped
+                if key in key_text or key_text in key or (
+                    len(key) >= 6 and len(key_text) >= 6 and key[:6] == key_text[:6]
+                )
+            ),
+            key_text,
+        )
+        row = grouped.setdefault(existing_key, {
+            "title": clean_title,
+            "address": "",
+            "category": _candidate_category(message),
+            "source_urls": [],
+            "lat": None,
+            "lng": None,
+            "confidence": 0.0,
+        })
+        if len(clean_title) < len(str(row["title"])):
+            row["title"] = clean_title
+        if url.startswith(("http://", "https://")) and url not in row["source_urls"]:
+            row["source_urls"].append(url)
+        row["address"] = row["address"] or _extract_address(answer, text)
+        row["confidence"] = max(float(row["confidence"]), quality or _source_host_quality(url))
+
+    for item in tool_results:
+        name = str(item.get("name") or "")
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        if name == "web_search":
+            for hit in result.get("results") or []:
+                if not isinstance(hit, dict):
+                    continue
+                add_candidate(
+                    str(hit.get("title") or ""),
+                    str(hit.get("href") or ""),
+                    str(hit.get("body") or ""),
+                    float(hit.get("quality") or 0),
+                )
+        elif name == "fetch_page":
+            add_candidate(
+                str(result.get("title") or ""),
+                str(result.get("url") or item.get("args", {}).get("url") or ""),
+                str(result.get("text") or ""),
+                0.85,
+            )
+
+    candidates = list(grouped.values())
+    if locked_candidate:
+        locked_key = _compact_candidate_text(str(locked_candidate.get("title") or ""))
+        matching = next(
+            (row for row in candidates if locked_key in _compact_candidate_text(str(row["title"]))
+             or _compact_candidate_text(str(row["title"])) in locked_key),
+            None,
+        )
+        if matching is None:
+            matching = dict(locked_candidate)
+            matching["source_urls"] = list(matching.get("source_urls") or [])
+            candidates.insert(0, matching)
+        else:
+            matching["title"] = str(locked_candidate.get("title") or matching["title"])
+            matching["address"] = matching.get("address") or str(locked_candidate.get("address") or "")
+            matching["source_urls"] = list(dict.fromkeys([
+                *(locked_candidate.get("source_urls") or []),
+                *(matching.get("source_urls") or []),
+            ]))[:8]
+        candidates = [matching]
+
+    for candidate in candidates[:4]:
+        title = str(candidate.get("title") or "")
+        address = str(candidate.get("address") or "")
+        title_key = _compact_candidate_text(title)
+        for item in tool_results:
+            if item.get("name") not in {"geocode_place", "fetch_page"}:
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict):
+                continue
+            query = str((item.get("args") or {}).get("query") or (item.get("args") or {}).get("url") or "")
+            if title_key and title_key not in _compact_candidate_text(query) and (
+                not address or _compact_candidate_text(address) not in _compact_candidate_text(query)
+            ):
+                continue
+            points = result.get("results") or result.get("coordinate_candidates") or []
+            point = next(
+                (hit for hit in points if isinstance(hit, dict) and hit.get("storage_allowed") is not False),
+                None,
+            )
+            if point:
+                try:
+                    candidate["lat"] = float(point["lat"])
+                    candidate["lng"] = float(point["lng"])
+                    candidate["confidence"] = max(
+                        float(candidate.get("confidence") or 0),
+                        float(point.get("confidence") or 0.75),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
+                break
+        candidate["source_urls"] = list(dict.fromkeys(candidate.get("source_urls") or []))[:8]
+        candidate["key"] = hashlib.sha256(
+            f"{title_key}|{_compact_candidate_text(address)}".encode("utf-8")
+        ).hexdigest()[:16]
+        candidate["status"] = "located" if candidate.get("lat") is not None else "location_needed"
+        candidate["confidence"] = round(float(candidate.get("confidence") or 0.55), 3)
+    candidates.sort(key=lambda row: (-float(row.get("confidence") or 0), str(row.get("title") or "")))
+    return candidates[:4]
+
+
+def _supporting_sources(answer: str, tool_results: list[dict[str, Any]]) -> list[str]:
+    ranked: list[tuple[float, int, str]] = []
+    seen: set[str] = set()
+    order = 0
+    for item in tool_results:
+        name = str(item.get("name") or "")
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        rows = result.get("results") or [] if name == "web_search" else [result]
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("href") or row.get("url") or (item.get("args") or {}).get("url") or "")
+            if not url.startswith(("http://", "https://")) or url in seen:
+                continue
+            title = str(row.get("title") or "")
+            if not _candidate_matches_answer(_candidate_title_from_page(title), answer):
+                continue
+            seen.add(url)
+            quality = float(row.get("quality") or (0.9 if name == "fetch_page" else _source_host_quality(url)))
+            ranked.append((quality, order, url))
+            order += 1
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    return [url for _quality, _order, url in ranked[:8]]
+
+
+def _compact_tool_trace(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trace: list[dict[str, Any]] = []
+    for sequence, item in enumerate(tool_results, 1):
+        result = item.get("result")
+        result_dict = result if isinstance(result, dict) else {}
+        urls: list[str] = []
+        _collect_sources(result_dict, set_urls := set())
+        urls.extend(sorted(set_urls)[:5])
+        trace.append({
+            "sequence": sequence,
+            "tool": str(item.get("name") or "")[:80],
+            "args": item.get("args") if isinstance(item.get("args"), dict) else {},
+            "ok": bool(result_dict.get("ok")) or (
+                not result_dict.get("error") and bool(result_dict.get("results") or result_dict.get("text"))
+            ),
+            "error": str(result_dict.get("error") or result_dict.get("detail") or "")[:300],
+            "result_count": len(result_dict.get("results") or []),
+            "urls": urls,
+        })
+    return trace[-40:]
 
 
 def _food_business_name(city: City, query: str) -> str:
@@ -227,6 +512,9 @@ def _research_seed_queries(city: City, message: str) -> list[str]:
         queries.append(f"{city.name_local} {BRAND_STORE_SEARCHES['모어요거트']} 地址")
     if any(alias.casefold() in folded for alias in BRAND_ANSWER_ALIASES["헤이티"]):
         queries.append(f"{city.name_local} {BRAND_STORE_SEARCHES['헤이티']} 地址")
+    if not queries and any(term in folded for term in ("마사지", "스파", "按摩", "spa", "足疗", "洗浴")):
+        area = " 中街" if any(term in folded for term in ("중제", "中街")) else ""
+        queries.append(f"{city.name_local}{area} 正规 洗浴 按摩 推荐")
     if not queries and FOOD_DISCOVERY_RE.search(message):
         queries.extend([
             f"{city.name_local} 必吃 特色美食 传统小吃",
@@ -355,6 +643,10 @@ def answer_travel_chat(
         .all()
     )
     prior.reverse()
+    contextual_followup = bool(
+        SHORT_FOLLOWUP_RE.search(message.strip()) or _is_contextual_write_followup(message)
+    )
+    locked_candidate = _latest_chat_candidate(prior) if contextual_followup else None
     resolved_message = _resolve_context_message(message, prior)
     write_intent, allowed = _chat_capabilities(message, context_message=resolved_message)
     food_discovery = bool(FOOD_DISCOVERY_RE.search(resolved_message))
@@ -420,6 +712,16 @@ def answer_travel_chat(
             "content": (
                 "현재 말은 짧은 후속 명령이다. 아래처럼 직전의 구체적 사용자 요청과 결합해 해석했다. "
                 "현재 지시를 새 질문처럼 버리지 말고 실제 행동까지 이어가라:\n" + resolved_message
+            ),
+        })
+    if locked_candidate:
+        messages.append({
+            "role": "system",
+            "content": (
+                "이번 후속 명령의 대상은 아래 구조화 후보로 고정되어 있다. 다른 업소나 비슷한 상호로 "
+                "대체하지 마라. 이름·주소·출처를 유지한 채 같은 후보의 좌표와 상세 근거만 보강하고, "
+                "저장 요청이면 이 후보만 propose_place로 처리하라:\n"
+                + json.dumps(locked_candidate, ensure_ascii=False, default=str)
             ),
         })
     messages.append({"role": "user", "content": message})
@@ -619,7 +921,12 @@ def answer_travel_chat(
 
     seed_results: list[dict[str, Any]] = []
     if allowed:
-        for seed_query in _research_seed_queries(city, resolved_message):
+        seed_queries = (
+            [_candidate_seed_query(city, locked_candidate)]
+            if locked_candidate
+            else _research_seed_queries(city, resolved_message)
+        )
+        for seed_query in seed_queries:
             seed_args = {"query": seed_query, "max_results": 8}
             seed_result = run_tool(db, "web_search", seed_args, city_id=city_id)
             _collect_tool_sources("web_search", seed_result, sources)
@@ -891,6 +1198,26 @@ def answer_travel_chat(
                 missing_business_evidence = False
                 coordinate_mismatch = False
                 if name == "propose_place":
+                    if locked_candidate:
+                        proposed_key = _compact_candidate_text(str(args.get("title") or ""))
+                        locked_key = _compact_candidate_text(str(locked_candidate.get("title") or ""))
+                        if not proposed_key or not locked_key or (
+                            proposed_key not in locked_key and locked_key not in proposed_key
+                        ):
+                            result = {
+                                "error": "candidate_target_changed",
+                                "detail": (
+                                    "후속 명령은 보존된 장소 후보에 고정되어 있습니다. 다른 업소로 바꾸지 말고 "
+                                    f"{locked_candidate.get('title')}만 제안하세요."
+                                ),
+                            }
+                            tool_results.append({"name": name, "args": args, "result": result})
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": json.dumps(result, ensure_ascii=False),
+                            })
+                            continue
                     serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
                     proposed_targets = [
                         target
@@ -1137,6 +1464,54 @@ def answer_travel_chat(
         else:
             final_text = "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다. 필요한 대상이나 조건 한 가지만 더 알려 주세요."
 
+    turn_candidates = _extract_grounded_candidates(
+        final_text,
+        tool_results,
+        message=resolved_message,
+        locked_candidate=locked_candidate,
+    )
+    # A grounded recommendation is useful conversation state even before a write
+    # request. Resolve its exact position once on the server so the next short
+    # command can act deterministically instead of asking the model to rediscover it.
+    if turn_candidates and turn_candidates[0].get("lat") is None:
+        candidate = turn_candidates[0]
+        geo_query = " ".join(filter(None, [
+            city.name_local,
+            str(candidate.get("title") or ""),
+            str(candidate.get("address") or ""),
+        ]))[:300]
+        already_geocoded = any(
+            item.get("name") == "geocode_place"
+            and _compact_candidate_text(geo_query)
+            == _compact_candidate_text(str((item.get("args") or {}).get("query") or ""))
+            for item in tool_results
+        )
+        if geo_query and not already_geocoded:
+            geo_args = {"query": geo_query, "limit": 5}
+            geo_result = run_tool(db, "geocode_place", geo_args, city_id=city_id)
+            _collect_tool_sources("geocode_place", geo_result, sources)
+            tool_results.append({"name": "geocode_place", "args": geo_args, "result": geo_result})
+            turn_candidates = _extract_grounded_candidates(
+                final_text,
+                tool_results,
+                message=resolved_message,
+                locked_candidate=locked_candidate,
+            )
+    if proposal_ids:
+        for index, candidate in enumerate(turn_candidates):
+            candidate_key = _compact_candidate_text(str(candidate.get("title") or ""))
+            matching_title = next(
+                (
+                    title for title in proposal_titles
+                    if candidate_key in _compact_candidate_text(title)
+                    or _compact_candidate_text(title) in candidate_key
+                ),
+                None,
+            )
+            if matching_title:
+                candidate["status"] = "proposed"
+                candidate["proposal_id"] = sorted(set(proposal_ids))[min(index, len(set(proposal_ids)) - 1)]
+
     if write_intent:
         target_text = "·".join(proposal_titles or brand_targets) or "요청 장소"
         if writes_complete():
@@ -1171,6 +1546,16 @@ def answer_travel_chat(
                 parts.append(f"{', '.join(failed)}은 근거가 있었지만 저장 도구가 성공하지 않아 DB 제안이 생성되지 않았습니다.")
             if food_discovery and proposal_ids:
                 parts.append(f"식당 후보 {len(set(proposal_ids))}건은 승인 대기 제안으로 실제 저장했습니다.")
+            elif locked_candidate and turn_candidates:
+                retained = turn_candidates[0]
+                parts.append(
+                    f"{retained.get('title')} 후보와 출처는 대화 이력에 보존했습니다. "
+                    "다른 업소로 바꾸지 않았습니다."
+                )
+                if retained.get("lat") is None:
+                    parts.append(
+                        "다만 저장 가능한 정확한 좌표를 확인하지 못해 지도 승인 제안까지 만들지는 않았습니다."
+                    )
             elif not brand_targets:
                 parts.append("성공한 저장 도구가 없어 DB 변경은 발생하지 않았습니다.")
             if food_discovery:
@@ -1179,6 +1564,9 @@ def answer_travel_chat(
             final_text = " ".join(parts)
 
     final_text = _strip_unsupported_urls(final_text, sources)
+    display_sources = _supporting_sources(final_text, tool_results)
+    if not display_sources and turn_candidates:
+        display_sources = list(turn_candidates[0].get("source_urls") or [])[:8]
     place_ids = {
         int(match)
         for match in PLACE_ID_RE.findall(final_text)
@@ -1191,14 +1579,18 @@ def answer_travel_chat(
         content=message,
         sources="[]",
         place_ids=json.dumps([selected_place_id] if selected_place_id else []),
+        candidates="[]",
+        tool_trace="[]",
     )
     assistant_row = TravelChatMessage(
         user_id=user_id,
         city_id=city_id,
         role="assistant",
         content=final_text,
-        sources=json.dumps(sorted(sources)[:12], ensure_ascii=False),
+        sources=json.dumps(display_sources, ensure_ascii=False),
         place_ids=json.dumps(sorted(place_ids)),
+        candidates=json.dumps(turn_candidates, ensure_ascii=False, default=str),
+        tool_trace=json.dumps(_compact_tool_trace(tool_results), ensure_ascii=False, default=str),
     )
     db.add_all([user_row, assistant_row])
     db.commit()
@@ -1207,5 +1599,6 @@ def answer_travel_chat(
         "row": assistant_row,
         "model": model,
         "place_ids": sorted(place_ids),
-        "sources": sorted(sources)[:12],
+        "sources": display_sources,
+        "candidates": turn_candidates,
     }

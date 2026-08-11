@@ -60,6 +60,149 @@ from app.rollback import _rollback_merge, marker_snapshot
 
 logger = logging.getLogger(__name__)
 
+_TRUSTED_SEARCH_HOSTS = (
+    "dianping.com",
+    "meituan.com",
+    "ctrip.com",
+    "qunar.com",
+    "trip.com",
+    "baidu.com",
+    "amap.com",
+    "openstreetmap.org",
+    "wikidata.org",
+    "wikipedia.org",
+    "shenyang.gov.cn",
+    "ln.gov.cn",
+    "bendibao.com",
+    "maigoo.com",
+)
+_BLOCKED_SEARCH_HOST_PARTS = (
+    "tanhuasq.com",
+    "shangspa.com",
+    "zjbinshuiyuan.cn",
+    "quanshanyayuan.cn",
+    "sxyijia.cn",
+    "nihaoad.com",
+    "62652.cn",
+    "tongchenganmo.cn",
+    "moyedaojia.com",
+    "shufuanmo.com",
+    "xjspa.com",
+    "024leisure.com",
+    "024xyw.com",
+    "qltyw.com",
+    "ypljj.com",
+    "fenglougg.com",
+    "paperword.cn",
+    "jiupinfang2.cn",
+    "huangloublog.com",
+)
+_UNSAFE_SEARCH_TEXT_RE = re.compile(
+    r"探花|黑料|成人视频|成人短剧|福利(?:视频|外流)|约炮|换妻|巨乳|少妇技师|"
+    r"丝足|上门按摩|上门推拿|同城按摩|私人会所|养生网|凤楼|休闲验证|"
+    r"求操|骚|情色|裸聊",
+    re.IGNORECASE,
+)
+_IRRELEVANT_TECH_TEXT_RE = re.compile(
+    r"API|Android|SCIM|Okta|Snowflake|Bedrock|WordPress|密码重置|"
+    r"프로그래밍|개발자|기술 블로그|인증 라이브러리|비밀번호 재설정",
+    re.IGNORECASE,
+)
+_QUERY_ACTION_WORDS = {
+    "이전", "사용자", "요청", "현재", "후속", "지시", "찾아줘", "검색", "등록해줘",
+    "추가해줘", "지도에", "주소", "推荐", "攻略", "地址", "찾아", "등록", "추가",
+}
+
+
+def _search_host(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").casefold()
+    except ValueError:
+        return ""
+
+
+def _blocked_search_url(url: str) -> bool:
+    host = _search_host(url)
+    if not host or any(part in host for part in _BLOCKED_SEARCH_HOST_PARTS):
+        return True
+    return bool(
+        re.search(r"/archives?/\d+/?$", url, re.IGNORECASE)
+        and (host.endswith(".cc") or host.endswith("cloudfront.net"))
+    )
+
+
+def _search_relevance_groups(query: str) -> list[tuple[str, ...]]:
+    folded = query.casefold()
+    groups: list[tuple[str, ...]] = []
+    if any(term in folded for term in ("沈阳", "선양", "심양")):
+        groups.append(("沈阳", "선양", "심양", "shenyang"))
+    if any(term in folded for term in ("中街", "중제")):
+        groups.append(("中街", "중제", "zhongjie"))
+    if any(term in folded for term in ("마사지", "按摩", "spa", "스파", "足疗", "洗浴")):
+        groups.append(("마사지", "按摩", "spa", "스파", "足疗", "洗浴", "推拿"))
+    if any(term in folded for term in ("식당", "맛집", "음식", "餐厅", "美食", "小吃", "饭店")):
+        groups.append(("식당", "맛집", "음식", "餐厅", "美食", "小吃", "饭店", "restaurant"))
+    if any(term in folded for term in ("호텔", "숙소", "酒店", "宾馆", "住宿")):
+        groups.append(("호텔", "숙소", "酒店", "宾馆", "住宿", "hotel"))
+    if any(term in folded for term in ("카페", "음료", "차", "咖啡", "奶茶", "饮品")):
+        groups.append(("카페", "음료", "咖啡", "奶茶", "饮品", "tea", "cafe"))
+    return groups
+
+
+def _search_result_quality(query: str, item: dict[str, Any]) -> float:
+    """Reject unsafe/off-topic search hits before they reach the model or history."""
+    url = str(item.get("href") or "")
+    host = _search_host(url)
+    if not host or not url.startswith(("http://", "https://")):
+        return 0.0
+    if _blocked_search_url(url):
+        return 0.0
+    text = " ".join(str(item.get(field) or "") for field in ("title", "body", "href"))
+    if _UNSAFE_SEARCH_TEXT_RE.search(text):
+        return 0.0
+    if _IRRELEVANT_TECH_TEXT_RE.search(text) and not _IRRELEVANT_TECH_TEXT_RE.search(query):
+        return 0.0
+    # Disposable spam mirrors in this corpus overwhelmingly use /archives/<id>
+    # on .cc or CloudFront hosts and have no stable publisher identity.
+    trusted = any(host == domain or host.endswith(f".{domain}") for domain in _TRUSTED_SEARCH_HOSTS)
+    folded_text = text.casefold()
+    relevance_groups = _search_relevance_groups(query)
+    matched_groups = sum(any(term.casefold() in folded_text for term in group) for group in relevance_groups)
+
+    raw_tokens = re.findall(r"[0-9A-Za-z가-힣\u3400-\u9fff]{2,}", query)
+    tokens = [token for token in raw_tokens if token.casefold() not in _QUERY_ACTION_WORDS]
+    token_matches = sum(1 for token in tokens[:12] if token.casefold() in folded_text)
+
+    score = 0.18 + (0.38 if trusted else 0.0)
+    score += min(0.28, matched_groups * 0.14)
+    score += min(0.2, token_matches * 0.05)
+    if relevance_groups and matched_groups == 0 and not trusted:
+        return 0.0
+    if len(relevance_groups) >= 2 and matched_groups < 2:
+        return 0.0
+    if not relevance_groups and token_matches == 0 and not trusted:
+        return 0.0
+    return round(min(score, 1.0), 3)
+
+
+def _filter_search_results(
+    query: str,
+    results: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    ranked: list[tuple[float, int, dict[str, Any]]] = []
+    for index, item in enumerate(results):
+        quality = _search_result_quality(query, item)
+        if quality < 0.55:
+            continue
+        enriched = dict(item)
+        enriched["quality"] = quality
+        ranked.append((quality, index, enriched))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    kept = [item for _quality, _index, item in ranked[:limit]]
+    return kept, max(0, len(results) - len(kept))
+
 TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -2482,7 +2625,7 @@ def run_tool(
                     try:
                         backend_results = list(ddgs.text(
                             query,
-                            max_results=max_results,
+                            max_results=min(max_results * 2, 30),
                             backend=backend,
                         ))
                     except Exception as backend_exc:  # noqa: BLE001
@@ -2492,7 +2635,8 @@ def run_tool(
                         search_backends.append(backend)
                         backend_batches.append(backend_results)
             seen_result_urls: set[str] = set()
-            for index in range(max_results):
+            raw_limit = min(max_results * 3, 45)
+            for index in range(max((len(batch) for batch in backend_batches), default=0)):
                 for batch in backend_batches:
                     if index >= len(batch):
                         continue
@@ -2502,9 +2646,9 @@ def run_tool(
                         continue
                     seen_result_urls.add(item_url)
                     results.append(item)
-                    if len(results) >= max_results:
+                    if len(results) >= raw_limit:
                         break
-                if len(results) >= max_results:
+                if len(results) >= raw_limit:
                     break
             if not results:
                 raise RuntimeError("; ".join(backend_errors) or "no search results")
@@ -2526,6 +2670,8 @@ def run_tool(
             )
             return {"error": str(exc), "results": []}
 
+        raw_result_count = len(results)
+        results, discarded_count = _filter_search_results(query, results, limit=max_results)
         hrefs = [r.get("href") or "" for r in results]
         known_rows = (
             db.query(AgentSearchResult).filter(AgentSearchResult.url.in_(hrefs)).all()
@@ -2538,6 +2684,7 @@ def run_tool(
                 "title": r.get("title"),
                 "href": r.get("href"),
                 "body": (r.get("body") or "")[:300],
+                "quality": float(r.get("quality") or 0),
                 "seen": (r.get("href") or "") in seen_urls,
             }
             for r in results
@@ -2579,6 +2726,8 @@ def run_tool(
         return {
             "results": out,
             "backend": "+".join(search_backends),
+            "raw_results_count": raw_result_count,
+            "discarded_count": discarded_count,
             "past_searches": {
                 "times": len(past),
                 "last_at": past[0].searched_at.isoformat() if past else None,
@@ -2589,6 +2738,8 @@ def run_tool(
         url = str(args.get("url") or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             return {"error": "bad_url"}
+        if _blocked_search_url(url):
+            return {"error": "blocked_source", "detail": "스팸·성인·저품질 출처는 열람하지 않습니다."}
         prior = db.query(AgentWebVisit).filter(
             AgentWebVisit.url == url,
             AgentWebVisit.city_id == city_id,
@@ -2600,6 +2751,9 @@ def run_tool(
             return {"error": f"fetch_failed: {exc}"[:300]}
         if "error" in page:
             return page
+        page_text = f"{page.get('title') or ''} {page.get('text') or ''}"
+        if _UNSAFE_SEARCH_TEXT_RE.search(page_text):
+            return {"error": "unsafe_source_content", "detail": "여행 정보에 부적합한 출처를 제외했습니다."}
         _record_visit(db, url, page.get("title") or "", city_id=city_id)
         return {
             "url": url,

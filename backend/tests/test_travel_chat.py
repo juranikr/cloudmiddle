@@ -8,7 +8,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.agent.tools import TOOLS
+from app.agent.tools import TOOLS, _filter_search_results, _search_result_quality
 from app.config import settings
 from app.db import Base
 from app.models import City, Marker, MarkerCategory, TravelChatMessage
@@ -20,17 +20,105 @@ from app.travel_chat import (
     _chat_capabilities,
     _food_business_name,
     _food_detail_recovery_query,
+    _extract_grounded_candidates,
+    _latest_chat_candidate,
     _missing_brand_targets,
     _needs_answer_retry,
     _research_seed_queries,
     _research_seed_query,
     _resolve_context_message,
     _strip_unsupported_urls,
+    _supporting_sources,
     answer_travel_chat,
 )
 
 
 class TravelChatRoutingTests(unittest.TestCase):
+    def test_search_filter_keeps_relevant_local_source_and_drops_spam(self) -> None:
+        query = "沈阳 中街 按摩店"
+        safe = {
+            "title": "【绿波廊SPA会馆 (中街店)】电话_地址_东中街洗浴中心",
+            "href": "https://m.dianping.com/shop/example",
+            "body": "沈阳中街洗浴与按摩服务",
+        }
+        unsafe = {
+            "title": "扫街探店黑料成人视频",
+            "href": "https://random.example.cc/archives/108389/",
+            "body": "成人内容",
+        }
+        unrelated = {
+            "title": "Amazon Bedrock API 개발자 문서",
+            "href": "https://example.com/bedrock",
+            "body": "Android API authentication",
+        }
+
+        kept, discarded = _filter_search_results(query, [unsafe, unrelated, safe], limit=8)
+
+        self.assertGreater(_search_result_quality(query, safe), 0.7)
+        self.assertEqual([item["href"] for item in kept], [safe["href"]])
+        self.assertEqual(discarded, 2)
+
+    def test_grounded_candidate_is_extracted_from_answer_and_tool_evidence(self) -> None:
+        answer = (
+            "중제 근처에서는 绿波廊SPA会馆（中街店）을 확인했습니다.\n"
+            "주소: 小什字街66号"
+        )
+        tools = [{
+            "name": "web_search",
+            "args": {"query": "沈阳 中街 按摩店"},
+            "result": {"results": [{
+                "title": "【绿波廊SPA会馆（中街店）】电话_地址_价格",
+                "href": "https://m.dianping.com/shop/example",
+                "body": "地址：小什字街66号",
+                "quality": 0.92,
+            }]},
+        }, {
+            "name": "geocode_place",
+            "args": {"query": "沈阳 绿波廊SPA会馆 中街店 小什字街66号"},
+            "result": {"results": [{
+                "display_name": "绿波廊SPA会馆",
+                "lat": 41.801,
+                "lng": 123.46,
+                "storage_allowed": True,
+                "confidence": 0.8,
+            }]},
+        }]
+
+        candidates = _extract_grounded_candidates(answer, tools, message="중제 마사지샵을 찾아줘")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["title"], "绿波廊SPA会馆（中街店）")
+        self.assertEqual(candidates[0]["address"], "小什字街66号")
+        self.assertEqual(candidates[0]["status"], "located")
+        self.assertEqual(candidates[0]["lat"], 41.801)
+        self.assertEqual(
+            _supporting_sources(answer, tools),
+            ["https://m.dianping.com/shop/example"],
+        )
+
+    def test_short_followup_binds_latest_structured_candidate(self) -> None:
+        candidate = {
+            "key": "abc",
+            "title": "绿波廊SPA会馆（中街店）",
+            "address": "小什字街66号",
+            "status": "location_needed",
+            "source_urls": ["https://m.dianping.com/shop/example"],
+        }
+        rows = [
+            SimpleNamespace(role="user", content="중제쪽 마사지샵도 찾아줘", candidates="[]"),
+            SimpleNamespace(
+                role="assistant",
+                content="자연어 답변은 신뢰하지 않음",
+                candidates=json.dumps([candidate], ensure_ascii=False),
+            ),
+        ]
+
+        resolved = _resolve_context_message("등록해줘", rows)
+
+        self.assertEqual(_latest_chat_candidate(rows)["key"], "abc")
+        self.assertIn("绿波廊SPA会馆", resolved)
+        self.assertIn("小什字街66号", resolved)
+
     def test_shenyang_food_bootstrap_uses_auditable_detail_pages(self) -> None:
         urls = CITY_FOOD_DETAIL_SOURCES["shenyang"]
 
@@ -77,6 +165,14 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertIn("沈阳", query)
         self.assertIn("喜茶 HEYTEA", query)
         self.assertIn("茉酸奶 More Yogurt", query)
+
+    def test_massage_seed_uses_short_safe_chinese_query(self) -> None:
+        city = City(name_local="沈阳")
+
+        queries = _research_seed_queries(city, "중제쪽 마사지샵도 찾아줘")
+
+        self.assertEqual(queries, ["沈阳 中街 正规 洗浴 按摩 推荐"])
+        self.assertNotIn("사용자 요청", queries[0])
 
     def test_short_write_followup_inherits_previous_targets(self) -> None:
         rows = [
@@ -381,6 +477,62 @@ class TravelChatLoopTests(unittest.TestCase):
             {"type": "function", "function": {"name": "propose_place"}},
         )
         self.assertNotIn("tools", completions.requests[-1])
+
+    def test_grounded_candidate_survives_failed_followup_without_target_drift(self) -> None:
+        candidate = {
+            "key": "candidate-1",
+            "title": "绿波廊SPA会馆（中街店）",
+            "address": "小什字街66号",
+            "category": "other",
+            "status": "location_needed",
+            "source_urls": ["https://m.dianping.com/shop/example"],
+            "lat": None,
+            "lng": None,
+            "confidence": 0.9,
+        }
+        self.db.add_all([
+            TravelChatMessage(
+                user_id=1,
+                city_id=1,
+                role="user",
+                content="중제쪽 마사지샵도 찾아줘",
+                sources="[]",
+                place_ids="[]",
+            ),
+            TravelChatMessage(
+                user_id=1,
+                city_id=1,
+                role="assistant",
+                content="도구 근거가 있는 후보입니다.",
+                sources=json.dumps(candidate["source_urls"]),
+                place_ids="[]",
+                candidates=json.dumps([candidate], ensure_ascii=False),
+            ),
+        ])
+        self.db.commit()
+        completions = _FakeCompletions(tool_rounds=0)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat.run_tool", return_value={"results": []}) as tool,
+        ):
+            result = answer_travel_chat(self.db, user_id=1, city_id=1, message="등록해줘")
+
+        search_calls = [call for call in tool.call_args_list if call.args[1] == "web_search"]
+        self.assertEqual(
+            search_calls[0].args[2]["query"],
+            "沈阳 绿波廊SPA会馆（中街店） 小什字街66号 地址",
+        )
+        saved_candidates = json.loads(result["row"].candidates)
+        self.assertEqual(saved_candidates[0]["title"], candidate["title"])
+        self.assertEqual(saved_candidates[0]["status"], "location_needed")
+        self.assertIn("다른 업소로 바꾸지 않았습니다", result["row"].content)
+        trace = json.loads(result["row"].tool_trace)
+        self.assertTrue(any(item["tool"] == "web_search" for item in trace))
 
     def test_existing_brand_places_skip_duplicate_research_and_proposals(self) -> None:
         self.db.add_all([

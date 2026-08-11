@@ -313,7 +313,21 @@ export interface TravelChatMessage {
   content: string;
   sources: string[];
   place_ids: number[];
+  candidates: TravelChatCandidate[];
   created_at: string;
+}
+
+export interface TravelChatCandidate {
+  key: string;
+  title: string;
+  address: string;
+  category: string;
+  status: "grounded" | "location_needed" | "located" | "proposed" | "mapped" | string;
+  source_urls: string[];
+  lat: number | null;
+  lng: number | null;
+  confidence: number;
+  proposal_id: number | null;
 }
 
 export interface TravelPreferenceSignal {
