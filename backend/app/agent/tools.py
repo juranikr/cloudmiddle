@@ -1238,7 +1238,7 @@ def run_tool(
             m.title = f"{m.title} ({local_name})"[:200]
             changed["local_name"] = local_name
         replace_title = str(args.get("replace_title") or "").strip()
-        if replace_title:
+        if replace_title and replace_title != m.title:
             if not _has_hangul(replace_title):
                 return {
                     "error": "korean_required",
@@ -1259,9 +1259,9 @@ def run_tool(
                 }
             if append_note not in (m.description or ""):
                 m.description = ((m.description or "").rstrip() + "\n\n" + append_note).strip()[:2000]
-            changed["append_note"] = True
+                changed["append_note"] = True
         replace_description = str(args.get("replace_description") or "").strip()
-        if replace_description:
+        if replace_description and replace_description != m.description:
             if not _has_hangul(replace_description):
                 return {
                     "error": "korean_required",
@@ -1276,8 +1276,10 @@ def run_tool(
             changed["replace_description"] = True
         if args.get("category"):
             try:
-                m.category = MarkerCategory(str(args["category"]))
-                changed["category"] = m.category.value
+                new_category = MarkerCategory(str(args["category"]))
+                if new_category != m.category:
+                    m.category = new_category
+                    changed["category"] = m.category.value
             except ValueError:
                 pass
         if not changed:

@@ -154,6 +154,23 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertNotEqual(first.topic, second.topic)
         self.assertEqual({first.topic, second.topic}, {"city:1:research_strategy", "city:2:research_strategy"})
 
+    def test_repeating_same_place_update_is_idempotent(self) -> None:
+        marker = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        event_count = self.db.query(PlaceEvent).count()
+        result = run_tool(
+            self.db,
+            "update_place_fields",
+            {
+                "place_id": marker.id,
+                "replace_title": marker.title,
+                "replace_description": marker.description,
+                "category": marker.category.value,
+            },
+            city_id=2,
+        )
+        self.assertEqual(result, {"ok": True, "changed": {}})
+        self.assertEqual(self.db.query(PlaceEvent).count(), event_count)
+
 
 if __name__ == "__main__":
     unittest.main()
