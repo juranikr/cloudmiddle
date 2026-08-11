@@ -278,8 +278,9 @@ def run_agent(
         # 스크래핑 조사 + 재검증 + 사진 보강까지 수행하므로 여유 확보
         steps_limit = max(base_steps, 110)
     else:
-        # 큐 처리 후 필수 웹 조사 분량(~30스텝) 포함
-        steps_limit = max(base_steps, min(48, 8 + unread_before * 4))
+        # 큐 검토·수정 뒤 mark_events_read까지 끝낼 여유를 먼저 보장한다.
+        # 기존 8+4n은 2건 큐에서도 16스텝 만에 소진되어 "조치는 했지만 읽음 처리를 못 한" 실패를 만들었다.
+        steps_limit = max(base_steps, min(140, 48 + unread_before * 4))
 
     if research_only:
         user_msg = (
