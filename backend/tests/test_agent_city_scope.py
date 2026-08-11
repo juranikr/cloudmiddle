@@ -6,7 +6,13 @@ import unittest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.agent.runner import count_unread
+from app.agent.runner import (
+    _ensure_gap_tasks,
+    _is_material_change,
+    _new_evidence_keys,
+    _tool_signature,
+    count_unread,
+)
 from app.agent.tools import TOOLS, run_tool
 from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
@@ -90,6 +96,50 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(count_unread(self.db, 2), 1)
         rows = run_tool(self.db, "list_places", {}, city_id=2)
         self.assertEqual([row["city_id"] for row in rows], [2])
+
+    def test_batch_progress_ignores_noop_mutations_and_repeated_evidence(self) -> None:
+        self.assertFalse(_is_material_change("upsert_agent_task", {"ok": True, "changed": False}))
+        self.assertTrue(_is_material_change("upsert_agent_task", {"ok": True, "created": True}))
+        self.assertTrue(_is_material_change("propose_place", {"proposal_id": 91}))
+
+        result = {"results": [{"seen": False, "href": "https://example.test/place"}]}
+        keys = _new_evidence_keys("web_search", result, set())
+        self.assertEqual(keys, {"url:https://example.test/place"})
+        self.assertEqual(_new_evidence_keys("web_search", result, keys), set())
+
+        self.assertEqual(
+            _tool_signature("web_search", {"limit": 5, "query": "沈阳"}),
+            _tool_signature("web_search", {"query": "沈阳", "limit": 5}),
+        )
+
+    def test_batch_gap_tasks_are_measurable_and_deduplicated(self) -> None:
+        first = _ensure_gap_tasks(
+            self.db,
+            city_id=2,
+            run_id=6,
+            gaps=["여행 역할 균형: 음식 2/3", "근거 페이지 4개 이상 확보(현재 2)"],
+        )
+        second = _ensure_gap_tasks(
+            self.db,
+            city_id=2,
+            run_id=7,
+            gaps=["여행 역할 균형: 음식 2/3", "근거 페이지 4개 이상 확보(현재 2)"],
+        )
+        self.assertEqual(first, second)
+        rows = self.db.query(AgentTask).filter(AgentTask.city_id == 2).all()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row.success_metric and "remaining_gaps" in row.success_metric for row in rows))
+        self.assertGreater(rows[0].priority, rows[1].priority)
+
+        _ensure_gap_tasks(
+            self.db,
+            city_id=2,
+            run_id=8,
+            gaps=["근거 페이지 4개 이상 확보(현재 2)"],
+        )
+        self.db.refresh(rows[0])
+        self.assertEqual(rows[0].status, "completed")
+        self.assertIn("자동 완료", rows[0].result)
 
     def test_admin_agent_history_can_be_scoped_to_city(self) -> None:
         for city_id in (1, 2):

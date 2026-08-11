@@ -1,4 +1,4 @@
-# 하루 3회 (KST 03:00 / 11:00 / 19:00 = UTC 18:00 / 02:00 / 10:00) Groq 에이전트 실행
+# 하루 3회 (KST 03:00 / 11:00 / 19:00 = UTC 18:00 / 02:00 / 10:00) 성과 기반 에이전트 실행
 resource "aws_cloudwatch_log_group" "agent" {
   name              = "/ecs/${local.name_prefix}-agent"
   retention_in_days = 14
@@ -23,6 +23,8 @@ resource "aws_ecs_task_definition" "agent" {
         { name = "AWS_REGION", value = var.aws_region },
         { name = "S3_BUCKET", value = aws_s3_bucket.images.bucket },
         { name = "S3_PUBLIC_BASE_URL", value = "https://${aws_cloudfront_distribution.images.domain_name}" },
+        { name = "AGENT_AUTONOMOUS_RESEARCH", value = "true" },
+        { name = "AGENT_MAX_STEPS", value = "180" },
       ]
       secrets = [
         { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.app.arn}:DATABASE_URL::" },
@@ -50,9 +52,9 @@ resource "aws_iam_role" "events_ecs" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
+        Effect    = "Allow"
         Principal = { Service = "events.amazonaws.com" }
-        Action   = "sts:AssumeRole"
+        Action    = "sts:AssumeRole"
       }
     ]
   })
@@ -71,8 +73,8 @@ resource "aws_iam_role_policy" "events_ecs" {
         Resource = [aws_ecs_task_definition.agent.arn]
       },
       {
-        Effect   = "Allow"
-        Action   = ["iam:PassRole"]
+        Effect = "Allow"
+        Action = ["iam:PassRole"]
         Resource = [
           aws_iam_role.ecs_task_execution.arn,
           aws_iam_role.ecs_task.arn,
@@ -84,8 +86,8 @@ resource "aws_iam_role_policy" "events_ecs" {
 
 resource "aws_cloudwatch_event_rule" "agent_daily" {
   name                = "${local.name_prefix}-agent-daily"
-  description         = "Daily Groq map curator"
-  schedule_expression = "cron(0 18 * * ? *)" # KST 03:00
+  description         = "Outcome-driven map curator, three times daily"
+  schedule_expression = "cron(0 2,10,18 * * ? *)" # KST 11:00 / 19:00 / 03:00
 }
 
 resource "aws_cloudwatch_event_target" "agent_daily" {

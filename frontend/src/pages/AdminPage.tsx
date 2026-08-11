@@ -5,6 +5,7 @@ import type {
   AdminAgentAction,
   AdminAgentProposal,
   AdminAgentRunHistory,
+  AdminAgentRunStep,
   AdminAgentTask,
   AdminKnowledge,
   AdminStatus,
@@ -20,6 +21,42 @@ const ACTION_LABEL: Record<string, string> = {
   image_reorder: "이미지 순서",
 };
 
+const METRIC_LABEL: Record<string, string> = {
+  unread_cleared: "작업 처리",
+  proposals: "승인 제안",
+  insights: "인사이트",
+  images: "이미지",
+  zoned_places: "구역 연결",
+  chained_places: "체인 연결",
+  completed_tasks: "과제 완료",
+  role_diversity: "역할 다양성",
+};
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function runDelta(run: AdminAgentRunHistory): Array<[string, number]> {
+  return Object.entries(asRecord(run.metrics.delta))
+    .map(([key, value]) => [key, Number(value)] as [string, number])
+    .filter(([, value]) => Number.isFinite(value) && value !== 0);
+}
+
+function runMaterialChanges(run: AdminAgentRunHistory): Record<string, unknown>[] {
+  const value = run.metrics.material_changes;
+  return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object") : [];
+}
+
+function stepDescription(step: AdminAgentRunStep): string {
+  const args = asRecord(step.detail.args);
+  const result = asRecord(step.detail.result);
+  const target = args.title ?? args.query ?? args.url ?? (args.place_id ? `장소 #${args.place_id}` : "");
+  const outcome = result.error ?? result.detail ?? result.proposal_id ?? result.changed ?? "";
+  return [target, outcome].filter((value) => value !== "" && value != null).map(String).join(" · ").slice(0, 240);
+}
+
 export default function AdminPage() {
   const { token, user, logout } = useAuth();
   const [status, setStatus] = useState<AdminStatus | null>(null);
@@ -29,6 +66,8 @@ export default function AdminPage() {
   const [cities, setCities] = useState<City[]>([]);
   const [proposals, setProposals] = useState<AdminAgentProposal[]>([]);
   const [runs, setRuns] = useState<AdminAgentRunHistory[]>([]);
+  const [runSteps, setRunSteps] = useState<Record<number, AdminAgentRunStep[]>>({});
+  const [loadingRunId, setLoadingRunId] = useState<number | null>(null);
   const [tasks, setTasks] = useState<AdminAgentTask[]>([]);
   const [selectedCityId, setSelectedCityId] = useState(2);
   const [researchMode, setResearchMode] = useState(true);
@@ -88,8 +127,9 @@ export default function AdminPage() {
       }
       const r = status.result;
       if (r) {
+        const resultLabel = r.status === "completed" ? "완료" : r.status === "partial" ? "부분 완료" : "실패";
         setInfo(
-          `${r.ok ? "완료" : "실패"} · 성과 ${r.score ?? 0}점 · 행동 라운드 ${r.steps} · 미처리 ${r.unread_before}→${r.unread_after}\n${r.message}`,
+          `${resultLabel} · 성과 ${r.score ?? 0}점 · 행동 라운드 ${r.steps} · 미처리 ${r.unread_before}→${r.unread_after}\n${r.message}`,
         );
       } else if (status.running) {
         setInfo("아직 실행 중입니다. 잠시 후 새로고침으로 결과를 확인하세요.");
@@ -101,6 +141,19 @@ export default function AdminPage() {
       setError(e instanceof Error ? e.message : "에이전트 실행 실패");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function loadRunSteps(runId: number) {
+    if (!token || runSteps[runId] || loadingRunId === runId) return;
+    setLoadingRunId(runId);
+    try {
+      const rows = await api.fetchAdminAgentRunSteps(token, runId);
+      setRunSteps((current) => ({ ...current, [runId]: rows }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "실행 단계 이력을 불러오지 못했습니다.");
+    } finally {
+      setLoadingRunId(null);
     }
   }
 
@@ -342,14 +395,58 @@ export default function AdminPage() {
         <p className="panel__meta">실행 로그와 후속 과제는 장소 설명·지식베이스와 분리되어 보관됩니다.</p>
         {runs.length ? (
           <ul className="admin__runs">
-            {runs.map((run) => (
-              <li key={run.id}>
-                <div><strong>실행 #{run.id} · {run.score.toFixed(1)}점</strong><span className={`run-status run-status--${run.status}`}>{run.status}</span></div>
-                <p>{run.objective}</p>
-                <small>{new Date(run.started_at).toLocaleString("ko-KR")} · 도구 행동 {run.step_count}회</small>
-                <details><summary>결과 보기</summary><pre>{run.summary}</pre></details>
-              </li>
-            ))}
+            {runs.map((run) => {
+              const metrics = asRecord(run.metrics);
+              const delta = runDelta(run);
+              const material = runMaterialChanges(run);
+              const steps = runSteps[run.id];
+              const duration = Number(metrics.duration_seconds ?? 0);
+              return (
+                <li key={run.id}>
+                  <div><strong>실행 #{run.id} · {run.score.toFixed(1)}점</strong><span className={`run-status run-status--${run.status}`}>{run.status}</span></div>
+                  <p>{run.objective}</p>
+                  <small>
+                    {new Date(run.started_at).toLocaleString("ko-KR")} · 도구 행동 {run.step_count}회
+                    {duration > 0 ? ` · ${Math.round(duration / 60)}분` : ""}
+                    {Number(metrics.repeated_calls_blocked ?? 0) > 0 ? ` · 반복 차단 ${metrics.repeated_calls_blocked}회` : ""}
+                  </small>
+                  <div className="admin__run-delta">
+                    {delta.length ? delta.map(([key, value]) => (
+                      <span key={key}>{METRIC_LABEL[key] ?? key} {value > 0 ? "+" : ""}{value}</span>
+                    )) : <span className="is-empty">측정된 DB 변화 없음</span>}
+                  </div>
+                  {material.length ? (
+                    <ul className="admin__run-material">
+                      {material.slice(0, 8).map((item, index) => (
+                        <li key={`${String(item.sequence ?? index)}-${String(item.tool ?? "change")}`}>
+                          #{String(item.sequence ?? index + 1)} {String(item.tool ?? "변경")}
+                          {item.proposal_id ? ` · 제안 #${String(item.proposal_id)}` : ""}
+                          {item.place_id ? ` · 장소 #${String(item.place_id)}` : ""}
+                          {item.task_id ? ` · 과제 #${String(item.task_id)}` : ""}
+                          {item.title ? ` · ${String(item.title)}` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  <details><summary>결과 요약</summary><pre>{run.summary}</pre></details>
+                  <details onToggle={(event) => { if (event.currentTarget.open) void loadRunSteps(run.id); }}>
+                    <summary>전체 과정 {run.step_count}단계</summary>
+                    {loadingRunId === run.id ? <p className="panel__meta">단계 이력을 불러오는 중…</p> : null}
+                    {steps ? (
+                      <ol className="admin__run-steps">
+                        {steps.map((step) => (
+                          <li key={step.sequence} className={`run-step run-step--${step.outcome}`}>
+                            <strong>#{step.sequence} {step.tool}</strong>
+                            <span>{step.outcome}{step.score_delta ? ` · +${step.score_delta}점` : ""}</span>
+                            {stepDescription(step) ? <p>{stepDescription(step)}</p> : null}
+                          </li>
+                        ))}
+                      </ol>
+                    ) : null}
+                  </details>
+                </li>
+              );
+            })}
           </ul>
         ) : <p className="panel__meta">새 성과 기반 실행 이력이 아직 없습니다.</p>}
         <details className="admin__tasks" open>

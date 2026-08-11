@@ -244,6 +244,7 @@ class ImageReorderRequest(BaseModel):
 
 class AgentRunResponse(BaseModel):
     ok: bool
+    status: str = "completed"
     steps: int
     message: str
     unread_before: int

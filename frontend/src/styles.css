@@ -643,6 +643,77 @@ textarea {
   transform: rotate(-45deg);
 }
 
+.place-cluster-icon {
+  display: grid !important;
+  place-items: center;
+  background: transparent !important;
+  border: 0 !important;
+}
+
+.place-cluster-icon > span {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  border: 3px solid rgba(255, 255, 255, 0.96);
+  border-radius: 50% 50% 50% 18%;
+  background: linear-gradient(145deg, #17352f, #0f766e);
+  box-shadow: 0 5px 18px rgba(15, 60, 54, 0.36);
+  color: #fff;
+  font-size: 0.92rem;
+  font-weight: 900;
+}
+
+.place-cluster-popup .leaflet-popup-content-wrapper {
+  border-radius: 18px;
+  box-shadow: 0 14px 42px rgba(20, 33, 43, 0.2);
+}
+
+.place-cluster-popup .leaflet-popup-content {
+  width: min(280px, calc(100vw - 72px)) !important;
+  margin: 14px;
+}
+
+.cluster-place-picker > strong,
+.cluster-place-picker > span {
+  display: block;
+}
+
+.cluster-place-picker > strong { color: var(--ink); font-size: 0.95rem; }
+.cluster-place-picker > span { margin-top: 3px; color: var(--muted); font-size: 0.75rem; }
+.cluster-place-picker__list {
+  display: grid;
+  gap: 5px;
+  max-height: min(330px, 48vh);
+  margin-top: 10px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.cluster-place-picker__list button {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px;
+  border: 0;
+  border-radius: 11px;
+  background: rgba(20, 33, 43, 0.045);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.cluster-place-picker__list button:hover,
+.cluster-place-picker__list button:focus-visible { background: rgba(15, 118, 110, 0.11); }
+.cluster-place-picker__list i { width: 9px; height: 9px; border-radius: 50%; }
+.cluster-place-picker__list b,
+.cluster-place-picker__list small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cluster-place-picker__list b { font-size: 0.82rem; }
+.cluster-place-picker__list small { margin-top: 2px; color: var(--muted); font-size: 0.68rem; }
+.cluster-place-picker__list em { color: #ca8a04; font-style: normal; }
+
 .jinan-pin__dot--draft {
   background: #f59e0b;
   box-shadow: 0 0 0 2px #fff, 0 2px 8px rgba(15, 23, 42, 0.35);
@@ -1320,6 +1391,20 @@ textarea {
 .admin__runs small { color: var(--muted); }
 .admin__runs details { margin-top: 8px; }
 .admin__runs pre { white-space: pre-wrap; font: inherit; font-size: 0.8rem; }
+.admin__run-delta { display: flex !important; flex-wrap: wrap; justify-content: flex-start !important; gap: 5px !important; margin-top: 9px; }
+.admin__run-delta span { padding: 3px 7px; border-radius: 999px; background: #dcfce7; color: #166534; font-size: .7rem; font-weight: 800; }
+.admin__run-delta .is-empty { background: #f1f5f9; color: #64748b; }
+.admin__run-material { list-style: none; margin: 9px 0 0; padding: 0; display: grid; gap: 5px; }
+.admin__run-material li { padding: 7px 9px; border-left: 3px solid #0f766e; border-radius: 7px; background: rgba(15, 118, 110, .065); font-size: .76rem; }
+.admin__run-steps { list-style: none; max-height: 430px; margin: 8px 0 0; padding: 0; overflow-y: auto; display: grid; gap: 5px; }
+.admin__run-steps li { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: start; gap: 7px; padding: 7px 8px; border-left: 3px solid #cbd5e1; border-radius: 7px; background: #f8fafc; }
+.admin__run-steps li > span { color: var(--muted); font-size: .7rem; font-weight: 800; }
+.admin__run-steps li > strong { font-size: .74rem; }
+.admin__run-steps li > p { margin: 0; color: #475569; font-size: .72rem; overflow-wrap: anywhere; }
+.admin__run-steps .run-step--changed { border-left-color: #16a34a; background: #f0fdf4; }
+.admin__run-steps .run-step--error { border-left-color: #dc2626; background: #fef2f2; }
+.admin__run-steps .run-step--repeated,
+.admin__run-steps .run-step--no_new_evidence { border-left-color: #d97706; background: #fffbeb; }
 .run-status { padding: 2px 7px; border-radius: 999px; background: #e2e8f0; font-size: 0.72rem; }
 .run-status--completed { background: #dcfce7; color: #166534; }
 .run-status--partial { background: #fef3c7; color: #92400e; }

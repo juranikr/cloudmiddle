@@ -258,6 +258,26 @@ export interface AdminAgentRunHistory {
   finished_at: string | null;
 }
 
+export interface AdminAgentRunStep {
+  sequence: number;
+  phase: string;
+  tool: string;
+  outcome: "ok" | "changed" | "error" | "repeated" | "no_new_evidence" | string;
+  score_delta: number;
+  detail: {
+    args?: Record<string, unknown>;
+    result?: Record<string, unknown> | unknown[];
+    progress?: {
+      material_change?: boolean;
+      new_evidence?: number;
+      score?: number;
+      no_material_actions?: number;
+    };
+    [key: string]: unknown;
+  };
+  created_at: string;
+}
+
 export interface AdminAgentTask {
   id: number;
   city_id: number;

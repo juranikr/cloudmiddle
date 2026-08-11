@@ -2,6 +2,7 @@ resource "aws_lb" "api" {
   name               = "${local.name_prefix}-alb"
   internal           = false
   load_balancer_type = "application"
+  idle_timeout       = 180
   security_groups    = [aws_security_group.alb.id]
   subnets            = aws_subnet.public[*].id
 

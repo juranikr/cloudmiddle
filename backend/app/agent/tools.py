@@ -748,9 +748,9 @@ TOOLS: list[dict[str, Any]] = [
                     "task_id": {"type": "integer"},
                     "kind": {"type": "string"},
                     "title": {"type": "string"},
-                    "detail": {"type": "string"},
-                    "success_metric": {"type": "string"},
-                    "priority": {"type": "integer"},
+                    "detail": {"type": "string", "description": "다음 실행이 바로 행동할 수 있는 대상·근거·차단 원인"},
+                    "success_metric": {"type": "string", "description": "완료 여부를 DB 수치나 검증 결과로 판정할 수 있는 기준"},
+                    "priority": {"type": "integer", "minimum": 1, "maximum": 100, "description": "100이 가장 높은 우선순위, 1이 가장 낮음"},
                     "status": {"type": "string", "enum": ["pending", "completed", "blocked"]},
                     "result": {"type": "string"},
                 },
@@ -2247,6 +2247,7 @@ def run_tool(
         status_value = str(args.get("status") or "pending")
         task_id = int(args["task_id"]) if args.get("task_id") is not None else None
         row = db.query(AgentTask).filter(AgentTask.id == task_id, AgentTask.city_id == city_id).first() if task_id else None
+        created = False
         if row is None:
             title = str(args.get("title") or "").strip()[:240]
             task_text = " ".join(
@@ -2282,6 +2283,15 @@ def run_tool(
             if row is None:
                 row = AgentTask(city_id=city_id, title=title)
                 db.add(row)
+                created = True
+        before = (
+            row.kind,
+            row.detail,
+            row.success_metric,
+            row.priority,
+            row.status,
+            row.result,
+        )
         row.kind = str(args.get("kind") or row.kind or "research")[:30]
         row.detail = str(args.get("detail") or row.detail or "")[:8000]
         row.success_metric = str(args.get("success_metric") or row.success_metric or "")[:2000]
@@ -2290,8 +2300,23 @@ def run_tool(
         row.result = str(args.get("result") or row.result or "")[:8000]
         if row.status == "completed":
             row.completed_at = datetime.now(timezone.utc)
+        after = (
+            row.kind,
+            row.detail,
+            row.success_metric,
+            row.priority,
+            row.status,
+            row.result,
+        )
         db.commit()
-        return {"ok": True, "task_id": row.id, "status": row.status}
+        return {
+            "ok": True,
+            "task_id": row.id,
+            "status": row.status,
+            "created": created,
+            "changed": created or before != after,
+            "attempts": row.attempts,
+        }
 
     if name == "list_knowledge":
         limit = int(args.get("limit") or 30)

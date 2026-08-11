@@ -15,6 +15,7 @@ import type { GeocodeHit, ShareImportResult } from "../api";
 import { useAuth } from "../auth";
 import { CATEGORY_LIST, CATEGORY_META } from "../categories";
 import AddressSearch from "../components/AddressSearch";
+import ClusteredPlaceMarkers from "../components/ClusteredPlaceMarkers";
 import ConfirmBar from "../components/ConfirmBar";
 import MapViewPersistence from "../components/MapViewPersistence";
 import MarkerPanel, { type CreateDefaults } from "../components/MarkerPanel";
@@ -35,7 +36,7 @@ import {
   requestLocationAccess,
   saveLocateOn,
 } from "../mapStorage";
-import { getCategoryIcon, getSearchResultIcon } from "../markerIcons";
+import { getSearchResultIcon } from "../markerIcons";
 import type { City, LatLng, MarkerCategory, MarkerItem, MarkerPayload, MarkerShape, PlaceChain } from "../types";
 
 const JINAN_CENTER: [number, number] = [36.65, 117.12];
@@ -900,15 +901,12 @@ export default function MapPage() {
                   {m.title}
                 </Tooltip>
               </Polygon>
-            ) : (
-              <Marker
-                key={m.id}
-                position={[m.lat, m.lng]}
-                icon={getCategoryIcon(m.category)}
-                eventHandlers={{ click: () => openView(m) }}
-              />
-            ),
+            ) : null,
           )}
+          <ClusteredPlaceMarkers
+            markers={markers.filter((marker) => marker.shape === "point")}
+            onSelect={openView}
+          />
           {searchPin ? (
             <Marker position={[searchPin.lat, searchPin.lng]} icon={searchIcon} title={searchPin.label} />
           ) : null}

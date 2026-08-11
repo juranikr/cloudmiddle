@@ -140,6 +140,16 @@ class AgentRunHistoryOut(BaseModel):
     finished_at: Optional[datetime] = None
 
 
+class AgentRunStepOut(BaseModel):
+    sequence: int
+    phase: str
+    tool: str
+    outcome: str
+    score_delta: float
+    detail: dict[str, Any]
+    created_at: datetime
+
+
 class AgentTaskOut(BaseModel):
     id: int
     city_id: int
@@ -162,6 +172,7 @@ def _run_agent_background(city_id: int, research: bool) -> None:
     except Exception as exc:
         result = {
             "ok": False,
+            "status": "failed",
             "steps": 0,
             "message": str(exc)[:1500],
             "unread_before": 0,
@@ -232,6 +243,34 @@ def admin_agent_runs(
             id=row.id, city_id=row.city_id, mode=row.mode, status=row.status,
             objective=row.objective, score=row.score, metrics=metrics, summary=row.summary,
             step_count=len(row.steps or []), started_at=row.started_at, finished_at=row.finished_at,
+        ))
+    return output
+
+
+@router.get("/agent/runs/{run_id}/steps", response_model=list[AgentRunStepOut])
+def admin_agent_run_steps(
+    run_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> list[AgentRunStepOut]:
+    _ = admin
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail="에이전트 실행 이력을 찾을 수 없습니다.")
+    output: list[AgentRunStepOut] = []
+    for row in run.steps:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except json.JSONDecodeError:
+            detail = {"raw": row.detail or ""}
+        output.append(AgentRunStepOut(
+            sequence=row.sequence,
+            phase=row.phase,
+            tool=row.tool,
+            outcome=row.outcome,
+            score_delta=row.score_delta,
+            detail=detail if isinstance(detail, dict) else {"value": detail},
+            created_at=row.created_at,
         ))
     return output
 

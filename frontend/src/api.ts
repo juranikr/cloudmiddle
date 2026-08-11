@@ -1,4 +1,5 @@
 import type {
+  AdminAgentRunStep,
   AdminAgentAction,
   AdminAgentProposal,
   AdminAgentRunHistory,
@@ -265,6 +266,7 @@ export async function fetchAdminStatus(token: string): Promise<AdminStatus> {
 
 export interface AgentRunResult {
   ok: boolean;
+  status: "completed" | "partial" | "failed";
   steps: number;
   message: string;
   unread_before: number;
@@ -368,6 +370,11 @@ export async function fetchAdminKnowledge(token: string): Promise<AdminKnowledge
 export async function fetchAdminAgentRuns(token: string, cityId: number): Promise<AdminAgentRunHistory[]> {
   const res = await request(`/api/admin/agent/runs?city_id=${cityId}`, { headers: authHeaders(token) });
   return handle<AdminAgentRunHistory[]>(res);
+}
+
+export async function fetchAdminAgentRunSteps(token: string, runId: number): Promise<AdminAgentRunStep[]> {
+  const res = await request(`/api/admin/agent/runs/${runId}/steps`, { headers: authHeaders(token) });
+  return handle<AdminAgentRunStep[]>(res);
 }
 
 export async function fetchAdminAgentTasks(token: string, cityId: number): Promise<AdminAgentTask[]> {
