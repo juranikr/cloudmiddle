@@ -1567,6 +1567,74 @@ textarea {
 .result-list .source-badge--arcgis, .search-card .source-badge--arcgis { background: #dbeafe; color: #1d4ed8; }
 .result-list .source-badge--nominatim, .search-card .source-badge--nominatim { background: #fef3c7; color: #92400e; }
 .result-list .source-badge--wikidata, .search-card .source-badge--wikidata { background: #ede9fe; color: #6d28d9; }
+
+.place-insights {
+  display: grid;
+  gap: 14px;
+  margin: 18px 0;
+}
+
+.place-insights__group {
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 13px;
+  background: #fff;
+}
+
+.place-insights__group--history { border-left: 4px solid #a16207; }
+.place-insights__group--visit { border-left: 4px solid #0f766e; }
+.place-insights__group--location { border-left: 4px solid #2563eb; }
+.place-insights__group--tip { border-left: 4px solid #9333ea; }
+
+.place-insights h4 { margin: 0 0 9px; font-size: 0.92rem; }
+.place-insights ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.place-insights li + li { border-top: 1px dashed #e2e8f0; padding-top: 10px; }
+.place-insights__title { display: flex; gap: 7px; align-items: center; }
+.place-insights__title time { color: #92400e; font-weight: 750; }
+.place-insights__title strong { flex: 1; }
+.place-insights__title span { color: #64748b; font-size: 0.72rem; }
+.place-insights p { margin: 5px 0; white-space: pre-wrap; line-height: 1.55; }
+.place-insights a, .coordinate-proof a { color: #0f766e; font-size: 0.78rem; }
+
+.coordinate-proof {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 0.78rem;
+}
+
+.coordinate-proof strong { color: #0f172a; }
+
+.admin__agent-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  align-items: end;
+  margin-bottom: 14px;
+}
+
+.admin__agent-controls label { display: grid; gap: 5px; font-weight: 700; }
+.admin__agent-controls select { min-width: 220px; }
+.admin__agent-controls .admin__check { display: flex; flex-direction: row; align-items: center; font-weight: 600; }
+
+.admin__proposals { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.admin__proposals > li { padding: 15px; border: 1px solid #dbe4ee; border-radius: 14px; background: #fbfdff; }
+.admin__proposal-head { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+.admin__proposal-head strong { font-size: 1rem; }
+.confidence { padding: 3px 8px; border-radius: 999px; font-size: 0.72rem; font-weight: 800; background: #fef3c7; color: #92400e; }
+.confidence--high { background: #dcfce7; color: #166534; }
+.admin__proposals p { white-space: pre-wrap; line-height: 1.5; }
+.admin__proposal-data { display: flex; gap: 16px; margin: 8px 0; }
+.admin__proposal-data div { display: flex; gap: 5px; }
+.admin__proposal-data dt { color: #64748b; }
+.admin__proposal-data dd { margin: 0; font-weight: 700; }
+.admin__proposal-sources { display: flex; flex-wrap: wrap; gap: 7px; }
+.admin__proposal-sources a { padding: 5px 8px; border-radius: 8px; background: #e0f2fe; color: #0369a1; font-size: 0.78rem; }
 .result-list li small {
   color: var(--teal-deep);
   font-size: 0.72rem;

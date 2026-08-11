@@ -24,6 +24,7 @@ export interface City {
   center_lat: number;
   center_lng: number;
   default_zoom: number;
+  search_viewbox: string;
   status: string;
   place_count: number;
 }
@@ -48,6 +49,7 @@ export interface AdminStatus {
   unread_work_items: number;
   knowledge_topics?: number;
   agent_suggested_places?: number;
+  proposals_pending?: number;
 }
 
 export interface PlaceEventChange {
@@ -88,6 +90,18 @@ export interface PlaceImage {
   content_type: string;
 }
 
+export interface PlaceInsight {
+  id: number;
+  kind: "location" | "history" | "visit" | "tip";
+  title: string;
+  content: string;
+  year_label: string;
+  source_url: string;
+  source_title: string;
+  confidence: number;
+  verified_at: string | null;
+}
+
 export interface MarkerItem {
   id: number;
   city_id: number;
@@ -103,6 +117,14 @@ export interface MarkerItem {
   lng: number;
   polygon: LatLng[] | null;
   images: PlaceImage[];
+  insights: PlaceInsight[];
+  coordinate_source: string;
+  coordinate_external_id: string;
+  coordinate_query: string;
+  coordinate_source_url: string;
+  coordinate_confidence: number | null;
+  coordinate_crs: string;
+  coordinate_verified_at: string | null;
   is_agent_suggested: boolean;
   is_favorite?: boolean;
   created_at: string;
@@ -118,6 +140,12 @@ export interface MarkerPayload {
   lat: number;
   lng: number;
   polygon?: LatLng[] | null;
+  coordinate_source?: string;
+  coordinate_external_id?: string;
+  coordinate_query?: string;
+  coordinate_source_url?: string;
+  coordinate_confidence?: number | null;
+  coordinate_crs?: string;
 }
 
 export interface UserMessage {
@@ -142,4 +170,21 @@ export interface AdminKnowledge {
   place_id: number | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AdminAgentProposal {
+  id: number;
+  city_id: number;
+  place_id: number | null;
+  result_place_id: number | null;
+  action: "create_place" | "merge_places" | string;
+  title: string;
+  payload: Record<string, unknown>;
+  evidence: string;
+  source_urls: string[];
+  confidence: number;
+  status: string;
+  decision_note: string;
+  created_at: string;
+  decided_at: string | null;
 }

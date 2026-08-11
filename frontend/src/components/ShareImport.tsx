@@ -6,6 +6,7 @@ type Source = "amap" | "dianping";
 
 interface Props {
   token: string;
+  cityId: number;
   source: Source;
   /** 메인(고덕) / 등록 패널(따종) */
   placement: "main" | "panel";
@@ -29,7 +30,7 @@ const COPY: Record<Source, { button: string; title: string; hint: string; placeh
   },
 };
 
-export default function ShareImport({ token, source, placement, onImported }: Props) {
+export default function ShareImport({ token, cityId, source, placement, onImported }: Props) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -43,7 +44,7 @@ export default function ShareImport({ token, source, placement, onImported }: Pr
     setBusy(true);
     setError("");
     try {
-      const result = await api.importShare(token, payload, source);
+      const result = await api.importShare(token, payload, source, cityId);
       onImported(result);
       setText("");
       setOpen(false);

@@ -17,19 +17,31 @@ export function pointInPolygon(point: LatLng, polygon: LatLng[]): boolean {
   return inside;
 }
 
-/** 지난시 대략 범위 — 이 안일 때만 내 위치 표시 */
-export const JINAN_BOUNDS = {
-  south: 36.35,
-  north: 36.95,
-  west: 116.7,
-  east: 117.55,
-};
+export interface GeoBounds {
+  south: number;
+  north: number;
+  west: number;
+  east: number;
+}
 
-export function isInsideJinan(point: LatLng): boolean {
+/** API viewbox(west,north,east,south)를 위치 확인용 경계로 변환한다. */
+export function parseViewbox(viewbox: string): GeoBounds | null {
+  const values = viewbox.split(",").map(Number);
+  if (values.length !== 4 || values.some((value) => !Number.isFinite(value))) return null;
+  const [west, firstLat, east, secondLat] = values;
+  return {
+    west: Math.min(west, east),
+    east: Math.max(west, east),
+    south: Math.min(firstLat, secondLat),
+    north: Math.max(firstLat, secondLat),
+  };
+}
+
+export function isInsideBounds(point: LatLng, bounds: GeoBounds): boolean {
   return (
-    point.lat >= JINAN_BOUNDS.south &&
-    point.lat <= JINAN_BOUNDS.north &&
-    point.lng >= JINAN_BOUNDS.west &&
-    point.lng <= JINAN_BOUNDS.east
+    point.lat >= bounds.south &&
+    point.lat <= bounds.north &&
+    point.lng >= bounds.west &&
+    point.lng <= bounds.east
   );
 }

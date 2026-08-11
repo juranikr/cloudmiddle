@@ -1,5 +1,6 @@
 import type {
   AdminAgentAction,
+  AdminAgentProposal,
   AdminKnowledge,
   AdminStatus,
   City,
@@ -199,14 +200,15 @@ export interface ShareImportResult {
 }
 
 export async function importShare(
-  token: string,
-  text: string,
-  source: "amap" | "dianping" | "" = "",
+    token: string,
+    text: string,
+    source: "amap" | "dianping" | "" = "",
+    cityId = 1,
 ): Promise<ShareImportResult> {
   const res = await request("/api/import/share", {
     method: "POST",
     headers: authHeaders(token),
-    body: JSON.stringify({ text, source }),
+    body: JSON.stringify({ text, source, city_id: cityId }),
   });
   return handle<ShareImportResult>(res);
 }
@@ -261,6 +263,7 @@ export interface AgentRunResult {
   message: string;
   unread_before: number;
   unread_after: number;
+  city_id: number;
 }
 
 export interface AgentRunStatus {
@@ -270,10 +273,15 @@ export interface AgentRunStatus {
   result: AgentRunResult | null;
 }
 
-export async function startAdminAgent(token: string): Promise<AgentRunStatus> {
+export async function startAdminAgent(
+  token: string,
+  cityId: number,
+  research: boolean,
+): Promise<AgentRunStatus> {
   const res = await request("/api/admin/agent/run", {
     method: "POST",
     headers: authHeaders(token),
+    body: JSON.stringify({ city_id: cityId, research }),
   });
   return handle(res);
 }
@@ -345,6 +353,30 @@ export async function rollbackAdminAgentAction(
 export async function fetchAdminKnowledge(token: string): Promise<AdminKnowledge[]> {
   const res = await request("/api/admin/knowledge", { headers: authHeaders(token) });
   return handle<AdminKnowledge[]>(res);
+}
+
+export async function fetchAdminAgentProposals(
+  token: string,
+  cityId?: number,
+): Promise<AdminAgentProposal[]> {
+  const q = new URLSearchParams({ proposal_status: "pending" });
+  if (cityId) q.set("city_id", String(cityId));
+  const res = await request(`/api/admin/agent/proposals?${q}`, { headers: authHeaders(token) });
+  return handle<AdminAgentProposal[]>(res);
+}
+
+export async function decideAdminAgentProposal(
+  token: string,
+  proposalId: number,
+  decision: "approve" | "reject",
+  note = "",
+): Promise<AdminAgentProposal> {
+  const res = await request(`/api/admin/agent/proposals/${proposalId}/${decision}`, {
+    method: "POST",
+    headers: authHeaders(token),
+    body: JSON.stringify({ note }),
+  });
+  return handle<AdminAgentProposal>(res);
 }
 
 export async function addFavorite(token: string, placeId: number): Promise<{ place_id: number; is_favorite: boolean }> {

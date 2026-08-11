@@ -30,8 +30,23 @@ def list_knowledge(
     )
 
 
-def get_by_topic(db: Session, topic: str) -> Optional[AgentKnowledge]:
-    t = (topic or "").strip().lower()[:120]
+def _scoped_topic(topic: str, city_id: Optional[int], place_id: Optional[int]) -> str:
+    raw = (topic or "general").strip().lower() or "general"
+    if place_id is not None:
+        return f"place:{place_id}:{raw}"[:120]
+    if city_id is not None:
+        return f"city:{city_id}:{raw}"[:120]
+    return raw[:120]
+
+
+def get_by_topic(
+    db: Session,
+    topic: str,
+    *,
+    city_id: Optional[int] = None,
+    place_id: Optional[int] = None,
+) -> Optional[AgentKnowledge]:
+    t = _scoped_topic(topic, city_id, place_id)
     if not t:
         return None
     return db.query(AgentKnowledge).filter(AgentKnowledge.topic == t).first()
@@ -48,9 +63,10 @@ def upsert_knowledge(
     place_id: Optional[int] = None,
     merge: bool = False,
 ) -> AgentKnowledge:
-    topic_key = (topic or "general").strip().lower()[:120] or "general"
-    if topic_key.startswith("cycle_") or topic_key.startswith("cycle-"):
-        topic_key = "operations_lessons"
+    raw_topic = (topic or "general").strip().lower()[:100] or "general"
+    if raw_topic.startswith("cycle_") or raw_topic.startswith("cycle-"):
+        raw_topic = "operations_lessons"
+    topic_key = _scoped_topic(raw_topic, city_id, place_id)
     title_s = (title or topic_key)[:200]
     content_s = (content or "").strip()[:12000]
     scope_key = scope if scope in {"global", "city", "place"} else "global"
@@ -58,7 +74,7 @@ def upsert_knowledge(
         scope_key = "place"
     elif city_id is not None:
         scope_key = "city"
-    row = get_by_topic(db, topic_key)
+    row = get_by_topic(db, raw_topic, city_id=city_id, place_id=place_id)
     now = datetime.now(timezone.utc)
     if row is None:
         row = AgentKnowledge(

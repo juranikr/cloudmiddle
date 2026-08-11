@@ -10,8 +10,7 @@ from sqlalchemy.orm import Session
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
 from app.knowledge import knowledge_brief
-from app.messages import list_open_appeals
-from app.models import PlaceEvent
+from app.models import City, Marker, PlaceAppeal, PlaceAppealStatus, PlaceEvent
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
 목표: 미읽음 이력·이의신청·롤백·웹조사를 바탕으로 지도를 정리하고,
@@ -115,25 +114,75 @@ SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에�
 """
 
 
-def count_unread(db: Session) -> int:
-    events = (
-        db.query(PlaceEvent)
-        .filter(PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent")
-        .count()
+def _address_prefix(city: City) -> str:
+    parts = [part for part in (city.search_context or "").split() if part != "中国"]
+    return "".join(reversed(parts[:2])) if len(parts) >= 2 else city.name_local
+
+
+def _system_for_city(city: City) -> str:
+    prompt = SYSTEM.replace("山东省济南市", _address_prefix(city))
+    prompt = prompt.replace("중국 지난(济南)", f"중국 {city.name_ko}({city.name_local})")
+    prompt = prompt.replace("济南", city.name_local).replace("지난", city.name_ko)
+    return (
+        f"【실행 범위】city_id={city.id}, {city.name_ko}({city.name_local})만 처리한다. "
+        "다른 도시의 장소·이벤트·지식은 조회하거나 변경하지 않는다.\n"
+        "모든 중요한 사실과 변경 제안에는 실제 출처 URL과 confidence(0~1)를 남긴다. "
+        "위치·역사·방문정보는 description에 섞지 말고 upsert_place_insights로 구조화한다.\n\n"
+        + prompt
     )
-    appeals = len(list_open_appeals(db, limit=100))
+
+
+def _research_themes(city: City) -> str:
+    if city.slug == "shenyang":
+        return (
+            "沈阳故宫·张氏帅府·九一八历史博物馆·北陵/东陵·中街·西塔·"
+            "中国工业博物馆·辽宁省博物馆, 동선·운영시간·역사 사건을 우선 조사"
+        )
+    return f"{city.name_local} 대표 명소·현지 음식·역사·교통·야간 동선"
+
+
+def count_unread(db: Session, city_id: int | None = None) -> int:
+    event_query = db.query(PlaceEvent).filter(
+        PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent"
+    )
+    appeal_query = db.query(PlaceAppeal).filter(
+        PlaceAppeal.status == PlaceAppealStatus.open,
+        PlaceAppeal.groq_read_at.is_(None),
+    )
+    if city_id is not None:
+        event_query = event_query.join(Marker, Marker.id == PlaceEvent.place_id).filter(
+            Marker.city_id == city_id
+        )
+        appeal_query = appeal_query.join(Marker, Marker.id == PlaceAppeal.place_id).filter(
+            Marker.city_id == city_id
+        )
+    events = event_query.count()
+    appeals = appeal_query.count()
     return events + appeals
 
 
-def _work_queue(db: Session, *, limit: int = 80) -> dict[str, Any]:
+def _work_queue(db: Session, *, city_id: int, limit: int = 80) -> dict[str, Any]:
     events = (
         db.query(PlaceEvent)
+        .join(Marker, Marker.id == PlaceEvent.place_id)
         .filter(PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent")
+        .filter(Marker.city_id == city_id)
         .order_by(PlaceEvent.created_at.asc())
         .limit(limit)
         .all()
     )
-    appeals = list_open_appeals(db, limit=limit)
+    appeals = (
+        db.query(PlaceAppeal)
+        .join(Marker, Marker.id == PlaceAppeal.place_id)
+        .filter(
+            Marker.city_id == city_id,
+            PlaceAppeal.status == PlaceAppealStatus.open,
+            PlaceAppeal.groq_read_at.is_(None),
+        )
+        .order_by(PlaceAppeal.created_at.asc())
+        .limit(limit)
+        .all()
+    )
     return {
         "events": [
             {
@@ -171,18 +220,40 @@ def _queue_brief(queue: dict[str, Any]) -> str:
     )[:6000]
 
 
-def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
+def run_agent(
+    db: Session,
+    *,
+    city_id: int,
+    max_steps: int | None = None,
+    autonomous_research: bool | None = None,
+) -> dict[str, Any]:
+    city = db.query(City).filter(City.id == city_id, City.status == "active").first()
+    if city is None:
+        return {
+            "ok": False,
+            "steps": 0,
+            "message": f"활성 도시를 찾을 수 없습니다: city_id={city_id}",
+            "unread_before": 0,
+            "unread_after": 0,
+            "city_id": city_id,
+        }
+    allow_research = (
+        settings.agent_autonomous_research
+        if autonomous_research is None
+        else autonomous_research
+    )
     if not settings.groq_api_key:
         return {
             "ok": False,
             "steps": 0,
             "message": "GROQ_API_KEY 미설정",
-            "unread_before": count_unread(db),
-            "unread_after": count_unread(db),
+            "unread_before": count_unread(db, city_id),
+            "unread_after": count_unread(db, city_id),
+            "city_id": city_id,
         }
 
-    unread_before = count_unread(db)
-    if unread_before == 0 and not settings.agent_autonomous_research:
+    unread_before = count_unread(db, city_id)
+    if unread_before == 0 and not allow_research:
         return {
             "ok": True,
             "steps": 0,
@@ -190,10 +261,11 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "unread_before": 0,
             "unread_after": 0,
             "tool_counts": {},
+            "city_id": city_id,
         }
-    queue = _work_queue(db)
+    queue = _work_queue(db, city_id=city_id)
     research_only = unread_before == 0
-    kb = knowledge_brief(db, limit=12, city_id=1)
+    kb = knowledge_brief(db, limit=12, city_id=city_id)
     kb_hint = json.dumps(kb, ensure_ascii=False)[:4000] if kb else "[]"
 
     from groq import Groq
@@ -211,7 +283,9 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
 
     if research_only:
         user_msg = (
+            f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
             "현재 미읽음 작업은 없습니다. 연구 사이클을 수행하세요.\n"
+            f"우선 조사 테마: {_research_themes(city)}\n"
             f"기존 지식베이스 요약: {kb_hint}\n"
             "필수: 시작 list_knowledge, 종료 전 upsert_knowledge 1회 이상.\n"
             "1) list_knowledge / list_places로 현황 파악\n"
@@ -228,7 +302,8 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "5) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
             "geocode_place → create_place 5~12개 (제목 '中文名 (한국어 명칭)', 설명 한국어+중국어 주소). "
             "이미 등록된 장소와 겹치는 유용한 정보(영업시간·가격·팁·교통·별칭)는 "
-            "update_place_fields/update_place_context로 보완\n"
+            "upsert_place_insights로 위치·역사·방문정보를 분리해 보완하고, 모든 항목에 출처 URL과 "
+            "confidence를 기록. description은 간단한 소개만 유지\n"
             "6) 조사 전략(효과적 검색어·소스·다음 키워드)을 upsert_knowledge"
             "(topic 'research_strategy')로 병합. 7)·8)보다 먼저, 조사 직후 바로 호출할 것 "
             "(빠뜨리면 실패)\n"
@@ -242,6 +317,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         )
     else:
         user_msg = (
+            f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
             f"미읽음 작업 {unread_before}건 — 아래 큐를 전원 처리하기 전에는 종료·웹조사 금지.\n"
             f"작업 큐 JSON: {_queue_brief(queue)}\n"
             f"기존 지식베이스 요약: {kb_hint}\n"
@@ -263,15 +339,16 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         )
 
     runtime_policy = ""
-    if not settings.agent_autonomous_research:
+    if not allow_research:
         runtime_policy = (
             "\n\n【현재 운영 안전 모드 — 위의 연구 할당보다 우선】\n"
             "- 사용자 작업 큐만 처리한다. 자율 웹 조사, 신규 장소 발굴, 사진 보강, 작업량 채우기를 하지 않는다.\n"
-            "- 자동 장소 생성과 자동 병합은 비활성화되어 있다. 해당 조치가 필요하면 근거만 요약한다.\n"
+            "- 자동 장소 생성과 자동 병합은 비활성화되어 있다. 해당 조치가 필요하면 "
+            "create_place/merge_places를 호출해 근거·출처·신뢰도가 있는 관리자 승인 제안으로 남긴다.\n"
             "- 큐가 비면 즉시 종료한다. 스텝을 채우는 것은 목표가 아니다.\n"
         )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM + runtime_policy},
+        {"role": "system", "content": _system_for_city(city) + runtime_policy},
         {"role": "user", "content": user_msg},
     ]
 
@@ -323,10 +400,10 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             tool_calls = msg.tool_calls or []
             if not tool_calls:
                 final_text = msg.content or ""
-                remaining = count_unread(db)
+                remaining = count_unread(db, city_id)
                 if remaining > 0 and work_nudges < 4 and steps < steps_limit:
                     work_nudges += 1
-                    left = _work_queue(db)
+                    left = _work_queue(db, city_id=city_id)
                     messages.append(
                         {
                             "role": "user",
@@ -340,7 +417,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                     )
                     continue
                 if (
-                    settings.agent_autonomous_research
+                    allow_research
                     and "fetch_page" not in used_tools
                     and research_nudges < 2
                     and steps < steps_limit
@@ -374,7 +451,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                     continue
                 # 스텝 여유가 큰데 조기 종료하려는 경우: 잔여 할당량을 채우도록 계속시킨다
                 if (
-                    settings.agent_autonomous_research
+                    allow_research
                     and volume_nudges < 3
                     and steps < int(steps_limit * 0.6)
                 ):
@@ -428,7 +505,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                     args = {}
                 used_tools.add(tc.function.name)
                 tool_counts[tc.function.name] = tool_counts.get(tc.function.name, 0) + 1
-                result = run_tool(db, tc.function.name, args)
+                result = run_tool(db, tc.function.name, args, city_id=city_id)
                 messages.append(
                     {
                         "role": "tool",
@@ -450,7 +527,7 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
                 f"Detail: {exc}"
             )
         try:
-            unread_after = count_unread(db)
+            unread_after = count_unread(db, city_id)
         except Exception:
             unread_after = unread_before
         return {
@@ -459,9 +536,10 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
             "message": detail[:1500],
             "unread_before": unread_before,
             "unread_after": unread_after,
+            "city_id": city_id,
         }
 
-    unread_after = count_unread(db)
+    unread_after = count_unread(db, city_id)
     ok = unread_after == 0
     summary = final_text or "에이전트 사이클 완료"
     if tool_counts:
@@ -479,4 +557,5 @@ def run_agent(db: Session, *, max_steps: int | None = None) -> dict[str, Any]:
         "unread_before": unread_before,
         "unread_after": unread_after,
         "tool_counts": tool_counts,
+        "city_id": city_id,
     }

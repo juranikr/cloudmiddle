@@ -134,6 +134,16 @@ class Marker(Base):
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lng: Mapped[float] = mapped_column(Float, nullable=False)
     polygon: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 좌표가 어디에서 왔고 얼마나 믿을 만한지 보존한다. 중국 지도 좌표계 혼동도 함께 방지.
+    coordinate_source: Mapped[str] = mapped_column(String(50), default="manual", nullable=False)
+    coordinate_external_id: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    coordinate_query: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    coordinate_source_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    coordinate_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    coordinate_crs: Mapped[str] = mapped_column(String(20), default="WGS84", nullable=False)
+    coordinate_verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     agent_context: Mapped[str] = mapped_column(Text, default="", nullable=False)
     merged_into_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("markers.id", ondelete="SET NULL"), nullable=True, index=True
@@ -155,6 +165,9 @@ class Marker(Base):
     )
     images: Mapped[list["PlaceImage"]] = relationship(
         back_populates="place", cascade="all, delete-orphan", order_by="PlaceImage.sort_order"
+    )
+    insights: Mapped[list["PlaceInsight"]] = relationship(
+        back_populates="place", cascade="all, delete-orphan", order_by="PlaceInsight.sort_order"
     )
     # 삭제 후에도 place_events는 이력으로 남김 (FK ON DELETE SET NULL)
     events: Mapped[list["PlaceEvent"]] = relationship(back_populates="place")
@@ -218,6 +231,34 @@ class PlaceImage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     place: Mapped[Marker] = relationship(back_populates="images")
+
+
+class PlaceInsight(Base):
+    """위치·역사·방문정보를 출처/신뢰도와 함께 저장하는 작은 지식 단위."""
+
+    __tablename__ = "place_insights"
+    __table_args__ = (
+        UniqueConstraint("place_id", "kind", "title", name="uq_place_insight_title"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    place_id: Mapped[int] = mapped_column(ForeignKey("markers.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True, nullable=False)  # location|history|visit|tip
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    year_label: Mapped[str] = mapped_column(String(50), default="", nullable=False)
+    source_url: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
+    source_title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.7, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(20), default="agent", nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    place: Mapped[Marker] = relationship(back_populates="insights")
 
 
 class UserMessage(Base):
@@ -308,6 +349,9 @@ class AgentSearchLog(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     query: Mapped[str] = mapped_column(String(300), index=True, nullable=False)
+    city_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("cities.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     results_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     new_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     searched_at: Mapped[datetime] = mapped_column(
@@ -323,6 +367,9 @@ class AgentSearchResult(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     url: Mapped[str] = mapped_column(String(1000), unique=True, index=True, nullable=False)
     title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    city_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("cities.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     seen_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(
@@ -338,6 +385,9 @@ class AgentWebVisit(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     url: Mapped[str] = mapped_column(String(1000), unique=True, index=True, nullable=False)
     title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    city_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("cities.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     visit_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     first_visited_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -358,4 +408,35 @@ class PlaceFavorite(Base):
 
     user: Mapped[User] = relationship(back_populates="favorites")
     place: Mapped[Marker] = relationship()
+
+
+class AgentProposal(Base):
+    """에이전트의 고위험 변경은 즉시 반영하지 않고 근거가 있는 제안으로 보관한다."""
+
+    __tablename__ = "agent_proposals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(
+        ForeignKey("cities.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    result_place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), nullable=True
+    )
+    action: Mapped[str] = mapped_column(String(30), index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    payload: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    evidence: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source_urls: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    proposal_key: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True, nullable=False)
+    decision_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    decided_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 

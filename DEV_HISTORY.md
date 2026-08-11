@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-11 (KST) — 도시별 다중 위치 검색과 출처·저장 안전장치
+최종 갱신: 2026-08-11 (KST) — 도시별 근거 기반 에이전트·구조화 장소 지식·승인 UX
 
 ---
 
@@ -56,12 +56,16 @@
 
 ## 3) 제품·기능
 
-- 지도: Leaflet + OSM, 중심 지난
+- 지도: Leaflet + OSM, 도시 선택에 따라 중심·검색·GPS 유효 범위 전환
 - 마커: point(핀) / polygon(구역), 카테고리: tourist, lodging, restaurant, transport, shopping, drink, convenience, other
 - UX: 핀 모드 → 드래프트 + ConfirmBar(입력/취소); 구역 모드 → 탭 선택(점-in-폴리곤), 드래그로 그리기; 핀 모드에서는 구역이 클릭을 가로채지 않음
 - 장소는 **공유 모델**: 단일 소유자 없음, `place_contributors` + 로그인 사용자 전원 수정/삭제. **「내 마커」필터 제거**
 - 이력: `place_events` (create/update/delete/merge/image_*/context_*/agent_create/**rollback**) + `groq_read_at`
-- **Groq ReAct+tools** (`backend/app/agent/`): 미읽음 이벤트·이의신청·롤백 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/admin/agent/run`, 매일 새벽 자동
+- **Groq ReAct+tools** (`backend/app/agent/`): 도시별 미읽음 이벤트·이의신청·롤백 기반 병합·컨텍스트·웹검색(DDG)·장소 추가·이미지 순서. 수동 `POST /api/admin/agent/run`, 매일 새벽은 활성 도시별 실행
+  - `city_id`를 러너와 모든 장소 도구에 강제 전달해 제남/선양 큐·장소·지식·검색 이력이 섞이지 않음
+  - 자동 생성·병합 비활성 상태에서도 `agent_proposals`에 근거·출처 URL·신뢰도를 저장하고 `/admin`에서 승인/거절
+  - 도시/장소 지식 topic을 `city:{id}:...` / `place:{id}:...`로 분리해 같은 `research_strategy`가 덮어써지지 않음
+  - `place_insights`로 위치 맥락·역사·방문 정보·현지 팁을 출처·확인일·신뢰도와 함께 구조화
   - 병합/추가 시 관련 사용자에게 **인앱 메시지** (`user_messages`)
   - **이의신청** (`place_appeals`) → 다음 주기에 `list_open_appeals`로 재고려
   - 편집은 덮어쓰기보다 **기존 기록 보존·보완** (append_note, local_name 병기)
@@ -78,6 +82,8 @@
   - ArcGIS API 키가 없으면 단독 결과는 참고용(`storage_allowed=false`)이며 지도 직접 지정 후 등록
   - Nominatim 공개 정책에 맞춰 1 req/s 제한과 12시간 캐시 적용
 - 위치: HTTPS/localhost에서 GPS; HTTP LAN(아이폰)은 지도 중심 **가상 위치**
+- 좌표 출처: 각 마커에 provider/external ID/query/source URL/confidence/CRS/검증일을 보존
+- 따종·고덕 공유 초안도 선택 도시의 경계·검색 컨텍스트를 사용(제남 하드코딩 제거)
 - 지도 뷰: center/zoom·locate 플래그 `localStorage` 유지
 - 마커 설명: `http(s)://`·`www.` URL 자동 링크 (보기 모드, 새 탭)
 - **공유 초안**
@@ -142,6 +148,15 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 7) 히스토리 타임라인
+
+### 2026-08-11 — 도시별 근거 기반 에이전트·구조화 장소 지식
+- 러너/툴/스케줄을 활성 도시별로 실행하고 모든 장소·이벤트·이의·재검증 쿼리에 `city_id` 경계 적용
+- 관리자에서 도시 선택 + 웹 조사 모드 실행, `agent_proposals` 신규 장소/병합 승인·거절 UI
+- 신규 제안은 evidence/source URLs/confidence와 구조화 insight 2건 이상 필수
+- `place_insights`: location/history/visit/tip을 타임라인형 장소 상세에 표시
+- 마커 좌표 provenance(provider/external ID/query/source URL/confidence/CRS) 저장 및 화면 노출
+- 따종/고덕 공유 가져오기와 GPS 범위를 선택 도시 컨텍스트로 전환
+- 선양 초기 조사 축과 공통 편집 기준을 지식베이스 seed로 추가
 
 ### 2026-08-11 — 도시별 다중 위치 검색
 - `/api/geocode`: 운영 DB·ArcGIS·Nominatim·Wikidata 병렬 조회, 도시 viewbox 필터, 140m 근접 후보 병합

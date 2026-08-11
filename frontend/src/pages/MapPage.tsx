@@ -372,6 +372,10 @@ export default function MapPage() {
       title: result.title,
       description: result.description,
       category,
+      coordinateSource: result.needs_map_pick ? "manual" : result.source,
+      coordinateSourceUrl: result.source_url,
+      coordinateQuery: result.title,
+      coordinateConfidence: result.needs_map_pick ? null : 0.75,
     });
     setToolMode("pin");
     setSelected(null);
@@ -547,7 +551,7 @@ export default function MapPage() {
   const toolsBlock = (
     <div className="side-tools">
       {token ? (
-        <ShareImport token={token} source="amap" placement="main" onImported={handleShareImported} />
+        <ShareImport token={token} cityId={selectedCityId} source="amap" placement="main" onImported={handleShareImported} />
       ) : null}
     </div>
   );
@@ -626,6 +630,11 @@ export default function MapPage() {
                   title: geocodeShortName(selectedSearchHit),
                   description: selectedSearchHit.display_name,
                   category: "tourist",
+                  coordinateSource: selectedSearchHit.sources.join("+"),
+                  coordinateExternalId: selectedSearchHit.external_id,
+                  coordinateQuery: selectedSearchHit.query,
+                  coordinateSourceUrl: selectedSearchHit.source_url,
+                  coordinateConfidence: selectedSearchHit.confidence,
                 });
               }
               placePinDraft(searchPin.lat, searchPin.lng, { openCreate: true });
@@ -658,6 +667,7 @@ export default function MapPage() {
       marker={selected}
       createDefaults={createDefaults}
       token={token}
+      cityId={selectedCityId}
       canEdit={!!selected && !!user}
       onClose={closePanel}
       onCreate={handleCreate}
@@ -808,6 +818,8 @@ export default function MapPage() {
           <UserLocation
             enabled={locateOn}
             simulate={locateSimulate}
+            cityName={`${selectedCity.name_ko}(${selectedCity.name_local})`}
+            viewbox={selectedCity.search_viewbox}
             followOnce={locateFollowOnce}
             onFollowed={() => setLocateFollowOnce(false)}
             onStatus={handleLocateStatus}
@@ -894,7 +906,7 @@ export default function MapPage() {
               {locateOn ? "내 위치 끄기" : "내 위치"}
             </button>
             {token ? (
-              <ShareImport token={token} source="amap" placement="main" onImported={handleShareImported} />
+              <ShareImport token={token} cityId={selectedCityId} source="amap" placement="main" onImported={handleShareImported} />
             ) : null}
             {user?.is_admin ? (
               <a className="sheet-menu__link" href="/admin">

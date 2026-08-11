@@ -12,10 +12,20 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
 from app.agent.runner import count_unread, run_agent
+from app.agent.tools import run_tool
 from app.auth import get_admin_user, hash_password
 from app.config import settings
 from app.db import SessionLocal, get_db
-from app.models import AgentKnowledge, Marker, PlaceAppeal, PlaceAppealStatus, PlaceEvent, User
+from app.models import (
+    AgentKnowledge,
+    AgentProposal,
+    City,
+    Marker,
+    PlaceAppeal,
+    PlaceAppealStatus,
+    PlaceEvent,
+    User,
+)
 from app.knowledge import list_knowledge
 from app.rollback import is_rollbackable, list_agent_actions, rollback_event
 from app.schemas import AgentKnowledgeOut, AgentRunResponse, UserOut
@@ -35,6 +45,7 @@ class AdminStatusOut(BaseModel):
     unread_work_items: int
     knowledge_topics: int = 0
     agent_suggested_places: int = 0
+    proposals_pending: int = 0
 
 
 class AdminUserCreate(BaseModel):
@@ -74,6 +85,7 @@ def admin_status(
         agent_suggested_places=db.query(Marker).filter(
             Marker.is_agent_suggested.is_(True), Marker.merged_into_id.is_(None)
         ).count(),
+        proposals_pending=db.query(AgentProposal).filter(AgentProposal.status == "pending").count(),
     )
 
 
@@ -104,10 +116,15 @@ def _agent_run_status() -> AgentRunStatusOut:
     )
 
 
-def _run_agent_background() -> None:
+class AgentRunRequest(BaseModel):
+    city_id: int = Field(default=2, gt=0)
+    research: bool = False
+
+
+def _run_agent_background(city_id: int, research: bool) -> None:
     db = SessionLocal()
     try:
-        result = run_agent(db)
+        result = run_agent(db, city_id=city_id, autonomous_research=research)
     except Exception as exc:
         result = {
             "ok": False,
@@ -115,6 +132,7 @@ def _run_agent_background() -> None:
             "message": str(exc)[:1500],
             "unread_before": 0,
             "unread_after": 0,
+            "city_id": city_id,
         }
     finally:
         db.close()
@@ -125,9 +143,13 @@ def _run_agent_background() -> None:
 
 @router.post("/agent/run", response_model=AgentRunStatusOut)
 def admin_run_agent(
+    body: AgentRunRequest,
+    db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
 ) -> AgentRunStatusOut:
     _ = admin
+    if db.query(City.id).filter(City.id == body.city_id, City.status == "active").first() is None:
+        raise HTTPException(status_code=404, detail="도시를 찾을 수 없습니다")
     with _agent_run_lock:
         if not _agent_run_state["running"]:
             _agent_run_state.update(
@@ -138,7 +160,11 @@ def admin_run_agent(
                     "result": None,
                 }
             )
-            threading.Thread(target=_run_agent_background, daemon=True).start()
+            threading.Thread(
+                target=_run_agent_background,
+                args=(body.city_id, body.research),
+                daemon=True,
+            ).start()
     return _agent_run_status()
 
 
@@ -172,6 +198,130 @@ def admin_knowledge(
         )
         for r in rows
     ]
+
+
+class AgentProposalOut(BaseModel):
+    id: int
+    city_id: int
+    place_id: Optional[int] = None
+    result_place_id: Optional[int] = None
+    action: str
+    title: str
+    payload: dict[str, Any]
+    evidence: str
+    source_urls: list[str]
+    confidence: float
+    status: str
+    decision_note: str
+    created_at: datetime
+    decided_at: Optional[datetime] = None
+
+
+class AgentProposalDecision(BaseModel):
+    note: str = Field(default="", max_length=2000)
+
+
+def _proposal_out(row: AgentProposal) -> AgentProposalOut:
+    try:
+        payload = json.loads(row.payload or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    try:
+        urls = json.loads(row.source_urls or "[]")
+    except json.JSONDecodeError:
+        urls = []
+    return AgentProposalOut(
+        id=row.id,
+        city_id=row.city_id,
+        place_id=row.place_id,
+        result_place_id=row.result_place_id,
+        action=row.action,
+        title=row.title,
+        payload=payload if isinstance(payload, dict) else {},
+        evidence=row.evidence or "",
+        source_urls=urls if isinstance(urls, list) else [],
+        confidence=float(row.confidence or 0),
+        status=row.status,
+        decision_note=row.decision_note or "",
+        created_at=row.created_at,
+        decided_at=row.decided_at,
+    )
+
+
+@router.get("/agent/proposals", response_model=list[AgentProposalOut])
+def admin_agent_proposals(
+    city_id: Optional[int] = None,
+    proposal_status: str = "pending",
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> list[AgentProposalOut]:
+    _ = admin
+    query = db.query(AgentProposal)
+    if city_id is not None:
+        query = query.filter(AgentProposal.city_id == city_id)
+    if proposal_status and proposal_status != "all":
+        query = query.filter(AgentProposal.status == proposal_status)
+    rows = query.order_by(AgentProposal.created_at.desc()).limit(max(1, min(limit, 300))).all()
+    return [_proposal_out(row) for row in rows]
+
+
+@router.post("/agent/proposals/{proposal_id}/approve", response_model=AgentProposalOut)
+def approve_agent_proposal(
+    proposal_id: int,
+    body: AgentProposalDecision,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> AgentProposalOut:
+    row = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="제안을 찾을 수 없습니다")
+    if row.status != "pending":
+        raise HTTPException(status_code=409, detail="이미 처리된 제안입니다")
+    try:
+        payload = json.loads(row.payload or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="제안 데이터가 손상되었습니다") from exc
+    result = run_tool(db, row.action, payload, city_id=row.city_id, approved=True)
+    if not isinstance(result, dict) or result.get("error") or not result.get("ok"):
+        db.rollback()
+        detail = (
+            result.get("detail") or result.get("error")
+            if isinstance(result, dict)
+            else "apply_failed"
+        )
+        raise HTTPException(status_code=400, detail=f"제안을 적용하지 못했습니다: {detail}")
+    row = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+    assert row is not None
+    row.status = "approved"
+    row.decision_note = body.note.strip()
+    row.decided_by_user_id = admin.id
+    row.decided_at = datetime.now(timezone.utc)
+    row.result_place_id = int(result.get("place_id") or result.get("target_id") or 0) or None
+    db.commit()
+    db.refresh(row)
+    return _proposal_out(row)
+
+
+@router.post("/agent/proposals/{proposal_id}/reject", response_model=AgentProposalOut)
+def reject_agent_proposal(
+    proposal_id: int,
+    body: AgentProposalDecision,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> AgentProposalOut:
+    row = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="제안을 찾을 수 없습니다")
+    if row.status != "pending":
+        raise HTTPException(status_code=409, detail="이미 처리된 제안입니다")
+    row.status = "rejected"
+    row.decision_note = body.note.strip()
+    row.decided_by_user_id = admin.id
+    row.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return _proposal_out(row)
 
 
 class AdminAgentActionOut(BaseModel):

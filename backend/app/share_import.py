@@ -62,7 +62,14 @@ def looks_like_share_text(text: str) -> bool:
     return False
 
 
-def import_share_text(text: str, preferred_source: str = "") -> ShareImportResult:
+def import_share_text(
+    text: str,
+    preferred_source: str = "",
+    *,
+    city_name: str,
+    city_context: str,
+    viewbox: str = "",
+) -> ShareImportResult:
     raw = text.strip()
     if not raw:
         raise ValueError("붙여넣을 내용이 없습니다")
@@ -72,16 +79,22 @@ def import_share_text(text: str, preferred_source: str = "") -> ShareImportResul
     pref = preferred_source.strip().lower()
 
     if pref == "dianping" or (not pref and (dp_url or "【" in raw) and not amap_url):
-        return _import_dianping(raw, dp_url)
+        return _import_dianping(
+            raw, dp_url, city_name=city_name, city_context=city_context, viewbox=viewbox
+        )
 
     if pref == "amap" or amap_url or "surl.amap.com" in raw.lower() or "amap.com" in raw.lower():
         url = amap_url or ""
         if not url:
             raise ValueError("고덕 공유 링크(surl.amap.com)가 필요합니다")
-        return _import_amap(url, raw)
+        return _import_amap(
+            url, raw, city_name=city_name, city_context=city_context, viewbox=viewbox
+        )
 
     if dp_url or "【" in raw:
-        return _import_dianping(raw, dp_url)
+        return _import_dianping(
+            raw, dp_url, city_name=city_name, city_context=city_context, viewbox=viewbox
+        )
 
     raise ValueError("따종·고덕 공유 텍스트/링크를 인식하지 못했습니다")
 
@@ -185,13 +198,26 @@ def _category_from_text(*parts: str) -> str:
     return "other"
 
 
-def _import_amap(url: str, original: str) -> ShareImportResult:
+def _import_amap(
+    url: str,
+    original: str,
+    *,
+    city_name: str,
+    city_context: str,
+    viewbox: str,
+) -> ShareImportResult:
     try:
         final = _follow_redirects(url)
         parsed = _parse_amap_final(final)
     except RuntimeError:
         # 서버에서 amap 접속이 막히거나 지연되는 경우 — 본문 텍스트로 초안 폴백
-        return _import_amap_text_fallback(url, original)
+        return _import_amap_text_fallback(
+            url,
+            original,
+            city_name=city_name,
+            city_context=city_context,
+            viewbox=viewbox,
+        )
     if not parsed:
         raise RuntimeError("고덕 링크에서 위치 정보를 읽지 못했습니다. 링크가 만료됐을 수 있습니다.")
 
@@ -227,7 +253,14 @@ def _import_amap(url: str, original: str) -> ShareImportResult:
     )
 
 
-def _import_amap_text_fallback(url: str, original: str) -> ShareImportResult:
+def _import_amap_text_fallback(
+    url: str,
+    original: str,
+    *,
+    city_name: str,
+    city_context: str,
+    viewbox: str,
+) -> ShareImportResult:
     """링크 추적 실패 시: 공유 본문의 제목·주소로 초안 구성, 가능하면 지오코딩."""
     title, address, price_label, meta = _parse_share_body_lines(original, url)
     if not title:
@@ -243,9 +276,15 @@ def _import_amap_text_fallback(url: str, original: str) -> ShareImportResult:
         "고덕 링크 연결이 안 돼 본문 텍스트로 초안을 만들었습니다. "
         "지도에서 위치를 탭해 핀을 놓고 저장하세요."
     )
-    for q in filter(None, [f"{title} 济南", address and f"{address} 济南", address]):
+    for q in filter(None, [f"{title} {city_name}", address and f"{address} {city_name}", address]):
         try:
-            hits = search_address(q, limit=3)
+            hits = search_address(
+                q,
+                limit=3,
+                viewbox=viewbox,
+                city_name=city_name,
+                city_context=city_context,
+            )
         except RuntimeError:
             hits = []
         if hits:
@@ -349,7 +388,14 @@ def _parse_amap_p(p: str) -> Optional[tuple[float, float, str, str]]:
     return lat, lng, name, address
 
 
-def _import_dianping(text: str, url: str) -> ShareImportResult:
+def _import_dianping(
+    text: str,
+    url: str,
+    *,
+    city_name: str,
+    city_context: str,
+    viewbox: str,
+) -> ShareImportResult:
     source_url = url or _first_match(DP_URL_RE, text)
     title_m = TITLE_BRACKET_RE.search(text)
     title = (title_m.group(1).strip() if title_m else "").strip()
@@ -409,11 +455,17 @@ def _import_dianping(text: str, url: str) -> ShareImportResult:
 
     geo_queries = []
     if address:
-        geo_queries.extend([f"{address} 济南", address])
-    geo_queries.append(f"{title} 济南")
+        geo_queries.extend([f"{address} {city_name}", address])
+    geo_queries.append(f"{title} {city_name}")
     for q in geo_queries:
         try:
-            hits = search_address(q, limit=3)
+            hits = search_address(
+                q,
+                limit=3,
+                viewbox=viewbox,
+                city_name=city_name,
+                city_context=city_context,
+            )
         except RuntimeError:
             hits = []
         if hits:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import urllib.parse
 import urllib.request
@@ -32,6 +33,7 @@ from app.messages import (
     notify_place_contributors,
 )
 from app.models import (
+    AgentProposal,
     AgentSearchLog,
     AgentSearchResult,
     AgentWebVisit,
@@ -44,6 +46,7 @@ from app.models import (
     PlaceEvent,
     PlaceEventAction,
     PlaceImage,
+    PlaceInsight,
     UserMessageKind,
 )
 from app.rollback import _rollback_merge, marker_snapshot
@@ -174,8 +177,14 @@ TOOLS: list[dict[str, Any]] = [
                     "target_place_id": {"type": "integer"},
                     "source_place_id": {"type": "integer"},
                     "reason": {"type": "string", "description": "동일 실체 근거 (웹 출처 포함)"},
+                    "source_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "동일 실체를 확인한 실제 URL",
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 },
-                "required": ["target_place_id", "source_place_id"],
+                "required": ["target_place_id", "source_place_id", "reason", "source_urls", "confidence"],
             },
         },
     },
@@ -228,7 +237,7 @@ TOOLS: list[dict[str, Any]] = [
                 "사용자가 쓴 설명은 append_note로만 보완. "
                 "설명이 중국어/영어 위주로 잘못 작성된 장소(주로 agent 추가분)는 "
                 "replace_description으로 한국어 본문으로 전면 재작성 "
-                "(주소는 '주소: 山东省济南市…' 형태로 중국어 유지)."
+                "(주소는 '주소: [중국어 원문]' 형태로 유지)."
             ),
             "parameters": {
                 "type": "object",
@@ -258,12 +267,12 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "create_place",
             "description": (
-                "웹 조사·지오코딩 후 지도에 없는 유용한 지난 장소를 추천 추가한다. "
+                "웹 조사·지오코딩 후 현재 실행 도시의 지도에 없는 유용한 장소를 추천 추가한다. "
                 "매 사이클 소수를 적극 등록. "
                 "언어 규칙(위반 시 거부됨): title은 '中文名 (한국어 명칭)' 형식으로 "
                 "중국어+한국어 병기 (예: '泉城广场 (취안청 광장)'). "
                 "description 본문은 무조건 한국어로 작성하고, 지도 검색용 주소는 "
-                "'주소: 山东省济南市…' 형태로 중국어 원문을 포함할 것."
+                "'주소: [중국어 원문]' 형태로 포함할 것."
             ),
             "parameters": {
                 "type": "object",
@@ -274,8 +283,74 @@ TOOLS: list[dict[str, Any]] = [
                     "lat": {"type": "number"},
                     "lng": {"type": "number"},
                     "context": {"type": "string"},
+                    "coordinate_source": {"type": "string"},
+                    "coordinate_external_id": {"type": "string"},
+                    "coordinate_query": {"type": "string"},
+                    "coordinate_source_url": {"type": "string"},
+                    "coordinate_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "evidence": {
+                        "type": "string",
+                        "description": "왜 이 장소를 추가해야 하는지와 교차 확인한 근거를 한국어로 요약",
+                    },
+                    "source_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "판단에 사용한 실제 출처 URL. 최소 1개",
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "insights": {
+                        "type": "array",
+                        "minItems": 2,
+                        "description": "최소 위치 맥락 1개와 역사/방문정보 1개를 구조화",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["location", "history", "visit", "tip"]},
+                                "title": {"type": "string"},
+                                "content": {"type": "string"},
+                                "year_label": {"type": "string"},
+                                "source_url": {"type": "string"},
+                                "source_title": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                            "required": ["kind", "title", "content", "source_url", "confidence"],
+                        },
+                    },
                 },
-                "required": ["title", "lat", "lng"],
+                "required": ["title", "lat", "lng", "evidence", "source_urls", "confidence", "insights"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "upsert_place_insights",
+            "description": (
+                "장소의 현재 위치 의미·역사 사건·방문 정보·현지 팁을 출처와 신뢰도와 함께 구조화한다. "
+                "본문 description에 뒤섞지 말고 이 툴로 저장한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_id": {"type": "integer"},
+                    "insights": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["location", "history", "visit", "tip"]},
+                                "title": {"type": "string"},
+                                "content": {"type": "string"},
+                                "year_label": {"type": "string"},
+                                "source_url": {"type": "string"},
+                                "source_title": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            },
+                            "required": ["kind", "title", "content", "source_url", "confidence"],
+                        },
+                    },
+                },
+                "required": ["place_id", "insights"],
             },
         },
     },
@@ -420,7 +495,6 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "query": {"type": "string"},
                     "limit": {"type": "integer", "default": 5},
-                    "city_id": {"type": "integer", "default": 1, "description": "1=지난, 2=선양"},
                 },
                 "required": ["query"],
             },
@@ -593,6 +667,7 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 def _place_brief(m: Marker) -> dict[str, Any]:
     return {
         "id": m.id,
+        "city_id": m.city_id,
         "title": m.title,
         "category": m.category.value if m.category else None,
         "shape": m.shape.value if m.shape else None,
@@ -603,7 +678,58 @@ def _place_brief(m: Marker) -> dict[str, Any]:
         "merged_into_id": m.merged_into_id,
         "is_agent_suggested": m.is_agent_suggested,
         "image_count": len(m.images or []),
+        "insight_count": len(m.insights or []),
+        "coordinate_source": m.coordinate_source or "manual",
+        "coordinate_confidence": m.coordinate_confidence,
+        "coordinate_crs": m.coordinate_crs or "WGS84",
     }
+
+
+def _pending_proposal(
+    db: Session,
+    *,
+    city_id: int,
+    action: str,
+    title: str,
+    payload: dict[str, Any],
+    evidence: str,
+    source_urls: list[str],
+    confidence: float,
+    place_id: Optional[int] = None,
+) -> dict[str, Any]:
+    canonical = json.dumps(
+        {"city_id": city_id, "action": action, "payload": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    proposal_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    existing = (
+        db.query(AgentProposal)
+        .filter(
+            AgentProposal.proposal_key == proposal_key,
+            AgentProposal.status == "pending",
+        )
+        .order_by(AgentProposal.id.desc())
+        .first()
+    )
+    if existing:
+        return {"ok": True, "proposal_created": False, "proposal_id": existing.id}
+    row = AgentProposal(
+        city_id=city_id,
+        place_id=place_id,
+        action=action,
+        title=title[:200],
+        payload=json.dumps(payload, ensure_ascii=False),
+        evidence=evidence.strip()[:8000],
+        source_urls=json.dumps([u[:1000] for u in source_urls if u][:12], ensure_ascii=False),
+        confidence=max(0.0, min(float(confidence), 1.0)),
+        proposal_key=proposal_key,
+        status="pending",
+    )
+    db.add(row)
+    db.commit()
+    return {"ok": True, "proposal_created": True, "proposal_id": row.id}
 
 
 def _has_hangul(s: str) -> bool:
@@ -676,22 +802,24 @@ def _extract_page_text(url: str) -> dict[str, Any]:
     return {"title": parser.title.strip()[:300], "text": body[:7000]}
 
 
-def _record_visit(db: Session, url: str, title: str = "") -> bool:
+def _record_visit(db: Session, url: str, title: str = "", city_id: Optional[int] = None) -> bool:
     """방문 기록 upsert. 반환값: 이번이 첫 방문인지."""
     row = db.query(AgentWebVisit).filter(AgentWebVisit.url == url).first()
     if row:
         row.visit_count += 1
         if title and not row.title:
             row.title = title[:300]
+        if city_id is not None:
+            row.city_id = city_id
         db.commit()
         return False
-    db.add(AgentWebVisit(url=url[:1000], title=title[:300]))
+    db.add(AgentWebVisit(url=url[:1000], title=title[:300], city_id=city_id))
     db.commit()
     return True
 
 
 _WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
-_IMAGE_UA = "JinanTravelMap/0.1 (shared travel map; image enrichment)"
+_IMAGE_UA = "CloudmiddleTravelMap/0.2 (shared travel map; image enrichment)"
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 _IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
@@ -739,12 +867,21 @@ def _wikimedia_image_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
     return out
 
 
-def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
+def run_tool(
+    db: Session,
+    name: str,
+    args: dict[str, Any],
+    *,
+    city_id: int,
+    approved: bool = False,
+) -> Any:
     if name == "list_unread_events":
         limit = int(args.get("limit") or 30)
         rows = (
             db.query(PlaceEvent)
+            .join(Marker, Marker.id == PlaceEvent.place_id)
             .filter(PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent")
+            .filter(Marker.city_id == city_id)
             .order_by(PlaceEvent.created_at.asc())
             .limit(max(1, min(limit, 100)))
             .all()
@@ -765,7 +902,14 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
 
     if name == "mark_events_read":
         ids = [int(x) for x in (args.get("event_ids") or [])]
-        n = mark_events_read(db, ids)
+        allowed = [
+            row[0]
+            for row in db.query(PlaceEvent.id)
+            .join(Marker, Marker.id == PlaceEvent.place_id)
+            .filter(PlaceEvent.id.in_(ids), Marker.city_id == city_id)
+            .all()
+        ]
+        n = mark_events_read(db, allowed)
         db.commit()
         return {"marked": n}
 
@@ -782,7 +926,9 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         near_lng = args.get("near_lng")
         radius = float(args.get("radius_m") or 150)
 
-        query = db.query(Marker).filter(Marker.merged_into_id.is_(None))
+        query = db.query(Marker).filter(
+            Marker.city_id == city_id, Marker.merged_into_id.is_(None)
+        )
         if cat_raw:
             try:
                 query = query.filter(Marker.category == MarkerCategory(cat_raw))
@@ -825,7 +971,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = (
             db.query(Marker)
             .options(joinedload(Marker.images), joinedload(Marker.contributors))
-            .filter(Marker.id == pid)
+            .filter(Marker.id == pid, Marker.city_id == city_id)
             .first()
         )
         if not m:
@@ -852,10 +998,18 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
     if name == "find_nearby_candidates":
         pid = int(args["place_id"])
         radius = float(args.get("radius_m") or 120)
-        m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
+        m = db.query(Marker).filter(
+            Marker.id == pid,
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).first()
         if not m:
             return {"error": "not_found"}
-        others = db.query(Marker).filter(Marker.merged_into_id.is_(None), Marker.id != pid).all()
+        others = db.query(Marker).filter(
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+            Marker.id != pid,
+        ).all()
         hits = []
         for o in others:
             dist = _haversine_m(m.lat, m.lng, o.lat, o.lng)
@@ -865,19 +1019,42 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         return hits
 
     if name == "merge_places":
-        if not settings.agent_allow_auto_merge:
-            return {"error": "approval_required", "detail": "자동 병합이 비활성화되어 있습니다."}
         target_id = int(args["target_place_id"])
         source_id = int(args["source_place_id"])
         reason = str(args.get("reason") or "same place")
         if target_id == source_id:
             return {"error": "same_id"}
-        target = db.query(Marker).filter(Marker.id == target_id, Marker.merged_into_id.is_(None)).first()
-        source = db.query(Marker).filter(Marker.id == source_id, Marker.merged_into_id.is_(None)).first()
+        target = db.query(Marker).filter(
+            Marker.id == target_id,
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).first()
+        source = db.query(Marker).filter(
+            Marker.id == source_id,
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).first()
         if not target or not source:
             return {"error": "not_found"}
         if target.city_id != source.city_id:
             return {"error": "cross_city_merge_forbidden"}
+        if not settings.agent_allow_auto_merge and not approved:
+            payload = {
+                "target_place_id": target_id,
+                "source_place_id": source_id,
+                "reason": reason,
+            }
+            return _pending_proposal(
+                db,
+                city_id=city_id,
+                action="merge_places",
+                title=f"{source.title} → {target.title} 병합",
+                payload=payload,
+                evidence=reason,
+                source_urls=[str(u) for u in (args.get("source_urls") or [])],
+                confidence=float(args.get("confidence") or 0.5),
+                place_id=target_id,
+            )
         source_title = source.title
         before = {
             "target": marker_snapshot(target),
@@ -946,7 +1123,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
     if name == "undo_merge":
         source_id = int(args["source_place_id"])
         reason = str(args.get("reason") or "사용자 이의 수용")[:500]
-        source = db.query(Marker).filter(Marker.id == source_id).first()
+        source = db.query(Marker).filter(Marker.id == source_id, Marker.city_id == city_id).first()
         if not source:
             return {"error": "not_found"}
         if source.merged_into_id is None:
@@ -1011,7 +1188,11 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
     if name == "update_place_context":
         pid = int(args["place_id"])
         ctx = str(args.get("context") or "")[:8000]
-        m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
+        m = db.query(Marker).filter(
+            Marker.id == pid,
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).first()
         if not m:
             return {"error": "not_found"}
         before = marker_field_snapshot(m)
@@ -1042,7 +1223,11 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
 
     if name == "update_place_fields":
         pid = int(args["place_id"])
-        m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
+        m = db.query(Marker).filter(
+            Marker.id == pid,
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).first()
         if not m:
             return {"error": "not_found"}
         before = marker_field_snapshot(m)
@@ -1118,8 +1303,6 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         return {"ok": True, "changed": changed}
 
     if name == "create_place":
-        if not settings.agent_allow_auto_create:
-            return {"error": "approval_required", "detail": "자동 장소 생성이 비활성화되어 있습니다."}
         title = str(args.get("title") or "추천 장소")[:200]
         desc = str(args.get("description") or "")[:2000]
         if not _has_hangul(title):
@@ -1135,7 +1318,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
                 "error": "korean_required",
                 "detail": (
                     "description 본문은 무조건 한국어로 작성해야 합니다. "
-                    "중국어 정보는 번역하고, 주소만 '주소: 山东省济南市…' 형태로 중국어를 유지하세요."
+                    "중국어 정보는 번역하고, 주소만 '주소: [중국어 원문]' 형태로 유지하세요."
                 ),
             }
         cat_raw = str(args.get("category") or "other")
@@ -1143,20 +1326,109 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             cat = MarkerCategory(cat_raw)
         except ValueError:
             cat = MarkerCategory.other
+        insights_payload: list[dict[str, Any]] = []
+        for raw in (args.get("insights") or [])[:20]:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind") or "").strip().lower()
+            item_title = str(raw.get("title") or "").strip()[:200]
+            content = str(raw.get("content") or "").strip()[:4000]
+            source_url = str(raw.get("source_url") or "").strip()[:1000]
+            if (
+                kind not in {"location", "history", "visit", "tip"}
+                or not item_title
+                or not content
+                or not source_url
+                or not _has_hangul(content)
+            ):
+                continue
+            insights_payload.append(
+                {
+                    "kind": kind,
+                    "title": item_title,
+                    "content": content,
+                    "year_label": str(raw.get("year_label") or "").strip()[:50],
+                    "source_url": source_url,
+                    "source_title": str(raw.get("source_title") or "").strip()[:300],
+                    "confidence": max(0.0, min(float(raw.get("confidence") or 0.5), 1.0)),
+                }
+            )
+        payload = {
+            "title": title,
+            "description": desc,
+            "category": cat.value,
+            "lat": float(args["lat"]),
+            "lng": float(args["lng"]),
+            "context": str(args.get("context") or "")[:8000],
+            "coordinate_source": str(args.get("coordinate_source") or "agent_research")[:50],
+            "coordinate_external_id": str(args.get("coordinate_external_id") or "")[:200],
+            "coordinate_query": str(args.get("coordinate_query") or title)[:300],
+            "coordinate_source_url": str(args.get("coordinate_source_url") or "")[:1000],
+            "coordinate_confidence": max(
+                0.0, min(float(args.get("coordinate_confidence") or args.get("confidence") or 0.5), 1.0)
+            ),
+            "insights": insights_payload,
+        }
+        if not settings.agent_allow_auto_create and not approved:
+            source_urls = [str(u) for u in (args.get("source_urls") or []) if str(u).strip()]
+            evidence = str(args.get("evidence") or "").strip()
+            if not evidence or not source_urls:
+                return {
+                    "error": "evidence_required",
+                    "detail": "장소 제안에는 evidence와 실제 source_urls가 필요합니다.",
+                }
+            if len(insights_payload) < 2:
+                return {
+                    "error": "insights_required",
+                    "detail": "신규 장소 제안에는 출처가 있는 구조화 정보가 2건 이상 필요합니다.",
+                }
+            return _pending_proposal(
+                db,
+                city_id=city_id,
+                action="create_place",
+                title=title,
+                payload=payload,
+                evidence=evidence,
+                source_urls=source_urls,
+                confidence=float(args.get("confidence") or 0.5),
+            )
         m = Marker(
             user_id=None,
-            city_id=1,
+            city_id=city_id,
             category=cat,
             shape=MarkerShape.point,
             title=title,
             description=desc,
-            lat=float(args["lat"]),
-            lng=float(args["lng"]),
-            agent_context=str(args.get("context") or "")[:8000],
+            lat=payload["lat"],
+            lng=payload["lng"],
+            agent_context=payload["context"],
+            coordinate_source=payload["coordinate_source"],
+            coordinate_external_id=payload["coordinate_external_id"],
+            coordinate_query=payload["coordinate_query"],
+            coordinate_source_url=payload["coordinate_source_url"],
+            coordinate_confidence=payload["coordinate_confidence"],
+            coordinate_crs="WGS84",
+            coordinate_verified_at=datetime.now(timezone.utc),
             is_agent_suggested=True,
         )
         db.add(m)
         db.flush()
+        for index, item in enumerate(insights_payload):
+            db.add(
+                PlaceInsight(
+                    place_id=m.id,
+                    kind=item["kind"],
+                    title=item["title"],
+                    content=item["content"],
+                    year_label=item["year_label"],
+                    source_url=item["source_url"],
+                    source_title=item["source_title"],
+                    confidence=item["confidence"],
+                    created_by="agent",
+                    sort_order=index,
+                    verified_at=datetime.now(timezone.utc),
+                )
+            )
         ev = log_place_event(
             db,
             place_id=m.id,
@@ -1183,9 +1455,81 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         db.commit()
         return {"ok": True, "place_id": m.id}
 
+    if name == "upsert_place_insights":
+        pid = int(args["place_id"])
+        m = db.query(Marker).filter(
+            Marker.id == pid,
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).first()
+        if not m:
+            return {"error": "not_found"}
+        raw_items = args.get("insights") or []
+        if not isinstance(raw_items, list):
+            return {"error": "bad_insights"}
+        allowed_kinds = {"location", "history", "visit", "tip"}
+        changed = 0
+        now = datetime.now(timezone.utc)
+        for index, raw in enumerate(raw_items[:30]):
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind") or "").strip().lower()
+            title_s = str(raw.get("title") or "").strip()[:200]
+            content_s = str(raw.get("content") or "").strip()[:4000]
+            source_url = str(raw.get("source_url") or "").strip()[:1000]
+            if kind not in allowed_kinds or not title_s or not content_s or not source_url:
+                continue
+            if not _has_hangul(content_s):
+                continue
+            confidence = max(0.0, min(float(raw.get("confidence") or 0.5), 1.0))
+            row = db.query(PlaceInsight).filter(
+                PlaceInsight.place_id == pid,
+                PlaceInsight.kind == kind,
+                PlaceInsight.title == title_s,
+            ).first()
+            if row is None:
+                row = PlaceInsight(place_id=pid, kind=kind, title=title_s)
+                db.add(row)
+            row.content = content_s
+            row.year_label = str(raw.get("year_label") or "").strip()[:50]
+            row.source_url = source_url
+            row.source_title = str(raw.get("source_title") or "").strip()[:300]
+            row.confidence = confidence
+            row.created_by = "agent"
+            row.sort_order = index
+            row.verified_at = now
+            changed += 1
+        if changed:
+            log_place_event(
+                db,
+                place_id=pid,
+                user=None,
+                action=PlaceEventAction.context_update,
+                summary=f"구조화 정보 {changed}건 보완: {m.title}",
+                payload={
+                    "insight_count": changed,
+                    "fields": ["insights"],
+                    "changes": [{"field": "insights", "before": None, "after": changed}],
+                },
+                actor="agent",
+            )
+            db.commit()
+        return {"ok": True, "changed": changed}
+
     if name == "list_open_appeals":
         limit = int(args.get("limit") or 30)
-        rows = list_open_appeals(db, limit=limit)
+        rows = (
+            db.query(PlaceAppeal)
+            .join(Marker, Marker.id == PlaceAppeal.place_id)
+            .filter(
+                Marker.city_id == city_id,
+                PlaceAppeal.status == PlaceAppealStatus.open,
+                PlaceAppeal.groq_read_at.is_(None),
+            )
+            .order_by(PlaceAppeal.created_at.asc())
+            .limit(max(1, min(limit, 100)))
+            .all()
+        )
         return [
             {
                 "id": a.id,
@@ -1207,7 +1551,12 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             return {"error": "bad_status"}
         if status not in (PlaceAppealStatus.resolved, PlaceAppealStatus.dismissed):
             return {"error": "bad_status"}
-        appeal = db.query(PlaceAppeal).filter(PlaceAppeal.id == aid).first()
+        appeal = (
+            db.query(PlaceAppeal)
+            .join(Marker, Marker.id == PlaceAppeal.place_id)
+            .filter(PlaceAppeal.id == aid, Marker.city_id == city_id)
+            .first()
+        )
         if not appeal:
             return {"error": "not_found"}
         appeal.status = status
@@ -1238,7 +1587,12 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         open_ids = [
             a.id
             for a in db.query(PlaceAppeal)
-            .filter(PlaceAppeal.id.in_(ids), PlaceAppeal.status == PlaceAppealStatus.open)
+            .join(Marker, Marker.id == PlaceAppeal.place_id)
+            .filter(
+                PlaceAppeal.id.in_(ids),
+                PlaceAppeal.status == PlaceAppealStatus.open,
+                Marker.city_id == city_id,
+            )
             .all()
         ]
         if open_ids:
@@ -1247,12 +1601,21 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
                 "open_ids": open_ids,
                 "hint": "resolve_appeal(resolved|dismissed)로 종결한 뒤 읽음 처리하세요.",
             }
-        n = mark_appeals_read(db, ids)
+        allowed = [
+            row[0]
+            for row in db.query(PlaceAppeal.id)
+            .join(Marker, Marker.id == PlaceAppeal.place_id)
+            .filter(PlaceAppeal.id.in_(ids), Marker.city_id == city_id)
+            .all()
+        ]
+        n = mark_appeals_read(db, allowed)
         db.commit()
         return {"marked": n}
 
     if name == "reorder_images":
         pid = int(args["place_id"])
+        if db.query(Marker.id).filter(Marker.id == pid, Marker.city_id == city_id).first() is None:
+            return {"error": "not_found"}
         ordered = [int(x) for x in (args.get("ordered_ids") or [])]
         groups = args.get("group_keys") or {}
         images = db.query(PlaceImage).filter(PlaceImage.place_id == pid).all()
@@ -1290,9 +1653,11 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         limit = int(args.get("limit") or 20)
         rows = (
             db.query(PlaceEvent)
+            .join(Marker, Marker.id == PlaceEvent.place_id)
             .filter(
                 PlaceEvent.action == PlaceEventAction.rollback,
                 PlaceEvent.groq_read_at.is_(None),
+                Marker.city_id == city_id,
             )
             .order_by(PlaceEvent.created_at.desc())
             .limit(max(1, min(limit, 50)))
@@ -1312,7 +1677,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
 
     if name == "list_knowledge":
         limit = int(args.get("limit") or 30)
-        rows = list_knowledge(db, limit=limit)
+        rows = list_knowledge(db, limit=limit, city_id=city_id)
         return [
             {
                 "id": r.id,
@@ -1328,14 +1693,21 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         ]
 
     if name == "upsert_knowledge":
+        scope = str(args.get("scope") or "city")
+        requested_place_id = int(args["place_id"]) if args.get("place_id") is not None else None
+        if requested_place_id is not None and db.query(Marker.id).filter(
+            Marker.id == requested_place_id, Marker.city_id == city_id
+        ).first() is None:
+            return {"error": "cross_city_place_forbidden"}
+        knowledge_city_id = None if scope == "global" else city_id
         row = upsert_knowledge(
             db,
             topic=str(args.get("topic") or "general"),
             title=str(args.get("title") or "교훈"),
             content=str(args.get("content") or ""),
-            scope=str(args.get("scope") or "global"),
-            city_id=int(args["city_id"]) if args.get("city_id") is not None else None,
-            place_id=int(args["place_id"]) if args.get("place_id") is not None else None,
+            scope=scope,
+            city_id=knowledge_city_id,
+            place_id=requested_place_id,
             merge=bool(args.get("merge", False)),
         )
         db.commit()
@@ -1345,7 +1717,6 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         query = str(args.get("query") or "").strip()
         if not query:
             return {"results": []}
-        city_id = int(args.get("city_id") or 1)
         city = db.query(City).filter(City.id == city_id, City.status == "active").first()
         if city is None:
             return {"results": [], "error": f"unknown city_id: {city_id}"}
@@ -1384,7 +1755,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             if hrefs else []
         )
         known_by_url = {row.url: row for row in known_rows}
-        seen_urls = set(known_by_url)
+        seen_urls = {url for url, row in known_by_url.items() if row.city_id == city_id}
         out = [
             {
                 "title": r.get("title"),
@@ -1396,7 +1767,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         ]
         past = (
             db.query(AgentSearchLog)
-            .filter(AgentSearchLog.query == query)
+            .filter(AgentSearchLog.query == query, AgentSearchLog.city_id == city_id)
             .order_by(AgentSearchLog.searched_at.desc())
             .all()
         )
@@ -1407,14 +1778,22 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             existing = known_by_url.get(url)
             if existing:
                 existing.seen_count += 1
+                existing.city_id = city_id
                 existing.last_seen_at = datetime.now(timezone.utc)
                 if item.get("title") and not existing.title:
                     existing.title = str(item["title"])[:300]
             else:
-                db.add(AgentSearchResult(url=url[:1000], title=str(item.get("title") or "")[:300]))
+                db.add(
+                    AgentSearchResult(
+                        url=url[:1000],
+                        title=str(item.get("title") or "")[:300],
+                        city_id=city_id,
+                    )
+                )
         db.add(
             AgentSearchLog(
                 query=query[:300],
+                city_id=city_id,
                 results_count=len(out),
                 new_count=sum(1 for r in out if not r["seen"]),
             )
@@ -1432,7 +1811,10 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         url = str(args.get("url") or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             return {"error": "bad_url"}
-        prior = db.query(AgentWebVisit).filter(AgentWebVisit.url == url).first()
+        prior = db.query(AgentWebVisit).filter(
+            AgentWebVisit.url == url,
+            AgentWebVisit.city_id == city_id,
+        ).first()
         already_visited = prior is not None
         try:
             page = _extract_page_text(url)
@@ -1440,7 +1822,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             return {"error": f"fetch_failed: {exc}"[:300]}
         if "error" in page:
             return page
-        _record_visit(db, url, page.get("title") or "")
+        _record_visit(db, url, page.get("title") or "", city_id=city_id)
         return {
             "url": url,
             "title": page.get("title") or "",
@@ -1458,6 +1840,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         # 검색어별 집계: 횟수·최근 시각·최근 새 콘텐츠 수확
         logs = (
             db.query(AgentSearchLog)
+            .filter(AgentSearchLog.city_id == city_id)
             .order_by(AgentSearchLog.searched_at.desc())
             .limit(300)
             .all()
@@ -1477,6 +1860,7 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
             entry["times"] += 1
         visits = (
             db.query(AgentWebVisit)
+            .filter(AgentWebVisit.city_id == city_id)
             .order_by(AgentWebVisit.last_visited_at.desc())
             .limit(limit)
             .all()
@@ -1494,7 +1878,9 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
                 }
                 for v in visits
             ],
-            "total_visited_pages": db.query(AgentWebVisit).count(),
+            "total_visited_pages": db.query(AgentWebVisit).filter(
+                AgentWebVisit.city_id == city_id
+            ).count(),
         }
 
     if name == "search_place_images":
@@ -1517,7 +1903,11 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         m = (
             db.query(Marker)
             .options(joinedload(Marker.images))
-            .filter(Marker.id == pid, Marker.merged_into_id.is_(None))
+            .filter(
+                Marker.id == pid,
+                Marker.city_id == city_id,
+                Marker.merged_into_id.is_(None),
+            )
             .first()
         )
         if not m:
@@ -1576,7 +1966,10 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         limit = max(1, min(int(args.get("limit") or 10), 50))
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=days)
-        rows = db.query(Marker).filter(Marker.merged_into_id.is_(None)).all()
+        rows = db.query(Marker).filter(
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).all()
         stale: list[dict[str, Any]] = []
         for m in rows:
             candidates = [t for t in (m.updated_at, m.last_verified_at, m.created_at) if t]
@@ -1603,7 +1996,11 @@ def run_tool(db: Session, name: str, args: dict[str, Any]) -> Any:
         note = str(args.get("note") or "").strip()[:1000]
         if status not in ("valid", "closed", "moved", "uncertain"):
             return {"error": "bad_status"}
-        m = db.query(Marker).filter(Marker.id == pid, Marker.merged_into_id.is_(None)).first()
+        m = db.query(Marker).filter(
+            Marker.id == pid,
+            Marker.city_id == city_id,
+            Marker.merged_into_id.is_(None),
+        ).first()
         if not m:
             return {"error": "not_found"}
         before = marker_field_snapshot(m)

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import * as api from "../api";
 import { useAuth } from "../auth";
-import type { AdminAgentAction, AdminKnowledge, AdminStatus, User } from "../types";
+import type {
+  AdminAgentAction,
+  AdminAgentProposal,
+  AdminKnowledge,
+  AdminStatus,
+  City,
+  User,
+} from "../types";
 
 const ACTION_LABEL: Record<string, string> = {
   merge: "병합",
@@ -17,6 +24,10 @@ export default function AdminPage() {
   const [users, setUsers] = useState<User[]>([]);
   const [actions, setActions] = useState<AdminAgentAction[]>([]);
   const [knowledge, setKnowledge] = useState<AdminKnowledge[]>([]);
+  const [cities, setCities] = useState<City[]>([]);
+  const [proposals, setProposals] = useState<AdminAgentProposal[]>([]);
+  const [selectedCityId, setSelectedCityId] = useState(2);
+  const [researchMode, setResearchMode] = useState(true);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
   const [busy, setBusy] = useState(false);
@@ -28,20 +39,24 @@ export default function AdminPage() {
     if (!token) return;
     setError("");
     try {
-      const [s, u, a, k] = await Promise.all([
+      const [s, u, a, k, c, p] = await Promise.all([
         api.fetchAdminStatus(token),
         api.fetchAdminUsers(token),
         api.fetchAdminAgentActions(token),
         api.fetchAdminKnowledge(token),
+        api.fetchCities(token),
+        api.fetchAdminAgentProposals(token, selectedCityId),
       ]);
       setStatus(s);
       setUsers(u);
       setActions(a);
       setKnowledge(k);
+      setCities(c);
+      setProposals(p);
     } catch (e) {
       setError(e instanceof Error ? e.message : "관리자 정보를 불러오지 못했습니다");
     }
-  }, [token]);
+  }, [token, selectedCityId]);
 
   useEffect(() => {
     void reload();
@@ -54,7 +69,7 @@ export default function AdminPage() {
     setError("");
     setInfo("실행 중… (수 분 걸릴 수 있습니다)");
     try {
-      await api.startAdminAgent(token);
+      await api.startAdminAgent(token, selectedCityId, researchMode);
       // 백그라운드 실행 → 끝날 때까지 3초 간격 폴링 (최대 10분)
       const deadline = Date.now() + 10 * 60 * 1000;
       let status = await api.fetchAdminAgentStatus(token);
@@ -75,6 +90,24 @@ export default function AdminPage() {
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : "에이전트 실행 실패");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function decideProposal(proposal: AdminAgentProposal, decision: "approve" | "reject") {
+    if (!token) return;
+    const verb = decision === "approve" ? "승인해 지도에 반영" : "거절";
+    if (!confirm(`이 제안을 ${verb}할까요?\n${proposal.title}`)) return;
+    const note = prompt("판단 메모(선택)", "") ?? "";
+    setBusy(true);
+    setError("");
+    try {
+      await api.decideAdminAgentProposal(token, proposal.id, decision, note);
+      setInfo(`제안 #${proposal.id} ${decision === "approve" ? "승인·반영" : "거절"} 완료`);
+      await reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "제안 처리 실패");
     } finally {
       setBusy(false);
     }
@@ -186,6 +219,26 @@ export default function AdminPage() {
 
       <section className="admin__card">
         <h2>에이전트</h2>
+        <div className="admin__agent-controls">
+          <label>
+            실행 도시
+            <select value={selectedCityId} onChange={(e) => setSelectedCityId(Number(e.target.value))}>
+              {cities.map((city) => (
+                <option key={city.id} value={city.id}>
+                  {city.name_ko} ({city.name_local}) · 장소 {city.place_count}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="admin__check">
+            <input
+              type="checkbox"
+              checked={researchMode}
+              onChange={(e) => setResearchMode(e.target.checked)}
+            />
+            웹 조사·신규 장소 제안까지 수행
+          </label>
+        </div>
         {status ? (
           <ul className="admin__stats">
             <li>
@@ -199,13 +252,14 @@ export default function AdminPage() {
             <li>작업 대기(이력+이의): {status.unread_work_items}</li>
             <li>지식 주제: {status.knowledge_topics ?? 0}</li>
             <li>에이전트 추천 장소: {status.agent_suggested_places ?? 0}</li>
+            <li>승인 대기 제안: {status.proposals_pending ?? 0}</li>
           </ul>
         ) : (
           <p className="panel__meta">불러오는 중…</p>
         )}
         <div className="panel__actions">
           <button type="button" className="btn btn--primary" onClick={() => void runAgent()} disabled={busy}>
-            {busy ? "실행 중…" : "에이전트 지금 실행"}
+            {busy ? "실행 중…" : `${cities.find((c) => c.id === selectedCityId)?.name_ko ?? "도시"} 에이전트 실행`}
           </button>
           <button type="button" className="btn btn--ghost" onClick={() => void reload()} disabled={busy}>
             새로고침
@@ -215,6 +269,50 @@ export default function AdminPage() {
           매일 새벽 03:00(KST)에도 자동 실행됩니다. API 키는 AWS Secrets Manager
           (`tourmiddle-dev/app`의 GROQ_*)에서 관리합니다.
         </p>
+      </section>
+
+      <section className="admin__card admin__card--proposals">
+        <h2>근거 기반 승인 대기 ({proposals.length})</h2>
+        <p className="panel__meta">
+          에이전트가 찾은 신규 장소와 병합 후보입니다. 출처와 신뢰도를 확인한 뒤 반영하세요.
+        </p>
+        {proposals.length === 0 ? (
+          <p className="panel__meta">선택한 도시에 승인 대기 제안이 없습니다.</p>
+        ) : (
+          <ul className="admin__proposals">
+            {proposals.map((proposal) => (
+              <li key={proposal.id}>
+                <div className="admin__proposal-head">
+                  <strong>{proposal.title}</strong>
+                  <span className={`confidence confidence--${proposal.confidence >= 0.8 ? "high" : "mid"}`}>
+                    신뢰도 {Math.round(proposal.confidence * 100)}%
+                  </span>
+                </div>
+                <span className="panel__meta">
+                  #{proposal.id} · {proposal.action === "create_place" ? "신규 장소" : "장소 병합"} · {new Date(proposal.created_at).toLocaleString("ko-KR")}
+                </span>
+                <p>{proposal.evidence || "근거 설명 없음"}</p>
+                {proposal.action === "create_place" ? (
+                  <dl className="admin__proposal-data">
+                    <div><dt>좌표</dt><dd>{String(proposal.payload.lat ?? "-")}, {String(proposal.payload.lng ?? "-")}</dd></div>
+                    <div><dt>분류</dt><dd>{String(proposal.payload.category ?? "other")}</dd></div>
+                  </dl>
+                ) : null}
+                {proposal.source_urls.length ? (
+                  <div className="admin__proposal-sources">
+                    {proposal.source_urls.map((url) => (
+                      <a key={url} href={url} target="_blank" rel="noreferrer">출처 보기</a>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="panel__actions">
+                  <button type="button" className="btn btn--primary" disabled={busy} onClick={() => void decideProposal(proposal, "approve")}>승인·반영</button>
+                  <button type="button" className="btn btn--ghost" disabled={busy} onClick={() => void decideProposal(proposal, "reject")}>거절</button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <section className="admin__card">

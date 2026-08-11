@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Circle, Marker, useMap } from "react-leaflet";
-import { isInsideJinan } from "../geo";
+import { isInsideBounds, parseViewbox } from "../geo";
 import { getMyLocationIcon } from "../markerIcons";
 import type { LatLng } from "../types";
 
@@ -10,6 +10,8 @@ interface Props {
   enabled: boolean;
   /** HTTP LAN 등 GPS 불가 환경에서 지도 중심을 가상 내 위치로 표시 */
   simulate?: boolean;
+  cityName: string;
+  viewbox: string;
   followOnce?: boolean;
   onStatus: (status: LocateStatus, message: string) => void;
   onFollowed?: () => void;
@@ -24,6 +26,8 @@ const GEO_OPTS: PositionOptions = {
 export default function UserLocation({
   enabled,
   simulate = false,
+  cityName,
+  viewbox,
   followOnce = false,
   onStatus,
   onFollowed,
@@ -32,6 +36,7 @@ export default function UserLocation({
   const [pos, setPos] = useState<(LatLng & { accuracy: number }) | null>(null);
   const watchId = useRef<number | null>(null);
   const icon = useMemo(() => getMyLocationIcon(), []);
+  const bounds = useMemo(() => parseViewbox(viewbox), [viewbox]);
   const onStatusRef = useRef(onStatus);
   const onFollowedRef = useRef(onFollowed);
   const followOnceRef = useRef(followOnce);
@@ -77,11 +82,11 @@ export default function UserLocation({
         lng: geo.coords.longitude,
         accuracy: geo.coords.accuracy || 30,
       };
-      if (!isInsideJinan(next)) {
+      if (bounds && !isInsideBounds(next, bounds)) {
         setPos(null);
         onStatusRef.current(
           "outside",
-          "현재 위치가 지난(济南) 지도 범위 밖이라 표시하지 않습니다",
+          `현재 위치가 ${cityName} 지도 범위 밖이라 표시하지 않습니다`,
         );
         return;
       }
@@ -139,7 +144,7 @@ export default function UserLocation({
         watchId.current = null;
       }
     };
-  }, [enabled, simulate, map]);
+  }, [enabled, simulate, map, bounds, cityName]);
 
   if (!pos) return null;
 

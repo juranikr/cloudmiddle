@@ -20,6 +20,7 @@ class CityOut(BaseModel):
     center_lat: float
     center_lng: float
     default_zoom: int
+    search_viewbox: str = ""
     status: str
     place_count: int = 0
 
@@ -43,6 +44,7 @@ class GeocodeResult(BaseModel):
 class ShareImportRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     source: str = Field(default="", max_length=20, description="amap | dianping | 자동")
+    city_id: int = Field(default=1, gt=0)
 
 
 class ShareImportResultOut(BaseModel):
@@ -87,6 +89,12 @@ class MarkerCreate(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lng: float = Field(ge=-180, le=180)
     polygon: Optional[list[LatLng]] = None
+    coordinate_source: str = Field(default="manual", max_length=50)
+    coordinate_external_id: str = Field(default="", max_length=200)
+    coordinate_query: str = Field(default="", max_length=300)
+    coordinate_source_url: str = Field(default="", max_length=1000)
+    coordinate_confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    coordinate_crs: str = Field(default="WGS84", max_length=20)
 
     @model_validator(mode="after")
     def validate_geometry(self) -> "MarkerCreate":
@@ -113,6 +121,18 @@ class PlaceImageOut(BaseModel):
     content_type: str
 
 
+class PlaceInsightOut(BaseModel):
+    id: int
+    kind: str
+    title: str
+    content: str
+    year_label: str = ""
+    source_url: str = ""
+    source_title: str = ""
+    confidence: float = 0.0
+    verified_at: Optional[datetime] = None
+
+
 class MarkerOut(BaseModel):
     id: int
     city_id: int
@@ -128,6 +148,14 @@ class MarkerOut(BaseModel):
     lng: float
     polygon: Optional[list[LatLng]] = None
     images: list[PlaceImageOut] = []
+    insights: list[PlaceInsightOut] = []
+    coordinate_source: str = "manual"
+    coordinate_external_id: str = ""
+    coordinate_query: str = ""
+    coordinate_source_url: str = ""
+    coordinate_confidence: Optional[float] = None
+    coordinate_crs: str = "WGS84"
+    coordinate_verified_at: Optional[datetime] = None
     is_agent_suggested: bool = False
     is_favorite: bool = False
     created_at: datetime
@@ -156,6 +184,7 @@ class AgentRunResponse(BaseModel):
     message: str
     unread_before: int
     unread_after: int
+    city_id: int = 1
 
 
 class UserMessageOut(BaseModel):

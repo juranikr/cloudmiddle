@@ -2,6 +2,7 @@
 
 from app.agent.runner import run_agent
 from app.db import Base, SessionLocal, engine
+from app.models import City
 
 
 def main() -> None:
@@ -9,8 +10,9 @@ def main() -> None:
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        result = run_agent(db)
-        print(result)
+        cities = db.query(City).filter(City.status == "active").order_by(City.sort_order, City.id).all()
+        results = [run_agent(db, city_id=city.id) for city in cities]
+        print({"cities": results})
     finally:
         db.close()
 

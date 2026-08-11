@@ -36,6 +36,7 @@ from app.models import (
     PlaceEvent,
     PlaceEventAction,
     PlaceImage,
+    PlaceInsight,
     User,
     UserMessage,
     UserMessageKind,
@@ -58,6 +59,7 @@ from app.schemas import (
     MarkerUpdate,
     PlaceEventOut,
     PlaceImageOut,
+    PlaceInsightOut,
     ShareImportRequest,
     ShareImportResultOut,
     TokenResponse,
@@ -122,6 +124,20 @@ def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
         )
         for img in sorted(marker.images or [], key=lambda x: x.sort_order)
     ]
+    insights = [
+        PlaceInsightOut(
+            id=item.id,
+            kind=item.kind,
+            title=item.title,
+            content=item.content or "",
+            year_label=item.year_label or "",
+            source_url=item.source_url or "",
+            source_title=item.source_title or "",
+            confidence=float(item.confidence or 0),
+            verified_at=item.verified_at,
+        )
+        for item in sorted(marker.insights or [], key=lambda x: (x.sort_order, x.id))
+    ]
     return MarkerOut(
         id=marker.id,
         city_id=marker.city_id,
@@ -137,6 +153,14 @@ def marker_to_out(marker: Marker, *, is_favorite: bool = False) -> MarkerOut:
         lng=marker.lng,
         polygon=_parse_polygon(marker.polygon),
         images=images,
+        insights=insights,
+        coordinate_source=marker.coordinate_source or "manual",
+        coordinate_external_id=marker.coordinate_external_id or "",
+        coordinate_query=marker.coordinate_query or "",
+        coordinate_source_url=marker.coordinate_source_url or "",
+        coordinate_confidence=marker.coordinate_confidence,
+        coordinate_crs=marker.coordinate_crs or "WGS84",
+        coordinate_verified_at=marker.coordinate_verified_at,
         is_agent_suggested=bool(marker.is_agent_suggested),
         is_favorite=is_favorite,
         created_at=marker.created_at,
@@ -151,6 +175,7 @@ def _load_place(db: Session, place_id: int) -> Optional[Marker]:
             joinedload(Marker.creator),
             joinedload(Marker.contributors).joinedload(PlaceContributor.user),
             joinedload(Marker.images),
+            joinedload(Marker.insights),
         )
         .filter(Marker.id == place_id, Marker.merged_into_id.is_(None))
         .first()
@@ -185,6 +210,7 @@ def list_cities(
             center_lat=city.center_lat,
             center_lng=city.center_lng,
             default_zoom=city.default_zoom,
+            search_viewbox=city.search_viewbox,
             status=city.status,
             place_count=int(counts.get(city.id, 0)),
         )
@@ -240,11 +266,21 @@ def geocode(
 @app.post("/api/import/share", response_model=ShareImportResultOut)
 def import_share(
     body: ShareImportRequest,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ShareImportResultOut:
     _ = current_user
+    city = db.query(City).filter(City.id == body.city_id, City.status == "active").first()
+    if city is None:
+        raise HTTPException(status_code=404, detail="도시를 찾을 수 없습니다")
     try:
-        result = import_share_text(body.text, preferred_source=body.source)
+        result = import_share_text(
+            body.text,
+            preferred_source=body.source,
+            city_name=city.name_local,
+            city_context=city.search_context,
+            viewbox=city.search_viewbox,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -301,6 +337,7 @@ def list_markers(
             joinedload(Marker.creator),
             joinedload(Marker.contributors).joinedload(PlaceContributor.user),
             joinedload(Marker.images),
+            joinedload(Marker.insights),
         )
         .filter(Marker.merged_into_id.is_(None))
         .filter(Marker.city_id == city_id)
@@ -341,6 +378,12 @@ def create_marker(
         lat=lat,
         lng=lng,
         polygon=polygon_json,
+        coordinate_source=body.coordinate_source or "manual",
+        coordinate_external_id=body.coordinate_external_id,
+        coordinate_query=body.coordinate_query,
+        coordinate_source_url=body.coordinate_source_url,
+        coordinate_confidence=body.coordinate_confidence,
+        coordinate_crs=body.coordinate_crs or "WGS84",
     )
     db.add(marker)
     db.flush()
@@ -595,12 +638,14 @@ def reorder_images(
 
 @app.post("/api/agent/run", response_model=AgentRunResponse)
 def agent_run(
+    city_id: int = Query(..., gt=0),
+    research: bool = Query(False),
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
 ) -> AgentRunResponse:
     """하위 호환. 관리자만 실행 가능 — `/api/admin/agent/run` 권장."""
     _ = admin
-    result = run_agent(db)
+    result = run_agent(db, city_id=city_id, autonomous_research=research)
     return AgentRunResponse(**result)
 
 

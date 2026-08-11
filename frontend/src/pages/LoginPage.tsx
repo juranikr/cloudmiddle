@@ -28,7 +28,7 @@ export default function LoginPage() {
         <p className="login__eyebrow">China Travel Notes</p>
         <h1 className="login__title">지난 여행 지도</h1>
         <p className="login__lead">
-          한국 여행자들이 모아 두는 지난(济南) 스팟 기록. 로그인 후 마커를 남기고
+          한국 여행자들이 도시별로 모아 두는 중국 여행 스팟 기록. 로그인 후 도시를 골라 마커를 남기고
           다른 사람의 핀도 함께 보세요.
         </p>
 

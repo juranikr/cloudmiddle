@@ -51,6 +51,11 @@ export interface CreateDefaults {
   title?: string;
   description?: string;
   category?: MarkerCategory;
+  coordinateSource?: string;
+  coordinateExternalId?: string;
+  coordinateQuery?: string;
+  coordinateSourceUrl?: string;
+  coordinateConfidence?: number | null;
 }
 
 interface Props {
@@ -61,6 +66,7 @@ interface Props {
   marker?: MarkerItem | null;
   createDefaults?: CreateDefaults | null;
   token?: string | null;
+  cityId: number;
   canEdit: boolean;
   onClose: () => void;
   onCreate: (payload: MarkerPayload) => Promise<void>;
@@ -78,6 +84,7 @@ export default function MarkerPanel({
   marker,
   createDefaults,
   token,
+  cityId,
   canEdit,
   onClose,
   onCreate,
@@ -182,6 +189,12 @@ export default function MarkerPanel({
           lat: latlng.lat,
           lng: latlng.lng,
           polygon: shape === "polygon" ? polygon ?? null : null,
+          coordinate_source: createDefaults?.coordinateSource ?? "manual",
+          coordinate_external_id: createDefaults?.coordinateExternalId ?? "",
+          coordinate_query: createDefaults?.coordinateQuery ?? "",
+          coordinate_source_url: createDefaults?.coordinateSourceUrl ?? "",
+          coordinate_confidence: createDefaults?.coordinateConfidence ?? null,
+          coordinate_crs: "WGS84",
         });
       } else if (mode === "edit" && marker) {
         await onUpdate(marker.id, {
@@ -292,6 +305,55 @@ export default function MarkerPanel({
           <p className="panel__desc">
             {marker.description ? linkifyText(marker.description) : "설명 없음"}
           </p>
+          {marker.insights?.length ? (
+            <div className="place-insights">
+              {(["location", "history", "visit", "tip"] as const).map((kind) => {
+                const rows = marker.insights.filter((item) => item.kind === kind);
+                if (!rows.length) return null;
+                const labels = {
+                  location: "이 장소의 맥락",
+                  history: "역사 타임라인",
+                  visit: "방문 정보",
+                  tip: "현지 팁",
+                };
+                return (
+                  <section key={kind} className={`place-insights__group place-insights__group--${kind}`}>
+                    <h4>{labels[kind]}</h4>
+                    <ul>
+                      {rows.map((item) => (
+                        <li key={item.id}>
+                          <div className="place-insights__title">
+                            {item.year_label ? <time>{item.year_label}</time> : null}
+                            <strong>{item.title}</strong>
+                            <span>{Math.round(item.confidence * 100)}%</span>
+                          </div>
+                          <p>{linkifyText(item.content)}</p>
+                          {item.source_url ? (
+                            <a href={item.source_url} target="_blank" rel="noreferrer">
+                              출처: {item.source_title || "원문 보기"}
+                            </a>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                );
+              })}
+            </div>
+          ) : null}
+          <div className="coordinate-proof">
+            <strong>위치 근거</strong>
+            <span>
+              {marker.coordinate_source === "manual" ? "지도 직접 지정" : marker.coordinate_source}
+              {marker.coordinate_confidence != null
+                ? ` · 일치도 ${Math.round(marker.coordinate_confidence * 100)}%`
+                : ""}
+              {` · ${marker.coordinate_crs}`}
+            </span>
+            {marker.coordinate_source_url ? (
+              <a href={marker.coordinate_source_url} target="_blank" rel="noreferrer">좌표 출처 보기</a>
+            ) : null}
+          </div>
           {marker.agent_context ? (
             <div className="panel__context">
               <strong>정리 메모</strong>
@@ -408,6 +470,7 @@ export default function MarkerPanel({
           {mode === "create" && !isZone && token ? (
             <ShareImport
               token={token}
+              cityId={cityId}
               source="dianping"
               placement="panel"
               onImported={applyDianpingDraft}

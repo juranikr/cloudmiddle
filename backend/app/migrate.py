@@ -59,6 +59,33 @@ def ensure_schema() -> None:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN shape VARCHAR(20) DEFAULT 'point' NOT NULL"))
             if "polygon" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN polygon TEXT"))
+            marker_text_columns = {
+                "coordinate_source": ("VARCHAR(50)", "manual"),
+                "coordinate_external_id": ("VARCHAR(200)", ""),
+                "coordinate_query": ("VARCHAR(300)", ""),
+                "coordinate_source_url": ("VARCHAR(1000)", ""),
+                "coordinate_crs": ("VARCHAR(20)", "WGS84"),
+            }
+            for column, (sql_type, default_value) in marker_text_columns.items():
+                if column not in cols:
+                    escaped = default_value.replace("'", "''")
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE markers ADD COLUMN {column} {sql_type} "
+                            f"DEFAULT '{escaped}' NOT NULL"
+                        )
+                    )
+            if "coordinate_confidence" not in cols:
+                conn.execute(text("ALTER TABLE markers ADD COLUMN coordinate_confidence FLOAT"))
+            if "coordinate_verified_at" not in cols:
+                verified_type = (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if engine.dialect.name == "postgresql"
+                    else "TIMESTAMP"
+                )
+                conn.execute(
+                    text(f"ALTER TABLE markers ADD COLUMN coordinate_verified_at {verified_type}")
+                )
             if "agent_context" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN agent_context TEXT DEFAULT '' NOT NULL"))
             if "merged_into_id" not in cols:
@@ -87,6 +114,24 @@ def ensure_schema() -> None:
                 conn.execute(text("ALTER TABLE agent_knowledge ADD COLUMN city_id INTEGER"))
                 if engine.dialect.name == "postgresql":
                     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_knowledge_city_id ON agent_knowledge (city_id)"))
+
+        if "agent_search_logs" in tables:
+            search_cols = {c["name"] for c in insp.get_columns("agent_search_logs")}
+            if "city_id" not in search_cols:
+                conn.execute(text("ALTER TABLE agent_search_logs ADD COLUMN city_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_search_logs_city_id ON agent_search_logs (city_id)"))
+
+        if "agent_search_results" in tables:
+            result_cols = {c["name"] for c in insp.get_columns("agent_search_results")}
+            if "city_id" not in result_cols:
+                conn.execute(text("ALTER TABLE agent_search_results ADD COLUMN city_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_search_results_city_id ON agent_search_results (city_id)"))
+
+        if "agent_web_visits" in tables:
+            visit_cols = {c["name"] for c in insp.get_columns("agent_web_visits")}
+            if "city_id" not in visit_cols:
+                conn.execute(text("ALTER TABLE agent_web_visits ADD COLUMN city_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_web_visits_city_id ON agent_web_visits (city_id)"))
 
         # 기여자 백필: 기존 markers.user_id → place_contributors
         tables_now = set(inspect(engine).get_table_names())
