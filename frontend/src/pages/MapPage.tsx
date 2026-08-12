@@ -216,6 +216,23 @@ export default function MapPage() {
     void api.fetchUnreadMessageCount(token).then(setUnreadMsg).catch(() => setUnreadMsg(0));
   }, [token]);
 
+  useEffect(() => {
+    if (workspaceView === "map") return;
+    setDraftKind(null);
+    setDraftLatLng(null);
+    setDraftPolygon(null);
+    setSearchPin(null);
+    setSearchHits([]);
+    setSearchError("");
+    setSearchSheetOpen(false);
+    setPanelMode(null);
+    setCreateDefaults(null);
+    pendingImportPick.current = false;
+    setAwaitingImportPick(false);
+    setControlsOpen(false);
+    setMapFiltersOpen(false);
+  }, [workspaceView]);
+
   const loadMarkers = useCallback(async () => {
     if (!token || !selectedCityId) return;
     setLoading(true);
@@ -271,6 +288,17 @@ export default function MapPage() {
     setSearchHits([]);
     setSearchError("");
     setSearchSheetOpen(false);
+  }
+
+  function clearTransientMapWork() {
+    clearDraft();
+    clearSearch();
+    setPanelMode(null);
+    setCreateDefaults(null);
+    pendingImportPick.current = false;
+    setAwaitingImportPick(false);
+    setControlsOpen(false);
+    setMapFiltersOpen(false);
   }
 
   function placePinDraft(lat: number, lng: number, options?: { openCreate?: boolean }) {
@@ -775,7 +803,7 @@ export default function MapPage() {
   }
 
   return (
-    <div className={`map-app wonrae-app map-app--${workspaceView} ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""} ${sideCollapsed ? "map-app--side-collapsed" : ""}`}>
+    <div className={`map-app wonrae-app map-app--${workspaceView} ${toolMode === "zone" ? "map-app--zone" : ""} ${panelOpen ? "map-app--panel" : ""} ${awaitingConfirm ? "map-app--confirm" : ""} ${sideCollapsed ? "map-app--side-collapsed" : ""}`}>
       <WorkspaceNav
         value={workspaceView}
         cityLabel={`${selectedCity.name_ko} ${selectedCity.name_local}`}
@@ -786,6 +814,7 @@ export default function MapPage() {
         }}
         onChange={(view) => {
           if (view !== "map") {
+            clearTransientMapWork();
             setCategoryFilter(null);
             setFavoritesOnly(false);
             setAgentSuggestedOnly(false);
@@ -1012,7 +1041,7 @@ export default function MapPage() {
         </div>
       ) : null}
 
-      {awaitingConfirm ? (
+      {workspaceView === "map" && awaitingConfirm ? (
         <ConfirmBar
           title={draftKind === "polygon" ? "이 구역으로 할까요?" : "이 위치로 할까요?"}
           subtitle={

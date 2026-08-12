@@ -490,7 +490,7 @@ textarea {
 
 .confirm-bar {
   position: absolute;
-  z-index: 550;
+  z-index: 900;
   left: 12px;
   right: 12px;
   bottom: calc(var(--gnb-h, 64px) + 12px + env(safe-area-inset-bottom, 0px));
@@ -641,6 +641,13 @@ textarea {
   height: 18px;
   border-radius: 50% 50% 50% 4px;
   transform: rotate(-45deg);
+}
+
+.map-app--confirm .map-floating-mode,
+.map-app--confirm .map-floating-filters {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .place-cluster-icon {
