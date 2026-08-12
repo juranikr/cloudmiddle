@@ -2289,6 +2289,20 @@ def run_tool(
         raw_items = args.get("insights") or []
         if not isinstance(raw_items, list):
             return {"error": "bad_insights"}
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            content = str(raw.get("content") or "")
+            has_source_currency = bool(re.search(r"(?:위안|元|CNY|RMB|¥)", content, re.IGNORECASE))
+            has_converted_currency = bool(re.search(r"(?:\d[\d,]*(?:\.\d+)?\s*원|KRW|₩)", content, re.IGNORECASE))
+            if has_source_currency and has_converted_currency:
+                return {
+                    "error": "derived_currency_conversion_forbidden",
+                    "detail": (
+                        "장소 지식에는 출처가 표시한 원 통화 금액만 저장하세요. 환율에 따라 바뀌는 "
+                        "원화 환산값은 고정 사실처럼 저장할 수 없습니다."
+                    ),
+                }
         marker_context = " ".join(
             str(value or "")
             for value in (m.title, m.description, m.branch_name, m.coordinate_query)

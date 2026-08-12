@@ -390,19 +390,29 @@ class AgentCityScopeTests(unittest.TestCase):
         self.db.add(task)
         self.db.commit()
         mission, first = ensure_mission_for_task(self.db, task)
+        run = AgentRun(
+            city_id=2,
+            mission_id=mission.id,
+            work_item_id=first.id,
+            status="running",
+        )
+        self.db.add(run)
+        self.db.commit()
         next_item = rotate_blocked_work_item(
-            self.db, mission=mission, current=first, run_id=1, reason="세 경로 실패",
+            self.db, mission=mission, current=first, run_id=run.id, reason="세 경로 실패",
         )
         self.assertIsNotNone(next_item)
         self.assertNotEqual(next_item.id, first.id)
         self.assertEqual(first.status, "blocked")
         self.assertEqual(next_item.status, "active")
+        self.assertEqual(run.work_item_id, next_item.id)
 
         final = rotate_blocked_work_item(
-            self.db, mission=mission, current=next_item, run_id=1, reason="세 경로 실패",
+            self.db, mission=mission, current=next_item, run_id=run.id, reason="세 경로 실패",
         )
         self.assertIsNone(final)
         self.assertEqual(mission.status, "paused")
+        self.assertEqual(run.work_item_id, next_item.id)
 
     def test_first_lesson_observation_handles_database_defaults_before_commit(self) -> None:
         lesson = observe_lesson(
@@ -1107,6 +1117,27 @@ class AgentCityScopeTests(unittest.TestCase):
             city_id=2,
         )
         self.assertEqual(result["error"], "insight_branch_mismatch")
+
+    def test_place_insight_rejects_fixed_currency_conversion(self) -> None:
+        marker = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        result = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                "place_id": marker.id,
+                "insights": [{
+                    "kind": "tip",
+                    "title": "price",
+                    "content": "평균 가격은 61위안(약 5,000원)입니다.",
+                    "source_url": "https://example.test/price",
+                    "source_title": marker.title,
+                    "confidence": 0.9,
+                }],
+                "_validated_source_urls": ["https://example.test/price"],
+            },
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "derived_currency_conversion_forbidden")
 
     def test_reconcile_pauses_instead_of_reactivating_blocked_item(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()

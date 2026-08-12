@@ -893,6 +893,12 @@ def rotate_blocked_work_item(
             ).count(),
             "retry_condition": "새 출처 또는 12시간 냉각 후 재평가",
         })
+    run = db.get(AgentRun, run_id)
+    if run is not None:
+        # Keep the run summary cursor aligned with the durable mission cursor;
+        # otherwise the admin history shows the blocked item even though the
+        # next run will correctly resume its ready successor.
+        run.work_item_id = next_item.id if next_item is not None else current.id
     db.commit()
     return next_item
 
