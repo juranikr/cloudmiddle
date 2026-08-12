@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type CSSProperties, type FormEvent } from "react";
 import * as api from "../api";
 import type { ShareImportResult } from "../api";
 import { CATEGORY_LIST, CATEGORY_META } from "../categories";
@@ -347,8 +347,33 @@ export default function MarkerPanel({
   return (
     <aside className="panel" role="dialog" aria-label={heading}>
       <div className="panel__handle" aria-hidden />
-      <header className="panel__header">
-        <h2>{heading}</h2>
+      <header className={`panel__header${mode === "view" && marker ? " panel__header--place" : ""}`}>
+        {mode === "view" && marker ? (
+          <div className="panel__heading">
+            <span
+              className="panel__header-badge"
+              style={{ "--place-color": CATEGORY_META[marker.category].color } as CSSProperties}
+            >
+              {CATEGORY_META[marker.category].label}
+              {marker.shape === "polygon" ? " · 구역" : ""}
+              {marker.is_agent_suggested ? " · 추천" : ""}
+            </span>
+            <h2>{marker.title}</h2>
+          </div>
+        ) : (
+          <h2>{heading}</h2>
+        )}
+        {mode === "view" && marker ? (
+          <button
+            type="button"
+            className={"panel__header-fav" + (marker.is_favorite ? " is-on" : "")}
+            onClick={() => void toggleFavorite()}
+            aria-label={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
+            title={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
+          >
+            <span aria-hidden>{marker.is_favorite ? "★" : "☆"}</span>
+          </button>
+        ) : null}
         <button type="button" className="panel__close" onClick={onClose} aria-label="닫기">
           ×
         </button>
@@ -368,27 +393,6 @@ export default function MarkerPanel({
                 : undefined
             }
           />
-          <span
-            className="panel__badge"
-            style={{ background: CATEGORY_META[marker.category].color }}
-          >
-            {CATEGORY_META[marker.category].label}
-            {marker.shape === "polygon" ? " · 구역" : ""}
-            {marker.is_agent_suggested ? " · 추천" : ""}
-          </span>
-          <div className="panel__title-row">
-            <h3 className="panel__title">{marker.title}</h3>
-            <button
-              type="button"
-              className={"btn btn--ghost panel__fav" + (marker.is_favorite ? " is-on" : "")}
-              onClick={() => void toggleFavorite()}
-              aria-label={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
-              title={marker.is_favorite ? "즐겨찾기 해제" : "즐겨찾기"}
-            >
-              {marker.is_favorite ? "\u2605" : "\u2606"}
-            </button>
-          </div>
-
           <p className="panel__meta">
             {(marker.contributor_names?.length
               ? marker.contributor_names.join(" · ")

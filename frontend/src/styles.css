@@ -728,6 +728,7 @@ textarea {
 
 /* Panel */
 .panel {
+  --panel-inline-padding: 18px;
   position: relative;
   z-index: 600;
   width: 100%;
@@ -735,7 +736,7 @@ textarea {
   background: var(--surface);
   border-radius: 24px 24px 0 0;
   box-shadow: var(--shadow);
-  padding: 10px 18px calc(22px + env(safe-area-inset-bottom, 0px));
+  padding: 10px var(--panel-inline-padding) calc(22px + env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
   overflow: auto;
@@ -750,15 +751,91 @@ textarea {
 }
 
 .panel__header {
+  position: sticky;
+  z-index: 40;
+  top: -10px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+  min-width: 0;
+  margin: 0 calc(var(--panel-inline-padding) * -1);
+  padding: 10px var(--panel-inline-padding);
+  border-bottom: 1px solid rgba(20, 33, 43, 0.09);
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  box-shadow: 0 7px 15px rgba(20, 33, 43, 0.04);
+  backdrop-filter: blur(14px);
 }
 
 .panel__header h2 {
+  min-width: 0;
   margin: 0;
   font-size: 1.05rem;
+  line-height: 1.32;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: keep-all;
+}
+
+.panel__header--place {
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.panel__heading {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.panel__heading h2 {
+  margin-top: 4px;
+  font-size: 1.04rem;
+  letter-spacing: -0.025em;
+}
+
+.panel__header-badge {
+  display: flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  color: var(--place-color);
+  font-size: 0.66rem;
+  font-weight: 850;
+  line-height: 1.2;
+}
+
+.panel__header-badge::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--place-color);
+}
+
+.panel__header-fav,
+.panel__close {
+  flex: 0 0 auto;
+}
+
+.panel__header-fav {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(20, 33, 43, 0.06);
+  color: var(--muted);
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.panel__header-fav.is-on {
+  background: rgba(201, 162, 39, 0.12);
+  color: #b48700;
 }
 
 .panel__close {
@@ -2058,6 +2135,7 @@ textarea {
   .result-list { max-height: 40vh; }
 
   .map-side .panel {
+    --panel-inline-padding: 14px;
     position: relative;
     left: auto;
     right: auto;
