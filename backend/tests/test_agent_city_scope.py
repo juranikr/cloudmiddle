@@ -165,6 +165,34 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(active_again.id, active.id)
         self.assertEqual(self.db.query(AgentMission).count(), 1)
 
+    def test_resuming_blocked_item_starts_a_fresh_consecutive_failure_window(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_information",
+            title="information quality",
+            detail=f"targets:\n- #{place.id} {place.title} (current: thin)",
+            success_metric="two structured insights",
+            priority=78,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        mission.status = "paused"
+        item.status = "blocked"
+        item.failed_approaches = json.dumps(["source A failed", "source B failed", "source C failed"])
+        item.blocked_reason = "three source paths failed"
+        item.retry_condition = "cooldown"
+        self.db.commit()
+
+        resumed_mission, resumed = ensure_mission_for_task(self.db, task)
+
+        self.assertEqual(resumed_mission.id, mission.id)
+        self.assertEqual(resumed.status, "active")
+        self.assertEqual(json.loads(resumed.failed_approaches), [])
+        self.assertEqual(resumed.blocked_reason, "")
+        self.assertEqual(resumed.retry_condition, "")
+
     def test_checkpoint_persists_new_evidence_and_exact_next_action(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
         task = AgentTask(
@@ -198,6 +226,41 @@ class AgentCityScopeTests(unittest.TestCase):
             outcome="ok", new_evidence_count=0, material_change=False,
         )
         self.assertEqual(seen_continuity["next_action"]["tool"], "choose_alternative_source")
+
+    def test_material_progress_resets_consecutive_failure_rotation_count(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_information",
+            title="information quality",
+            detail=f"targets:\n- #{place.id} {place.title} (current: thin)",
+            success_metric="two structured insights",
+            priority=78,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        item.failed_approaches = json.dumps(["old source failed", "old write failed"])
+        run = AgentRun(city_id=2, mission_id=mission.id, work_item_id=item.id, status="running")
+        self.db.add(run)
+        self.db.commit()
+
+        updated, continuity = checkpoint_after_tool(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=1,
+            tool="upsert_place_insights",
+            args={"place_id": place.id},
+            result={"ok": True, "changed": 1, "place_id": place.id},
+            outcome="changed",
+            new_evidence_count=0,
+            material_change=True,
+        )
+
+        self.assertEqual(json.loads(updated.failed_approaches), [])
+        self.assertEqual(continuity["failed_approaches"], [])
 
     def test_contextual_knowledge_prefers_exact_city_and_source_strategy(self) -> None:
         upsert_knowledge(

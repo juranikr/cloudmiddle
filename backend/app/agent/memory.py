@@ -213,7 +213,15 @@ def ensure_mission_for_task(db: Session, task: AgentTask) -> tuple[AgentMission,
         active = db.query(AgentWorkItem).filter(AgentWorkItem.mission_id == mission.id).first()
     if active is None:
         raise RuntimeError(f"mission {mission.id} has no work item")
-    if active.status in {"ready", "blocked"}:
+    if active.status == "blocked":
+        # A paused mission is selected again only after its retry condition or
+        # cooldown has elapsed. Keep the auditable checkpoints/lessons, while
+        # giving the new attempt a fresh consecutive-failure budget.
+        active.failed_approaches = "[]"
+        active.retry_condition = ""
+        active.status = "active"
+        active.blocked_reason = ""
+    elif active.status == "ready":
         active.status = "active"
         active.blocked_reason = ""
     active.attempts += 1
@@ -650,6 +658,11 @@ def checkpoint_after_tool(
         evidence_rows.append(row)
 
     if material_change:
+        # Checkpoints and promoted lessons retain the historical failures, but
+        # deliberate rotation is based on consecutive failures since the most
+        # recent material success. Carrying older failures forward makes a
+        # resumed verification attempt pause after only one new source error.
+        failures = []
         facts.append(f"{tool}로 운영 DB 변화가 생성됨")
         item.stage = "verify"
         next_action = {"tool": "get_place" if item.place_id else "list_agent_tasks", "args": {"place_id": item.place_id} if item.place_id else {}, "purpose": "성공조건 재측정"}
