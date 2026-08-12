@@ -14,7 +14,9 @@ from app.agent.runner import (
     _performance_score,
     _performance_snapshot,
     _new_evidence_keys,
+    _normalize_research_query,
     _research_gaps,
+    _run_outcome_status,
     _sync_quality_tasks,
     _step_detail_json,
     _tool_signature,
@@ -121,9 +123,31 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.assertEqual(image_keys, {"image:https://images.example.test/place.jpg"})
 
+        challenge = {
+            "url": "https://example.test/login",
+            "title": "验证中心",
+            "text": "请登录后查看" * 40,
+            "already_visited": False,
+        }
+        self.assertEqual(_new_evidence_keys("fetch_page", challenge, set()), set())
+        useful_page = {
+            "url": "https://example.test/guide",
+            "title": "沈阳交通指南",
+            "text": "선양 공항과 도심 교통에 관한 구체적인 안내입니다. " * 12,
+            "already_visited": False,
+        }
+        self.assertEqual(
+            _new_evidence_keys("fetch_page", useful_page, set()),
+            {"page:https://example.test/guide"},
+        )
+
         self.assertEqual(
             _tool_signature("web_search", {"limit": 5, "query": "沈阳"}),
             _tool_signature("web_search", {"query": "沈阳", "limit": 5}),
+        )
+        self.assertEqual(
+            _normalize_research_query("  诚意小厨   皇姑店  "),
+            _normalize_research_query("诚意小厨 皇姑店"),
         )
 
         detail = _step_detail_json(
@@ -262,6 +286,33 @@ class AgentCityScopeTests(unittest.TestCase):
         self.db.refresh(rows[0])
         self.assertEqual(rows[0].status, "completed")
         self.assertIn("자동 완료", rows[0].result)
+
+    def test_batch_status_tracks_this_run_not_the_entire_city_backlog(self) -> None:
+        gaps = ["사진 없는 실제 장소 14/27"]
+        self.assertEqual(
+            _run_outcome_status(unread_after=0, gaps=gaps, material_change_count=3),
+            "completed",
+        )
+        self.assertEqual(
+            _run_outcome_status(unread_after=0, gaps=gaps, material_change_count=0),
+            "partial",
+        )
+        self.assertEqual(
+            _run_outcome_status(unread_after=2, gaps=[], material_change_count=3),
+            "partial",
+        )
+
+    def test_procedural_checklists_are_not_persisted_as_performance_gaps(self) -> None:
+        gaps = _research_gaps({}, {}, {"active_places": 0})
+        self.assertNotIn("이전 조사 백로그 확인", gaps)
+        self.assertNotIn("구역 현황 확인", gaps)
+        ids = _ensure_gap_tasks(
+            self.db,
+            city_id=2,
+            run_id=9,
+            gaps=["이전 조사 백로그 확인", "구역 현황 확인"],
+        )
+        self.assertEqual(ids, [])
 
     def test_admin_agent_history_can_be_scoped_to_city(self) -> None:
         for city_id in (1, 2):

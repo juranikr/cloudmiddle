@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
@@ -16,6 +16,7 @@ from app.models import (
     AgentProposal,
     AgentRun,
     AgentRunStep,
+    AgentSearchLog,
     AgentTask,
     City,
     Marker,
@@ -367,10 +368,9 @@ def _research_gaps(
     delta: dict[str, int], tool_counts: dict[str, int], snapshot: dict[str, int]
 ) -> list[str]:
     gaps: list[str] = []
-    if tool_counts.get("list_agent_tasks", 0) == 0:
-        gaps.append("이전 조사 백로그 확인")
-    if tool_counts.get("list_zones", 0) == 0:
-        gaps.append("구역 현황 확인")
+    # A gap must describe a traveler-facing outcome, not whether the model called
+    # a particular orchestration tool.  Persisting tool checklists as high-priority
+    # work made later cycles select vague tasks instead of exact place-quality work.
     active = snapshot.get("active_places", 0)
     if snapshot.get("imageless_places", 0):
         gaps.append(f"사진 없는 실제 장소 {snapshot['imageless_places']}/{active}")
@@ -426,6 +426,10 @@ def _tool_signature(name: str, args: dict[str, Any]) -> str:
     return f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
 
 
+def _normalize_research_query(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
 def _is_material_change(name: str, result: Any) -> bool:
     if name not in MUTATION_TOOLS or not isinstance(result, dict) or result.get("error"):
         return False
@@ -473,7 +477,7 @@ def _new_evidence_keys(name: str, result: Any, seen: set[str]) -> set[str]:
             if isinstance(item, dict) and item.get("seen") is False and item.get("href"):
                 candidates.add(f"url:{item['href']}")
     elif name == "fetch_page":
-        if not result.get("already_visited") and len(str(result.get("text") or "")) >= 120:
+        if not result.get("already_visited") and _useful_fetched_page(result):
             candidates.add(f"page:{result.get('url') or result.get('title')}")
     elif name == "geocode_place":
         for item in result.get("results") or []:
@@ -492,6 +496,73 @@ def _new_evidence_keys(name: str, result: Any, seen: set[str]) -> set[str]:
             if image_url:
                 candidates.add(f"image:{image_url}")
     return candidates - seen
+
+
+def _useful_fetched_page(result: dict[str, Any]) -> bool:
+    """Reject login/challenge shells that previously inflated evidence counts."""
+    title = str(result.get("title") or "").strip()
+    body = str(result.get("text") or "").strip()
+    if len(body) < 120:
+        return False
+    challenge_markers = (
+        "验证中心",
+        "安全验证",
+        "身份核实",
+        "请登录",
+        "扫码登录",
+        "登录后查看",
+        "captcha",
+        "access denied",
+    )
+    sample = f"{title}\n{body[:1200]}".lower()
+    return not any(marker in sample for marker in challenge_markers)
+
+
+def _evidence_handoff_items(name: str, result: Any, new_keys: set[str]) -> list[str]:
+    """Compact useful evidence so a later run can continue instead of re-searching."""
+    if not new_keys or not isinstance(result, dict):
+        return []
+    items: list[str] = []
+    if name == "web_search":
+        for item in result.get("results") or []:
+            if not isinstance(item, dict) or not item.get("href"):
+                continue
+            if f"url:{item['href']}" not in new_keys:
+                continue
+            title = str(item.get("title") or "제목 없음").strip()
+            snippet = str(item.get("body") or item.get("snippet") or "").strip()
+            items.append(f"검색 | {title[:100]} | {item['href']} | {snippet[:180]}")
+    elif name == "fetch_page":
+        title = str(result.get("title") or "제목 없음").strip()
+        url = str(result.get("url") or "").strip()
+        body = " ".join(str(result.get("text") or "").split())
+        items.append(f"본문 | {title[:100]} | {url} | {body[:240]}")
+    elif name == "geocode_place":
+        for item in (result.get("results") or [])[:3]:
+            if isinstance(item, dict):
+                items.append(
+                    "좌표 | "
+                    f"{str(item.get('name') or item.get('display_name') or '')[:100]} | "
+                    f"{item.get('source')}:{item.get('external_id')} | "
+                    f"{item.get('lat')},{item.get('lng')}"
+                )
+    elif name == "search_place_images":
+        for item in (result.get("results") or [])[:3]:
+            if isinstance(item, dict):
+                items.append(
+                    f"이미지 | {str(item.get('title') or '')[:100]} | "
+                    f"{item.get('image_url') or item.get('url')}"
+                )
+    return [item[:700] for item in items if item.strip()]
+
+
+def _run_outcome_status(*, unread_after: int, gaps: list[str], material_change_count: int) -> str:
+    """Run completion is distinct from whether the city's long-term backlog is empty."""
+    if unread_after > 0:
+        return "partial"
+    if material_change_count > 0:
+        return "completed"
+    return "completed" if not gaps else "partial"
 
 
 def _material_change_summary(sequence: int, name: str, args: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -802,7 +873,11 @@ def _ensure_gap_tasks(db: Session, *, city_id: int, run_id: int, gaps: list[str]
         "구역 미배정 실제 장소",
         "운영·존재 미검증",
     )
-    gaps = [gap for gap in gaps if not gap.startswith(quality_prefixes)]
+    procedural_gaps = {"이전 조사 백로그 확인", "구역 현황 확인"}
+    gaps = [
+        gap for gap in gaps
+        if not gap.startswith(quality_prefixes) and gap not in procedural_gaps
+    ]
     gap_set = set(gaps)
     existing_gap_tasks = db.query(AgentTask).filter(
         AgentTask.city_id == city_id,
@@ -908,6 +983,7 @@ def run_agent(
             db.commit()
     primary_task_hint = (
         f"백로그 #{primary_task.id} '{primary_task.title}'. 상세: {primary_task.detail or '없음'}. "
+        f"이전 실행 인계: {(primary_task.result or '없음')[:3000]}. "
         f"성공조건: {primary_task.success_metric or '근거가 있는 실제 DB 변화로 완료 여부 입증'}."
         if primary_task is not None
         else "지정된 백로그가 없습니다. 측정된 여행 역할 공백 중 가치가 가장 큰 하나를 먼저 선택하세요."
@@ -1065,6 +1141,15 @@ def run_agent(
     tool_counts: dict[str, int] = {}
     successful_tool_counts: dict[str, int] = {}
     seen_expensive_calls: set[str] = set()
+    recent_search_queries = {
+        _normalize_research_query(row[0])
+        for row in db.query(AgentSearchLog.query).filter(
+            AgentSearchLog.city_id == city_id,
+            AgentSearchLog.searched_at >= datetime.now(timezone.utc) - timedelta(days=7),
+            AgentSearchLog.results_count > 0,
+        ).order_by(AgentSearchLog.searched_at.desc()).limit(500)
+        if _normalize_research_query(row[0])
+    }
     evidence_keys: set[str] = set()
     material_changes: list[dict[str, Any]] = []
     repeated_calls = 0
@@ -1075,6 +1160,7 @@ def run_agent(
     schema_retries = 0
     no_progress_actions = 0
     no_material_actions = 0
+    evidence_handoff: list[str] = []
     action_sequence = 0
     current_score = 0.0
     context_compactions = 0
@@ -1199,6 +1285,12 @@ def run_agent(
                 tool_counts[name] = tool_counts.get(name, 0) + 1
                 signature = _tool_signature(name, args)
                 repeated = name in EXPENSIVE_RESEARCH_TOOLS and signature in seen_expensive_calls
+                normalized_query = (
+                    _normalize_research_query(args.get("query")) if name == "web_search" else ""
+                )
+                recent_search_repeat = bool(
+                    normalized_query and normalized_query in recent_search_queries
+                )
                 image_place_id = None
                 if name == "search_place_images" and args.get("place_id") is not None:
                     try:
@@ -1209,7 +1301,31 @@ def run_agent(
                     image_place_id is not None
                     and image_searches_by_place.get(image_place_id, 0) >= 3
                 )
-                if image_budget_exhausted:
+                decision_required = bool(
+                    no_material_actions >= 12 and name not in MUTATION_TOOLS
+                )
+                if decision_required:
+                    result = {
+                        "error": "material_decision_required",
+                        "detail": (
+                            "연속 12개 행동에서 실제 DB 변화가 없었습니다. 추가 조회·검색을 중단하고 "
+                            "이미 확보한 근거만 사용해 장소 정보·인사이트·검증·사진·구역·체인 중 하나를 "
+                            "안전하게 갱신하세요. 근거가 부족하면 해당 장소의 차단 원인과 다음 검증 방법을 "
+                            "과제 result에 남기고 다른 정확한 대상의 저장 행동으로 전환하세요. 추측 저장은 금지합니다."
+                        ),
+                    }
+                elif recent_search_repeat:
+                    repeated_calls += 1
+                    repeated = True
+                    result = {
+                        "error": "recent_duplicate_search",
+                        "detail": (
+                            "동일한 검색어가 최근 7일 안에 이미 실행되었습니다. list_research_history와 "
+                            "과제의 이전 실행 인계를 사용하세요. 새 검증이 필요하면 검색어만 꾸미지 말고 "
+                            "공식 기관·지도·예약 플랫폼처럼 출처 축을 바꾸거나 다른 정확한 대상으로 이동하세요."
+                        ),
+                    }
+                elif image_budget_exhausted:
                     result = {
                         "error": "place_image_search_budget_exhausted",
                         "detail": (
@@ -1232,12 +1348,17 @@ def run_agent(
                             image_searches_by_place.get(image_place_id, 0) + 1
                         )
                     result = run_tool(db, name, args, city_id=city_id)
+                    if normalized_query:
+                        recent_search_queries.add(normalized_query)
                 error = isinstance(result, dict) and bool(result.get("error"))
                 if not error:
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
                 material_change = _is_material_change(name, result)
                 new_evidence = _new_evidence_keys(name, result, evidence_keys)
                 evidence_keys.update(new_evidence)
+                for handoff_item in _evidence_handoff_items(name, result, new_evidence):
+                    if handoff_item not in evidence_handoff and len(evidence_handoff) < 12:
+                        evidence_handoff.append(handoff_item)
                 snapshot_after_tool = _performance_snapshot(db, city_id)
                 total_delta = _performance_delta(performance_before, snapshot_after_tool)
                 next_score = _performance_score(total_delta, successful_tool_counts)
@@ -1302,7 +1423,7 @@ def run_agent(
                         "content": json.dumps(result, ensure_ascii=False)[:12000],
                     }
                 )
-            if no_material_actions >= 12 and no_material_actions < 32 and material_nudges < 2:
+            if no_material_actions in {12, 16} and material_nudges < 2:
                 material_nudges += 1
                 messages.append({
                     "role": "user",
@@ -1313,10 +1434,11 @@ def run_agent(
                         "측정 가능한 upsert_agent_task로 남긴 뒤 다른 목표로 이동하세요."
                     ),
                 })
-            if no_material_actions >= 32:
+            if no_material_actions >= 20:
                 final_text = (
                     f"연속 {no_material_actions}개 행동이 실제 DB 변화로 이어지지 않아 안전 종료했습니다. "
-                    "확보한 근거와 남은 공백은 다음 실행의 측정 가능한 백로그로 넘깁니다."
+                    "12번째 행동부터 추가 조사를 막고 저장 여부 결정을 요구했으며, 확보한 근거와 "
+                    "차단 사유는 다음 실행의 정확한 백로그로 넘깁니다."
                 )
                 break
             if no_progress_actions >= 18 and steps >= 20:
@@ -1387,7 +1509,11 @@ def run_agent(
     gaps = _research_gaps(performance_delta, successful_tool_counts, performance_after) if allow_research else []
     gap_task_ids = _ensure_gap_tasks(db, city_id=city_id, run_id=agent_run.id, gaps=gaps) if gaps else []
     ok = unread_after == 0
-    run_status = "completed" if ok and not gaps else "partial"
+    run_status = _run_outcome_status(
+        unread_after=unread_after,
+        gaps=gaps,
+        material_change_count=len(material_changes),
+    )
     summary = final_text or "에이전트 사이클 완료"
     if tool_counts:
         stats = ", ".join(f"{t}×{c}" for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]))
@@ -1436,6 +1562,7 @@ def run_agent(
                 "material_changes": material_changes,
                 "material_change_count": len(material_changes),
                 "evidence_count": len(evidence_keys),
+                "evidence_handoff": evidence_handoff,
                 "repeated_calls_blocked": repeated_calls,
                 "image_searches_by_place": image_searches_by_place,
                 "context_compactions": context_compactions,
@@ -1452,10 +1579,13 @@ def run_agent(
         )
         db.commit()
     if primary_task is not None and primary_task.status == "pending":
-        primary_task.result = (
+        primary_result = (
             f"실행 #{agent_run.id}: {run_status}, 점수 {current_score}, 실제 변경 {len(material_changes)}건, "
             f"새 근거 {len(evidence_keys)}건. 남은 공백: {', '.join(gaps) or '없음'}"
-        )[:8000]
+        )
+        if evidence_handoff:
+            primary_result += "\n다음 실행 근거 인계:\n- " + "\n- ".join(evidence_handoff)
+        primary_task.result = primary_result[:8000]
         db.commit()
     if gaps:
         summary = f"{summary}\n[남은 성과] {', '.join(gaps)}"
