@@ -948,9 +948,9 @@ def _research_seed_queries(city: City, message: str, *, subject: str = "") -> li
         queries.append(f"{city.name_local}{area} 正规 洗浴 按摩 推荐")
     if not queries and subject == "food_snack":
         queries.extend([
-            f"{city.name_local} 中街 特色小吃 外带 店 地址",
+            f"site:you.ctrip.com/food/shenyang155 {city.name_local} 中街 小吃 外带",
+            f"site:touch.travel.qunar.com/poi {city.name_local} 小吃 甜品 糕点",
             f"{city.name_local} 老字号 糕点 点心 门店 地址",
-            f"{city.name_local} 甜品 烘焙 零食 边走边吃 推荐",
         ])
     if not queries and subject == "food":
         queries.extend([
