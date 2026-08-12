@@ -15,6 +15,7 @@ from app.models import City, Marker, MarkerCategory, TravelChatMessage, TravelCh
 from app.travel_chat import (
     ChatIntent,
     CITY_FOOD_DETAIL_SOURCES,
+    CITY_SNACK_DETAIL_SOURCES,
     RESEARCH_TOOLS,
     WRITE_TOOLS,
     _brand_source_urls,
@@ -41,6 +42,12 @@ from app.travel_chat import (
 
 
 class TravelChatRoutingTests(unittest.TestCase):
+    def test_shenyang_snack_bootstrap_is_separate_from_meal_sources(self) -> None:
+        snack_sources = CITY_SNACK_DETAIL_SOURCES["shenyang"]
+        self.assertEqual(len(snack_sources), 3)
+        self.assertTrue(all("fooddetail/155/" in url for url in snack_sources))
+        self.assertTrue(set(snack_sources).isdisjoint(CITY_FOOD_DETAIL_SOURCES["shenyang"]))
+
     def test_coordinate_match_rejects_another_shop_in_the_same_building(self) -> None:
         proposal = {
             "title": "小猫爸爸台湾香鸡排专卖店",
@@ -707,6 +714,7 @@ class TravelChatLoopTests(unittest.TestCase):
                 "ok": True, "allowed": True, "consumption_mode": "snack",
                 "reason": "소량 포장 간식", "confidence": 0.99,
             }),
+            patch.dict(CITY_SNACK_DETAIL_SOURCES, {"shenyang": ()}),
             patch("app.travel_chat.run_tool", side_effect=fake_tool) as tool,
         ):
             result = answer_travel_chat(

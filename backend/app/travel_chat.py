@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
+from app.geocode import parse_viewbox
 from app.models import (
     City,
     Marker,
@@ -61,6 +62,13 @@ CITY_FOOD_DETAIL_SOURCES: dict[str, tuple[str, ...]] = {
         "https://touch.travel.qunar.com/dist/poi/3332184",
         "https://gs.ctrip.com/html5/you/foods/fooddetail/155/5382272.html",
         "https://touch.travel.qunar.com/poi/3330756",
+    ),
+}
+CITY_SNACK_DETAIL_SOURCES: dict[str, tuple[str, ...]] = {
+    "shenyang": (
+        "https://gs.ctrip.com/html5/you/foods/fooddetail/155/15729804.html",
+        "https://gs.ctrip.com/html5/you/foods/fooddetail/155/22551502.html",
+        "https://gs.ctrip.com/html5/you/foods/fooddetail/155/5383835.html",
     ),
 }
 logger = logging.getLogger(__name__)
@@ -1329,6 +1337,7 @@ def answer_travel_chat(
     food_detail_queries: set[str] = set()
     food_business_names: list[str] = []
     food_geo_candidates: list[dict[str, Any]] = []
+    city_bounds = parse_viewbox(city.search_viewbox or "")
     for item in pending_work:
         try:
             lat, lng = float(item["lat"]), float(item["lng"])
@@ -1392,6 +1401,8 @@ def answer_travel_chat(
             try:
                 point = (float(coordinate["lat"]), float(coordinate["lng"]))
             except (KeyError, TypeError, ValueError):
+                continue
+            if city_bounds is not None and not city_bounds.contains(point[0], point[1]):
                 continue
             verified_coordinates.append(point)
             verified_coordinate_records.append({
@@ -1458,8 +1469,11 @@ def answer_travel_chat(
         return fetched
 
     food_bootstrap_pages: list[dict[str, Any]] = []
-    if food_discovery and not snack_discovery and write_intent:
-        for url in CITY_FOOD_DETAIL_SOURCES.get(city.slug, ()):
+    if food_discovery and write_intent:
+        bootstrap_sources = (
+            CITY_SNACK_DETAIL_SOURCES if snack_discovery else CITY_FOOD_DETAIL_SOURCES
+        )
+        for url in bootstrap_sources.get(city.slug, ()):
             if len(food_geo_candidates) >= 2:
                 break
             if url in fetched_food_urls:
@@ -1703,7 +1717,7 @@ def answer_travel_chat(
 
     force_required = False
     tool_round_limit = (
-        12 if food_discovery and write_intent and not brand_targets
+        14 if food_discovery and write_intent and not brand_targets
         else MAX_WRITE_TOOL_ROUNDS if write_intent
         else MAX_RESEARCH_TOOL_ROUNDS
     )
