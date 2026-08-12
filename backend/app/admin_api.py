@@ -18,10 +18,12 @@ from app.config import settings
 from app.db import SessionLocal, get_db
 from app.models import (
     AgentKnowledge,
+    AgentMission,
     AgentProposal,
     AgentRun,
     AgentRunStep,
     AgentTask,
+    AgentWorkItem,
     City,
     Marker,
     PlaceAppeal,
@@ -34,6 +36,22 @@ from app.rollback import is_rollbackable, list_agent_actions, rollback_event
 from app.schemas import AgentKnowledgeOut, AgentRunResponse, UserOut
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+
+def _json_dict(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _json_list(raw: str) -> list[str]:
+    try:
+        value = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
 
 
 class AdminStatusOut(BaseModel):
@@ -162,6 +180,38 @@ class AgentTaskOut(BaseModel):
     attempts: int
     result: str
     created_at: datetime
+    updated_at: datetime
+
+
+class AgentMissionOut(BaseModel):
+    id: int
+    city_id: int
+    task_id: Optional[int] = None
+    kind: str
+    title: str
+    objective: str
+    success_metric: str
+    status: str
+    priority: int
+    progress: dict[str, Any]
+    last_run_id: Optional[int] = None
+    updated_at: datetime
+
+
+class AgentWorkItemOut(BaseModel):
+    id: int
+    mission_id: int
+    place_id: Optional[int] = None
+    target_key: str
+    title: str
+    stage: str
+    status: str
+    state_summary: str
+    next_action: dict[str, Any]
+    failed_approaches: list[str]
+    blocked_reason: str
+    retry_condition: str
+    last_run_id: Optional[int] = None
     updated_at: datetime
 
 
@@ -297,6 +347,50 @@ def admin_agent_tasks(
     ) for row in rows]
 
 
+@router.get("/agent/missions", response_model=list[AgentMissionOut])
+def admin_agent_missions(
+    city_id: Optional[int] = None,
+    mission_status: str = "active",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> list[AgentMissionOut]:
+    _ = admin
+    query = db.query(AgentMission)
+    if city_id is not None:
+        query = query.filter(AgentMission.city_id == city_id)
+    if mission_status != "all":
+        query = query.filter(AgentMission.status == mission_status)
+    rows = query.order_by(AgentMission.priority.desc(), AgentMission.updated_at.desc()).limit(max(1, min(limit, 200))).all()
+    return [AgentMissionOut(
+        id=row.id, city_id=row.city_id, task_id=row.task_id, kind=row.kind,
+        title=row.title, objective=row.objective, success_metric=row.success_metric,
+        status=row.status, priority=row.priority,
+        progress=_json_dict(row.progress), last_run_id=row.last_run_id, updated_at=row.updated_at,
+    ) for row in rows]
+
+
+@router.get("/agent/missions/{mission_id}/work-items", response_model=list[AgentWorkItemOut])
+def admin_agent_work_items(
+    mission_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> list[AgentWorkItemOut]:
+    _ = admin
+    if db.get(AgentMission, mission_id) is None:
+        raise HTTPException(status_code=404, detail="에이전트 미션을 찾을 수 없습니다.")
+    rows = db.query(AgentWorkItem).filter(AgentWorkItem.mission_id == mission_id).order_by(
+        AgentWorkItem.priority.desc(), AgentWorkItem.id.asc()
+    ).all()
+    return [AgentWorkItemOut(
+        id=row.id, mission_id=row.mission_id, place_id=row.place_id,
+        target_key=row.target_key, title=row.title, stage=row.stage, status=row.status,
+        state_summary=row.state_summary, next_action=_json_dict(row.next_action),
+        failed_approaches=_json_list(row.failed_approaches), blocked_reason=row.blocked_reason,
+        retry_condition=row.retry_condition, last_run_id=row.last_run_id, updated_at=row.updated_at,
+    ) for row in rows]
+
+
 @router.get("/knowledge", response_model=list[AgentKnowledgeOut])
 def admin_knowledge(
     db: Session = Depends(get_db),
@@ -324,8 +418,13 @@ def admin_knowledge(
             summary=r.summary or "",
             principles=as_list(r.principles),
             next_actions=as_list(r.next_actions),
+            keywords=as_list(r.keywords),
+            applicability=_json_dict(r.applicability),
+            source_refs=as_list(r.source_refs),
             evidence_count=r.evidence_count or 0,
             quality_score=r.quality_score or 0,
+            retrieval_count=r.retrieval_count or 0,
+            last_retrieved_at=r.last_retrieved_at,
             status=r.status or "active",
             version=r.version or 1,
             created_at=r.created_at,

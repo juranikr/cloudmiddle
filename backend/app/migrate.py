@@ -138,8 +138,17 @@ def ensure_schema() -> None:
                 "summary": "TEXT DEFAULT '' NOT NULL",
                 "principles": "TEXT DEFAULT '[]' NOT NULL",
                 "next_actions": "TEXT DEFAULT '[]' NOT NULL",
+                "keywords": "TEXT DEFAULT '[]' NOT NULL",
+                "applicability": "TEXT DEFAULT '{}' NOT NULL",
+                "source_refs": "TEXT DEFAULT '[]' NOT NULL",
                 "evidence_count": "INTEGER DEFAULT 0 NOT NULL",
                 "quality_score": "FLOAT DEFAULT 0.7 NOT NULL",
+                "retrieval_count": "INTEGER DEFAULT 0 NOT NULL",
+                "last_retrieved_at": (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if engine.dialect.name == "postgresql"
+                    else "TIMESTAMP"
+                ),
                 "status": "VARCHAR(20) DEFAULT 'active' NOT NULL",
                 "version": "INTEGER DEFAULT 1 NOT NULL",
             }
@@ -164,6 +173,15 @@ def ensure_schema() -> None:
             if "city_id" not in visit_cols:
                 conn.execute(text("ALTER TABLE agent_web_visits ADD COLUMN city_id INTEGER"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_web_visits_city_id ON agent_web_visits (city_id)"))
+
+        if "agent_runs" in tables:
+            run_cols = {c["name"] for c in insp.get_columns("agent_runs")}
+            if "mission_id" not in run_cols:
+                conn.execute(text("ALTER TABLE agent_runs ADD COLUMN mission_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_runs_mission_id ON agent_runs (mission_id)"))
+            if "work_item_id" not in run_cols:
+                conn.execute(text("ALTER TABLE agent_runs ADD COLUMN work_item_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_runs_work_item_id ON agent_runs (work_item_id)"))
 
         if "travel_chat_messages" in tables:
             chat_cols = {c["name"] for c in insp.get_columns("travel_chat_messages")}

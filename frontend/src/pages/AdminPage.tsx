@@ -7,6 +7,8 @@ import type {
   AdminAgentRunHistory,
   AdminAgentRunStep,
   AdminAgentTask,
+  AdminAgentMission,
+  AdminAgentWorkItem,
   AdminKnowledge,
   AdminStatus,
   City,
@@ -69,6 +71,8 @@ export default function AdminPage() {
   const [runSteps, setRunSteps] = useState<Record<number, AdminAgentRunStep[]>>({});
   const [loadingRunId, setLoadingRunId] = useState<number | null>(null);
   const [tasks, setTasks] = useState<AdminAgentTask[]>([]);
+  const [missions, setMissions] = useState<AdminAgentMission[]>([]);
+  const [missionItems, setMissionItems] = useState<Record<number, AdminAgentWorkItem[]>>({});
   const [selectedCityId, setSelectedCityId] = useState(2);
   const [researchMode, setResearchMode] = useState(true);
   const [error, setError] = useState("");
@@ -83,7 +87,7 @@ export default function AdminPage() {
     if (!token) return;
     setError("");
     try {
-      const [s, u, a, k, c, p, r, t] = await Promise.all([
+      const [s, u, a, k, c, p, r, t, m] = await Promise.all([
         api.fetchAdminStatus(token),
         api.fetchAdminUsers(token),
         api.fetchAdminAgentActions(token, selectedCityId),
@@ -92,6 +96,7 @@ export default function AdminPage() {
         api.fetchAdminAgentProposals(token, selectedCityId),
         api.fetchAdminAgentRuns(token, selectedCityId),
         api.fetchAdminAgentTasks(token, selectedCityId),
+        api.fetchAdminAgentMissions(token, selectedCityId),
       ]);
       setStatus(s);
       setUsers(u);
@@ -101,6 +106,12 @@ export default function AdminPage() {
       setProposals(p);
       setRuns(r);
       setTasks(t);
+      setMissions(m);
+      const itemEntries = await Promise.all(m.map(async (mission) => [
+        mission.id,
+        await api.fetchAdminAgentWorkItems(token, mission.id),
+      ] as const));
+      setMissionItems(Object.fromEntries(itemEntries));
     } catch (e) {
       setError(e instanceof Error ? e.message : "관리자 정보를 불러오지 못했습니다");
     }
@@ -340,6 +351,36 @@ export default function AdminPage() {
             새로고침
           </button>
         </div>
+        <div className="admin__continuity">
+          <h3>지속 작업 기억</h3>
+          {missions.length === 0 ? (
+            <p className="panel__meta">아직 활성 Mission이 없습니다. 다음 연구 실행부터 작업 단위 기억이 생성됩니다.</p>
+          ) : missions.map((mission) => {
+            const items = missionItems[mission.id] ?? [];
+            const active = items.find((item) => item.status === "active") ?? items.find((item) => item.status === "ready");
+            return <article key={mission.id} className="admin__mission">
+              <div>
+                <strong>Mission #{mission.id} · {mission.title}</strong>
+                <span>{mission.status} · 우선순위 {mission.priority}</span>
+              </div>
+              <p>{mission.success_metric || mission.objective}</p>
+              {active ? <div className="admin__checkpoint">
+                <b>현재: {active.target_key} · {active.title}</b>
+                <span>{active.stage} / {active.status}</span>
+                {active.state_summary ? <p>{active.state_summary}</p> : null}
+                <code>다음 행동: {JSON.stringify(active.next_action)}</code>
+                {active.failed_approaches.length ? <details>
+                  <summary>실패한 경로 {active.failed_approaches.length}건</summary>
+                  <ul>{active.failed_approaches.map((failure) => <li key={failure}>{failure}</li>)}</ul>
+                </details> : null}
+              </div> : null}
+              <small>
+                세부 작업 {items.filter((item) => item.status === "done").length}/{items.length} 완료 ·
+                차단 {items.filter((item) => item.status === "blocked").length}
+              </small>
+            </article>;
+          })}
+        </div>
         <p className="panel__meta">
           매일 03:00·11:00·19:00(KST)에 성과 기반 자동 실행됩니다. API 키는 AWS Secrets Manager
           (`tourmiddle-dev/app`의 GROQ_*)에서 관리합니다.
@@ -504,7 +545,7 @@ export default function AdminPage() {
       {activeTab === "knowledge" ? <section className="admin__card">
         <h2>에이전트 지식베이스</h2>
         <p className="panel__meta">
-          이의·롤백·웹조사에서 얻은 교훈을 주제별로 병합해 다음 실행에 사용합니다.
+          전체 문서를 무조건 넣지 않고 현재 도시·장소·과제·실패 상황과 관련도가 높은 항목만 검색해 다음 실행에 사용합니다.
         </p>
         {knowledge.length === 0 ? (
           <p className="panel__meta">아직 저장된 지식이 없습니다. 에이전트를 실행하면 쌓입니다.</p>
@@ -518,10 +559,17 @@ export default function AdminPage() {
                 <span className="panel__meta">
                   {new Date(k.updated_at).toLocaleString("ko-KR")}
                   {k.place_id ? ` · 장소 #${k.place_id}` : ""}
+                  {` · 사용 ${k.retrieval_count ?? 0}회`}
                 </span>
                 <p>{k.summary || k.content}</p>
+                {k.keywords?.length ? <div className="admin__knowledge-tags">
+                  {k.keywords.slice(0, 10).map((keyword) => <span key={keyword}>{keyword}</span>)}
+                </div> : null}
                 {k.principles?.length ? <ul>{k.principles.map((item) => <li key={item}>{item}</li>)}</ul> : null}
                 {k.next_actions?.length ? <details><summary>다음 과제 {k.next_actions.length}개</summary><ul>{k.next_actions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
+                {k.applicability && Object.keys(k.applicability).length ? <details>
+                  <summary>적용 조건</summary><pre>{JSON.stringify(k.applicability, null, 2)}</pre>
+                </details> : null}
               </li>
             ))}
           </ul>

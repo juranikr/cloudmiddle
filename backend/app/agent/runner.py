@@ -10,14 +10,27 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.agent.tools import TOOLS, is_useful_fetched_page, run_tool
 from app.config import settings
-from app.knowledge import knowledge_brief
+from app.agent.memory import (
+    checkpoint_after_tool,
+    ensure_mission_for_task,
+    evaluate_knowledge_uses,
+    finalize_mission,
+    learn_from_recent_runs,
+    mission_context,
+    record_knowledge_uses,
+    reconcile_work_items,
+    retrieve_contextual_knowledge,
+    rotate_blocked_work_item,
+)
 from app.models import (
     AgentKnowledge,
+    AgentMission,
     AgentProposal,
     AgentRun,
     AgentRunStep,
     AgentSearchLog,
     AgentTask,
+    AgentWorkItem,
     City,
     Marker,
     MarkerShape,
@@ -28,6 +41,7 @@ from app.models import (
     PlaceInsight,
 )
 from app.personalization import city_personalization_brief
+from app.knowledge import normalize_knowledge_metadata
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
 목표: 미읽음 이력·이의신청·롤백·웹조사를 바탕으로 지도를 정리하고,
@@ -944,23 +958,56 @@ def run_agent(
         }
     queue = _work_queue(db, city_id=city_id)
     research_only = unread_before == 0
-    kb = knowledge_brief(db, limit=12, city_id=city_id)
-    kb_hint = json.dumps(kb, ensure_ascii=False)[:4000] if kb else "[]"
     personalization_hint = city_personalization_brief(db, city_id=city_id)[:7000]
     quality_task_ids_before = (
         _sync_quality_tasks(db, city_id=city_id) if allow_research else []
     )
     primary_task = None
+    active_mission = None
+    active_work_item = None
     if allow_research:
-        primary_task = (
-            db.query(AgentTask)
-            .filter(AgentTask.city_id == city_id, AgentTask.status == "pending")
-            .order_by(AgentTask.priority.desc(), AgentTask.created_at.asc())
+        resumable_mission = (
+            db.query(AgentMission)
+            .join(AgentTask, AgentTask.id == AgentMission.task_id)
+            .join(AgentWorkItem, AgentWorkItem.mission_id == AgentMission.id)
+            .filter(
+                AgentMission.city_id == city_id,
+                AgentMission.status == "active",
+                AgentTask.status == "pending",
+                AgentWorkItem.status.in_(("active", "ready")),
+            )
+            .order_by(AgentMission.updated_at.desc(), AgentMission.id.desc())
             .first()
         )
+        if resumable_mission is not None:
+            primary_task = db.get(AgentTask, resumable_mission.task_id)
+        else:
+            candidates = (
+                db.query(AgentTask)
+                .filter(AgentTask.city_id == city_id, AgentTask.status == "pending")
+                .order_by(AgentTask.priority.desc(), AgentTask.created_at.asc())
+                .all()
+            )
+            cooldown_cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
+            for candidate in candidates:
+                paused = db.query(AgentMission).filter(
+                    AgentMission.city_id == city_id,
+                    AgentMission.task_id == candidate.id,
+                    AgentMission.status == "paused",
+                    AgentMission.updated_at > cooldown_cutoff,
+                ).first()
+                if paused is None:
+                    primary_task = candidate
+                    break
         if primary_task is not None:
             primary_task.attempts += 1
+            active_mission, active_work_item = ensure_mission_for_task(db, primary_task)
             db.commit()
+    continuity_hint = (
+        json.dumps(mission_context(active_mission, active_work_item), ensure_ascii=False)[:7000]
+        if active_mission is not None and active_work_item is not None
+        else "{}"
+    )
     primary_task_hint = (
         f"백로그 #{primary_task.id} '{primary_task.title}'. 상세: {primary_task.detail or '없음'}. "
         f"이전 실행 인계: {(primary_task.result or '없음')[:3000]}. "
@@ -982,6 +1029,8 @@ def run_agent(
     performance_before = _performance_snapshot(db, city_id)
     agent_run = AgentRun(
         city_id=city_id,
+        mission_id=active_mission.id if active_mission is not None else None,
+        work_item_id=active_work_item.id if active_work_item is not None else None,
         mode="research" if allow_research else "queue",
         status="running",
         objective=(
@@ -994,13 +1043,32 @@ def run_agent(
     db.add(agent_run)
     db.commit()
     db.refresh(agent_run)
+    normalize_knowledge_metadata(db, city_id=city_id)
+    learn_from_recent_runs(db, city_id=city_id)
+    retrieved_knowledge = retrieve_contextual_knowledge(
+        db,
+        city_id=city_id,
+        mission=active_mission,
+        work_item=active_work_item,
+        query=primary_task_hint,
+        limit=10,
+    )
+    record_knowledge_uses(
+        db,
+        run=agent_run,
+        mission=active_mission,
+        work_item=active_work_item,
+        retrieved=retrieved_knowledge,
+    )
+    kb_hint = json.dumps(retrieved_knowledge, ensure_ascii=False)[:7000]
 
     if research_only:
         user_msg = (
             f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
             "현재 미읽음 작업은 없습니다. 연구 사이클을 수행하세요.\n"
             f"우선 조사 테마: {_research_themes(city)}\n"
-            f"기존 지식베이스 요약: {kb_hint}\n"
+            f"현재 상황에 맞게 검색된 지식·검증된 교훈: {kb_hint}\n"
+            f"이전 실행에서 이어받은 작업 체크포인트: {continuity_hint}\n"
             f"이번 실행의 1차 목표: {primary_task_hint}\n"
             "1차 목표를 먼저 끝내고 upsert_agent_task로 완료 근거를 남기세요. 막히면 같은 검색을 반복하지 말고 "
             "차단 원인과 다음 검증 방법을 task.result에 남긴 뒤 다른 성과 공백으로 이동하세요.\n"
@@ -1049,7 +1117,8 @@ def run_agent(
             f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
             f"미읽음 작업 {unread_before}건 — 아래 큐를 전원 처리하기 전에는 종료·웹조사 금지.\n"
             f"작업 큐 JSON: {_queue_brief(queue)}\n"
-            f"기존 지식베이스 요약: {kb_hint}\n"
+            f"현재 상황에 맞게 검색된 지식·검증된 교훈: {kb_hint}\n"
+            f"이전 실행에서 이어받은 작업 체크포인트: {continuity_hint}\n"
             "필수 순서:\n"
             "1) list_knowledge, list_agent_tasks, list_zones, list_recent_rollbacks\n"
             "2) appeal_ids 각각 resolve_appeal\n"
@@ -1072,7 +1141,8 @@ def run_agent(
     if research_only:
         user_msg = (
             f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
-            f"기존 지식베이스 요약: {kb_hint}\n"
+            f"현재 상황에 맞게 검색된 지식·검증된 교훈: {kb_hint}\n"
+            f"이전 실행에서 이어받은 작업 체크포인트: {continuity_hint}\n"
             f"도시별 우선 관점: {_research_themes(city)}\n"
             f"이번 실행의 1차 목표: {primary_task_hint}\n\n"
             "고정 건수를 채우지 말고 다음 성과 기반 ReAct 루프를 반복하세요.\n"
@@ -1256,6 +1326,7 @@ def run_agent(
                     ],
                 }
             )
+            continuity_updates: list[dict[str, Any]] = []
             for tc in tool_calls:
                 raw_args = tc.function.arguments or "{}"
                 try:
@@ -1283,8 +1354,16 @@ def run_agent(
                     image_place_id is not None
                     and image_searches_by_place.get(image_place_id, 0) >= 3
                 )
+                followup_url = str(args.get("url") or "")
+                is_new_evidence_followup = bool(
+                    name == "fetch_page"
+                    and followup_url
+                    and f"url:{followup_url}" in evidence_keys
+                )
                 decision_required = bool(
-                    research_actions_since_material >= 8 and name not in MUTATION_TOOLS
+                    research_actions_since_material >= 8
+                    and name not in MUTATION_TOOLS
+                    and not is_new_evidence_followup
                 )
                 if decision_required:
                     result = {
@@ -1378,7 +1457,7 @@ def run_agent(
                     research_actions_since_material = 0
                 else:
                     no_material_actions += 1
-                    if name in EXPENSIVE_RESEARCH_TOOLS:
+                    if name in EXPENSIVE_RESEARCH_TOOLS and not is_new_evidence_followup:
                         research_actions_since_material += 1
                 observation_progress = (
                     not error
@@ -1414,12 +1493,63 @@ def run_agent(
                     )
                 )
                 agent_run.score = current_score
+                active_work_item, continuity = checkpoint_after_tool(
+                    db,
+                    mission=active_mission,
+                    work_item=active_work_item,
+                    run_id=agent_run.id,
+                    sequence=action_sequence,
+                    tool=name,
+                    args=args,
+                    result=result,
+                    outcome=outcome,
+                    new_evidence_count=len(new_evidence),
+                    material_change=material_change,
+                )
+                if active_work_item is not None:
+                    agent_run.work_item_id = active_work_item.id
+                if material_change:
+                    active_work_item = reconcile_work_items(db, mission=active_mission) or active_work_item
+                    if active_work_item is not None:
+                        agent_run.work_item_id = active_work_item.id
+                        continuity = mission_context(active_mission, active_work_item) if active_mission else continuity
+                elif (
+                    active_work_item is not None
+                    and len(continuity.get("failed_approaches") or []) >= 3
+                ):
+                    previous_target = active_work_item.target_key
+                    active_work_item = rotate_blocked_work_item(
+                        db,
+                        mission=active_mission,
+                        current=active_work_item,
+                        run_id=agent_run.id,
+                        reason="서로 다른 조사 경로 3회가 실패하거나 차단됨",
+                    )
+                    if active_work_item is not None:
+                        agent_run.work_item_id = active_work_item.id
+                        continuity["rotation"] = {
+                            "from": previous_target,
+                            "to": active_work_item.target_key,
+                            "reason": "실패 경로 3회 누적",
+                        }
                 db.commit()
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": json.dumps(result, ensure_ascii=False)[:12000],
+                    }
+                )
+                if continuity:
+                    continuity_updates.append(continuity)
+            if continuity_updates:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "작업 연속성 체크포인트가 저장되었습니다. 다음 호출은 이 상태를 이어가세요: "
+                            + json.dumps(continuity_updates[-3:], ensure_ascii=False)[:3500]
+                        ),
                     }
                 )
             if no_material_actions in {12, 18} and material_nudges < 2:
@@ -1434,6 +1564,13 @@ def run_agent(
                     ),
                 })
             if no_material_actions >= 24:
+                active_work_item = rotate_blocked_work_item(
+                    db,
+                    mission=active_mission,
+                    current=active_work_item,
+                    run_id=agent_run.id,
+                    reason=f"연속 {no_material_actions}개 행동에서 실제 DB 변화 없음",
+                )
                 final_text = (
                     f"연속 {no_material_actions}개 행동이 실제 DB 변화로 이어지지 않아 안전 종료했습니다. "
                     "무성과 조사 8회부터 추가 조사를 막고 저장 여부 결정을 요구했으며, 확보한 근거와 "
@@ -1570,6 +1707,19 @@ def run_agent(
                 "quality_task_ids_before": quality_task_ids_before,
                 "quality_task_ids_after": quality_task_ids_after,
                 "primary_task_id": primary_task.id if primary_task is not None else None,
+                "mission_id": active_mission.id if active_mission is not None else None,
+                "work_item_id": active_work_item.id if active_work_item is not None else None,
+                "continuity": (
+                    mission_context(active_mission, active_work_item)
+                    if active_mission is not None and active_work_item is not None
+                    else None
+                ),
+                "retrieved_knowledge_ids": [
+                    item.get("id") for item in retrieved_knowledge.get("knowledge", [])
+                ],
+                "applied_lesson_ids": [
+                    item.get("id") for item in retrieved_knowledge.get("lessons", [])
+                ],
                 "no_progress_actions": no_progress_actions,
                 "no_material_actions": no_material_actions,
                 "research_actions_since_material": research_actions_since_material,
@@ -1587,6 +1737,17 @@ def run_agent(
             primary_result += "\n다음 실행 근거 인계:\n- " + "\n- ".join(evidence_handoff)
         primary_task.result = primary_result[:8000]
         db.commit()
+    finalize_mission(
+        db,
+        mission=active_mission,
+        task=primary_task,
+        run_id=agent_run.id,
+    )
+    evaluate_knowledge_uses(
+        db,
+        run_id=agent_run.id,
+        material_change_count=len(material_changes),
+    )
     if gaps:
         summary = f"{summary}\n[남은 성과] {', '.join(gaps)}"
     return {

@@ -4,6 +4,8 @@ import type {
   AdminAgentProposal,
   AdminAgentRunHistory,
   AdminAgentTask,
+  AdminAgentMission,
+  AdminAgentWorkItem,
   AdminKnowledge,
   AdminStatus,
   City,
@@ -383,6 +385,16 @@ export async function fetchAdminAgentRunSteps(token: string, runId: number): Pro
 export async function fetchAdminAgentTasks(token: string, cityId: number): Promise<AdminAgentTask[]> {
   const res = await request(`/api/admin/agent/tasks?city_id=${cityId}&task_status=pending`, { headers: authHeaders(token) });
   return handle<AdminAgentTask[]>(res);
+}
+
+export async function fetchAdminAgentMissions(token: string, cityId: number): Promise<AdminAgentMission[]> {
+  const res = await request(`/api/admin/agent/missions?city_id=${cityId}&mission_status=active`, { headers: authHeaders(token) });
+  return handle<AdminAgentMission[]>(res);
+}
+
+export async function fetchAdminAgentWorkItems(token: string, missionId: number): Promise<AdminAgentWorkItem[]> {
+  const res = await request(`/api/admin/agent/missions/${missionId}/work-items`, { headers: authHeaders(token) });
+  return handle<AdminAgentWorkItem[]>(res);
 }
 
 export async function fetchPlaceNotes(token: string, placeId: number): Promise<PlaceNote[]> {

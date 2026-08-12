@@ -219,8 +219,13 @@ export interface AdminKnowledge {
   summary?: string;
   principles?: string[];
   next_actions?: string[];
+  keywords?: string[];
+  applicability?: Record<string, unknown>;
+  source_refs?: string[];
   evidence_count?: number;
   quality_score?: number;
+  retrieval_count?: number;
+  last_retrieved_at?: string | null;
   status?: string;
   version?: number;
   created_at: string;
@@ -290,6 +295,38 @@ export interface AdminAgentTask {
   attempts: number;
   result: string;
   created_at: string;
+  updated_at: string;
+}
+
+export interface AdminAgentMission {
+  id: number;
+  city_id: number;
+  task_id: number | null;
+  kind: string;
+  title: string;
+  objective: string;
+  success_metric: string;
+  status: string;
+  priority: number;
+  progress: Record<string, unknown>;
+  last_run_id: number | null;
+  updated_at: string;
+}
+
+export interface AdminAgentWorkItem {
+  id: number;
+  mission_id: number;
+  place_id: number | null;
+  target_key: string;
+  title: string;
+  stage: string;
+  status: string;
+  state_summary: string;
+  next_action: Record<string, unknown>;
+  failed_approaches: string[];
+  blocked_reason: string;
+  retry_condition: string;
+  last_run_id: number | null;
   updated_at: string;
 }
 

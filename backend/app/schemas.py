@@ -314,8 +314,13 @@ class AgentKnowledgeOut(BaseModel):
     summary: str = ""
     principles: list[str] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    applicability: dict[str, Any] = Field(default_factory=dict)
+    source_refs: list[str] = Field(default_factory=list)
     evidence_count: int = 0
     quality_score: float = 0.0
+    retrieval_count: int = 0
+    last_retrieved_at: Optional[datetime] = None
     status: str = "active"
     version: int = 1
     created_at: datetime

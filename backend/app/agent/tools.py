@@ -119,6 +119,11 @@ _PAGE_CHALLENGE_MARKERS = (
     "身份核实",
     "请登录",
     "扫码登录",
+    "app扫码",
+    "扫描二维码登录",
+    "账号登录/注册",
+    "二维码已失效",
+    "登录失败",
     "登录后查看",
     "captcha",
     "access denied",
@@ -292,7 +297,12 @@ TOOLS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"limit": {"type": "integer", "default": 30}},
+                "properties": {
+                    "limit": {"type": "integer", "default": 30},
+                    "query": {"type": "string", "description": "현재 작업·대상·실패 상황을 설명하는 검색 문장"},
+                    "place_id": {"type": ["integer", "null"], "description": "특정 장소 지식이 필요할 때"},
+                    "categories": {"type": "array", "items": {"type": "string"}},
+                },
             },
         },
     },
@@ -719,6 +729,9 @@ TOOLS: list[dict[str, Any]] = [
                     "summary": {"type": "string", "description": "핵심 결론 1~3문장"},
                     "principles": {"type": "array", "items": {"type": "string"}, "description": "다음 실행이 재사용할 원칙"},
                     "next_actions": {"type": "array", "items": {"type": "string"}, "description": "표시용 요약. 실제 과제는 upsert_agent_task에도 저장"},
+                    "keywords": {"type": "array", "items": {"type": "string"}, "description": "검색에 쓸 대상·상황·출처 키워드"},
+                    "applicability": {"type": "object", "description": "적용 조건: task_kinds, stages, domains, trigger 등"},
+                    "source_refs": {"type": "array", "items": {"type": "string"}, "description": "근거 URL 또는 run:/evidence: 참조"},
                     "evidence_count": {"type": "integer"},
                     "quality_score": {"type": "number", "minimum": 0, "maximum": 1},
                     "scope": {
@@ -2748,6 +2761,37 @@ def run_tool(
 
     if name == "list_knowledge":
         limit = int(args.get("limit") or 30)
+        query = str(args.get("query") or "").strip()
+        place_id = int(args["place_id"]) if args.get("place_id") is not None else None
+        categories = {str(item).strip() for item in (args.get("categories") or []) if str(item).strip()}
+        if query or place_id is not None or categories:
+            from app.agent.memory import retrieve_contextual_knowledge
+
+            if place_id is not None and db.query(Marker.id).filter(
+                Marker.id == place_id, Marker.city_id == city_id
+            ).first() is None:
+                return {"error": "cross_city_place_forbidden"}
+            retrieved = retrieve_contextual_knowledge(
+                db,
+                city_id=city_id,
+                query=" ".join([query, " ".join(categories)]),
+                limit=limit,
+            )
+            if place_id is not None:
+                rows = list_knowledge(db, limit=100, city_id=city_id)
+                seen = {item["id"] for item in retrieved["knowledge"]}
+                for row in rows:
+                    if row.place_id != place_id or row.id in seen:
+                        continue
+                    retrieved["knowledge"].insert(0, {
+                        "id": row.id, "topic": row.topic, "title": row.title,
+                        "category": row.category, "scope": row.scope,
+                        "summary": (row.summary or row.content or "")[:900],
+                        "principles": json.loads(row.principles or "[]"),
+                        "next_actions": json.loads(row.next_actions or "[]"),
+                        "score": 99.0, "reason": "exact place scope",
+                    })
+            return retrieved
         rows = list_knowledge(db, limit=limit, city_id=city_id)
         return [
             {
@@ -2758,6 +2802,9 @@ def run_tool(
                 "summary": r.summary,
                 "principles": json.loads(r.principles or "[]"),
                 "next_actions": json.loads(r.next_actions or "[]"),
+                "keywords": json.loads(r.keywords or "[]"),
+                "applicability": json.loads(r.applicability or "{}"),
+                "source_refs": json.loads(r.source_refs or "[]"),
                 "quality_score": r.quality_score,
                 "scope": r.scope,
                 "city_id": r.city_id,
@@ -2774,7 +2821,7 @@ def run_tool(
         title = str(args.get("title") or "교훈").strip()
         content = str(args.get("content") or "").strip()
         journal_text = f"{topic} {title} {content}".lower()
-        if category == "workflow" or any(
+        if any(
             marker in journal_text
             for marker in ("사이클 요약", "승인 제안 요약", "작업 완료", "cycle summary", "run summary")
         ):
@@ -2786,10 +2833,19 @@ def run_tool(
                     "후속 일은 upsert_agent_task로 분리하세요."
                 ),
             }
-        if category not in {"quality", "city", "source", "data_model", "playbook"}:
+        if category not in {"quality", "workflow", "city", "source", "data_model", "playbook"}:
             return {
                 "error": "invalid_knowledge_category",
-                "detail": "category는 quality|city|source|data_model|playbook 중 하나여야 합니다.",
+                "detail": "category는 quality|workflow|city|source|data_model|playbook 중 하나여야 합니다.",
+            }
+        if category == "workflow" and (
+            int(args.get("evidence_count") or 0) < 2
+            or not (args.get("principles") or [])
+            or not isinstance(args.get("applicability"), dict)
+        ):
+            return {
+                "error": "workflow_knowledge_requires_evidence",
+                "detail": "workflow 지식은 사례 2건 이상, 재사용 원칙, 적용 조건을 함께 제공해야 저장할 수 있습니다.",
             }
         requested_place_id = int(args["place_id"]) if args.get("place_id") is not None else None
         if requested_place_id is not None and db.query(Marker.id).filter(
@@ -2810,6 +2866,9 @@ def run_tool(
             summary=str(args.get("summary") or ""),
             principles=[str(item) for item in (args.get("principles") or [])],
             next_actions=[str(item) for item in (args.get("next_actions") or [])],
+            keywords=[str(item) for item in (args.get("keywords") or [])],
+            applicability=args.get("applicability") if isinstance(args.get("applicability"), dict) else {},
+            source_refs=[str(item) for item in (args.get("source_refs") or [])],
             evidence_count=int(args.get("evidence_count") or 0),
             quality_score=float(args.get("quality_score") or 0.7),
         )

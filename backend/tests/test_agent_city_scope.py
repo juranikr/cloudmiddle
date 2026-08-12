@@ -26,12 +26,24 @@ from app.agent.tools import TOOLS, run_tool
 from app.agent.tools import is_useful_fetched_page
 from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
+from app.agent.memory import (
+    checkpoint_after_tool,
+    ensure_mission_for_task,
+    learn_from_recent_runs,
+    retrieve_contextual_knowledge,
+    rotate_blocked_work_item,
+)
 from app.rollback import list_agent_actions
 from app.models import (
     AgentKnowledge,
     AgentKnowledgeArchive,
     AgentProposal,
+    AgentRun,
     AgentTask,
+    AgentEvidence,
+    AgentLesson,
+    AgentMission,
+    AgentWorkItem,
     City,
     Marker,
     MarkerCategory,
@@ -107,6 +119,147 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(count_unread(self.db, 2), 1)
         rows = run_tool(self.db, "list_places", {}, city_id=2)
         self.assertEqual([row["city_id"] for row in rows], [2])
+
+    def test_durable_mission_splits_quality_task_into_resumable_place_work_items(self) -> None:
+        places = self.db.query(Marker).filter(Marker.city_id == 2).all()
+        second = Marker(
+            city_id=2,
+            category=MarkerCategory.restaurant,
+            shape=MarkerShape.point,
+            title="诚意小厨(皇姑店)",
+            description="한국어 설명",
+            lat=41.82,
+            lng=123.41,
+        )
+        self.db.add(second)
+        self.db.flush()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_verification",
+            title="운영 검증",
+            detail=(
+                "대상:\n"
+                f"- #{places[0].id} {places[0].title} (현재: 미검증)\n"
+                f"- #{second.id} {second.title} (현재: 미검증)"
+            ),
+            success_metric="각 장소의 last_verified_at 기록",
+            priority=78,
+        )
+        self.db.add(task)
+        self.db.commit()
+
+        mission, active = ensure_mission_for_task(self.db, task)
+        items = self.db.query(AgentWorkItem).filter(AgentWorkItem.mission_id == mission.id).order_by(AgentWorkItem.id).all()
+        self.assertEqual(len(items), 2)
+        self.assertEqual(active.place_id, places[0].id)
+        self.assertEqual(json.loads(active.next_action)["tool"], "get_place")
+
+        mission_again, active_again = ensure_mission_for_task(self.db, task)
+        self.assertEqual(mission_again.id, mission.id)
+        self.assertEqual(active_again.id, active.id)
+        self.assertEqual(self.db.query(AgentMission).count(), 1)
+
+    def test_checkpoint_persists_new_evidence_and_exact_next_action(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2, kind="quality_verification", title="운영 검증",
+            detail=f"대상:\n- #{place.id} {place.title} (현재: 미검증)",
+            success_metric="last_verified_at 기록", priority=78,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        run = AgentRun(city_id=2, mission_id=mission.id, work_item_id=item.id, status="running")
+        self.db.add(run)
+        self.db.commit()
+
+        updated, continuity = checkpoint_after_tool(
+            self.db, mission=mission, work_item=item, run_id=run.id, sequence=1,
+            tool="web_search", args={"query": place.title},
+            result={"results": [{"href": "https://example.test/place", "title": "공식 안내", "body": "운영 정보", "seen": False}]},
+            outcome="ok", new_evidence_count=1, material_change=False,
+        )
+        self.db.commit()
+        self.assertEqual(json.loads(updated.next_action)["tool"], "fetch_page")
+        self.assertEqual(continuity["next_action"]["args"]["url"], "https://example.test/place")
+        evidence = self.db.query(AgentEvidence).one()
+        self.assertEqual(evidence.source_status, "discovered")
+
+        _, seen_continuity = checkpoint_after_tool(
+            self.db, mission=mission, work_item=updated, run_id=run.id, sequence=2,
+            tool="web_search", args={"query": place.title + " 재검색"},
+            result={"results": [{"href": "https://example.test/old", "title": "기존 결과", "body": "이미 확인", "seen": True}]},
+            outcome="ok", new_evidence_count=0, material_change=False,
+        )
+        self.assertEqual(seen_continuity["next_action"]["tool"], "choose_alternative_source")
+
+    def test_contextual_knowledge_prefers_exact_city_and_source_strategy(self) -> None:
+        upsert_knowledge(
+            self.db, topic="dianping_source", title="Dianping 인증 화면 대응",
+            content="로그인 화면은 검증 근거가 아니며 다른 출처를 선택한다.",
+            scope="city", city_id=2, category="source", quality_score=0.95,
+            keywords=["dianping", "로그인", "검증"],
+            applicability={"task_kinds": ["quality_verification"], "domains": ["dianping.com"]},
+        )
+        upsert_knowledge(
+            self.db, topic="jinan_springs", title="지난 샘물",
+            content="지난의 샘물 조사 지식", scope="city", city_id=1, category="city",
+        )
+        self.db.commit()
+        task = AgentTask(
+            city_id=2, kind="quality_verification", title="운영 검증",
+            detail="Dianping 로그인 화면 이후 다른 출처 검증", priority=78,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        item.failed_approaches = json.dumps(["Dianping 로그인 화면"])
+        self.db.commit()
+        found = retrieve_contextual_knowledge(
+            self.db, city_id=2, mission=mission, work_item=item,
+            query="Dianping 로그인 검증", limit=5,
+        )
+        topics = [entry["topic"] for entry in found["knowledge"]]
+        self.assertIn("city:2:dianping_source", topics)
+        self.assertNotIn("city:1:jinan_springs", topics)
+
+    def test_dianping_login_shell_is_not_useful_evidence(self) -> None:
+        shell = {
+            "url": "https://www.dianping.com/shop/1",
+            "title": "大众点评网",
+            "text": "登录 APP扫码，享七天免登录 二维码已失效 账号登录/注册 " * 15,
+        }
+        self.assertFalse(is_useful_fetched_page(shell))
+
+    def test_blocked_target_rotates_and_pauses_only_when_every_target_is_blocked(self) -> None:
+        places = self.db.query(Marker).filter(Marker.city_id == 2).all()
+        second = Marker(
+            city_id=2, category=MarkerCategory.restaurant, shape=MarkerShape.point,
+            title="두 번째 대상", description="한국어 설명", lat=41.82, lng=123.42,
+        )
+        self.db.add(second)
+        self.db.flush()
+        task = AgentTask(
+            city_id=2, kind="quality_verification", title="순환 검증",
+            detail=f"대상:\n- #{places[0].id} {places[0].title}\n- #{second.id} {second.title}",
+            success_metric="검증", priority=78,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, first = ensure_mission_for_task(self.db, task)
+        next_item = rotate_blocked_work_item(
+            self.db, mission=mission, current=first, run_id=1, reason="세 경로 실패",
+        )
+        self.assertIsNotNone(next_item)
+        self.assertNotEqual(next_item.id, first.id)
+        self.assertEqual(first.status, "blocked")
+        self.assertEqual(next_item.status, "active")
+
+        final = rotate_blocked_work_item(
+            self.db, mission=mission, current=next_item, run_id=1, reason="세 경로 실패",
+        )
+        self.assertIsNone(final)
+        self.assertEqual(mission.status, "paused")
 
     def test_batch_progress_ignores_noop_mutations_and_repeated_evidence(self) -> None:
         self.assertFalse(_is_material_change("upsert_agent_task", {"ok": True, "changed": False}))

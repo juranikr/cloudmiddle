@@ -405,8 +405,13 @@ class AgentKnowledge(Base):
     summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     principles: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     next_actions: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    keywords: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    applicability: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    source_refs: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     evidence_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     quality_score: Mapped[float] = mapped_column(Float, default=0.7, nullable=False)
+    retrieval_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_retrieved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False, index=True)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -538,6 +543,12 @@ class AgentRun(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    mission_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_missions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    work_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_work_items.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     mode: Mapped[str] = mapped_column(String(30), default="queue", nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="running", index=True, nullable=False)
     objective: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -589,6 +600,193 @@ class AgentTask(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentMission(Base):
+    """A durable objective that survives individual model calls and batch runs."""
+
+    __tablename__ = "agent_missions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_tasks.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(40), default="research", index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    objective: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    success_metric: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=50, index=True, nullable=False)
+    strategy: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    progress: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    policy_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_run_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentWorkItem(Base):
+    """Small resumable target within a mission, normally one place or one exact gap."""
+
+    __tablename__ = "agent_work_items"
+    __table_args__ = (UniqueConstraint("mission_id", "target_key", name="uq_agent_mission_target"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    mission_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_missions.id", ondelete="CASCADE"), index=True
+    )
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    target_type: Mapped[str] = mapped_column(String(30), default="task", nullable=False)
+    target_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    goal: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    definition_of_done: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    stage: Mapped[str] = mapped_column(String(30), default="observe", index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ready", index=True, nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=50, index=True, nullable=False)
+    state_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    current_hypothesis: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    next_action: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    failed_approaches: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    blocked_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    retry_condition: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    evidence_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_run_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentCheckpoint(Base):
+    """Compact task state persisted after each action; never private chain-of-thought."""
+
+    __tablename__ = "agent_checkpoints"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    mission_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_missions.id", ondelete="CASCADE"), index=True
+    )
+    work_item_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_work_items.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    state_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    decision: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    new_facts: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    rejected_claims: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    failed_approaches: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    next_action: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    outcome: Mapped[str] = mapped_column(String(30), default="observed", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AgentEvidence(Base):
+    """A claim-level research observation, including rejected and blocked sources."""
+
+    __tablename__ = "agent_evidence"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    mission_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_missions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    work_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_work_items.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    run_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    source_type: Mapped[str] = mapped_column(String(30), default="tool", index=True, nullable=False)
+    url: Mapped[str] = mapped_column(String(1000), default="", index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    claim: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    excerpt: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source_status: Mapped[str] = mapped_column(String(30), default="discovered", index=True, nullable=False)
+    rejection_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AgentLesson(Base):
+    """An operational lesson promoted only after repeated outcome evidence."""
+
+    __tablename__ = "agent_lessons"
+    __table_args__ = (UniqueConstraint("lesson_key", name="uq_agent_lesson_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    lesson_key: Mapped[str] = mapped_column(String(160), index=True, nullable=False)
+    scope: Mapped[str] = mapped_column(String(20), default="global", index=True, nullable=False)
+    city_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("cities.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    category: Mapped[str] = mapped_column(String(40), default="workflow", index=True, nullable=False)
+    trigger: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_effect: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    applicability: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    evidence_refs: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="candidate", index=True, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    observation_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    applied_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_applied_run_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
+    )
+
+
+class AgentKnowledgeUse(Base):
+    """Audit trail of why a knowledge item or lesson entered a run context."""
+
+    __tablename__ = "agent_knowledge_uses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    knowledge_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_knowledge.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    lesson_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_lessons.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
+    mission_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_missions.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    work_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("agent_work_items.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    relevance_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    retrieval_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    outcome: Mapped[str] = mapped_column(String(20), default="pending", index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
 class TravelPlan(Base):

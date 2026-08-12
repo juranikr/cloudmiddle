@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -26,6 +27,18 @@ def _derive_structure(content: str) -> tuple[str, list[str], list[str]]:
     principles = [line[:500] for line in lines if not any(word in line for word in ("다음", "향후", "예정"))][:6]
     next_actions = [line[:500] for line in lines if any(word in line for word in ("다음", "향후", "예정"))][:6]
     return summary, principles, next_actions
+
+
+def _derive_keywords(*values: str) -> list[str]:
+    text = " ".join(value or "" for value in values).casefold()
+    tokens = re.findall(r"[0-9a-z_\-]{2,}|[가-힣]{2,}|[\u3400-\u9fff]{2,}", text)
+    stop = {"장소", "정보", "실행", "다음", "현재", "대한", "있는", "한다", "agent", "place"}
+    output: list[str] = []
+    for token in tokens:
+        if token in stop or token in output:
+            continue
+        output.append(token)
+    return output[:30]
 
 
 def list_knowledge(
@@ -83,6 +96,9 @@ def upsert_knowledge(
     summary: str = "",
     principles: Optional[list[str]] = None,
     next_actions: Optional[list[str]] = None,
+    keywords: Optional[list[str]] = None,
+    applicability: Optional[dict] = None,
+    source_refs: Optional[list[str]] = None,
     evidence_count: int = 0,
     quality_score: float = 0.7,
 ) -> AgentKnowledge:
@@ -96,6 +112,11 @@ def upsert_knowledge(
     summary_s = (summary or derived_summary)[:1000]
     principles_s = [str(item).strip()[:500] for item in (principles or derived_principles) if str(item).strip()][:10]
     next_actions_s = [str(item).strip()[:500] for item in (next_actions or derived_actions) if str(item).strip()][:10]
+    keywords_s = [str(item).strip().casefold()[:120] for item in (keywords or []) if str(item).strip()][:30]
+    if not keywords_s:
+        keywords_s = _derive_keywords(raw_topic, title_s, summary_s, content_s, " ".join(principles_s))
+    applicability_s = applicability if isinstance(applicability, dict) else {}
+    source_refs_s = [str(item).strip()[:1000] for item in (source_refs or []) if str(item).strip()][:30]
     scope_key = scope if scope in {"global", "city", "place"} else "global"
     if place_id is not None:
         scope_key = "place"
@@ -115,6 +136,9 @@ def upsert_knowledge(
             summary=summary_s,
             principles=json.dumps(principles_s, ensure_ascii=False),
             next_actions=json.dumps(next_actions_s, ensure_ascii=False),
+            keywords=json.dumps(keywords_s, ensure_ascii=False),
+            applicability=json.dumps(applicability_s, ensure_ascii=False),
+            source_refs=json.dumps(source_refs_s, ensure_ascii=False),
             evidence_count=max(0, evidence_count),
             quality_score=max(0.0, min(float(quality_score), 1.0)),
             status="active",
@@ -135,6 +159,9 @@ def upsert_knowledge(
         row.summary = summary_s or row.summary
         row.principles = json.dumps(principles_s, ensure_ascii=False)
         row.next_actions = json.dumps(next_actions_s, ensure_ascii=False)
+        row.keywords = json.dumps(keywords_s, ensure_ascii=False)
+        row.applicability = json.dumps(applicability_s, ensure_ascii=False)
+        row.source_refs = json.dumps(source_refs_s, ensure_ascii=False)
         row.evidence_count = max(0, evidence_count)
         row.quality_score = max(0.0, min(float(quality_score), 1.0))
         row.status = "active"
@@ -152,6 +179,12 @@ def knowledge_brief(db: Session, *, limit: int = 15, city_id: Optional[int] = No
             "summary": (r.summary or r.content or "")[:800],
             "principles": _json_list(r.principles)[:6],
             "next_actions": _json_list(r.next_actions)[:6],
+            "keywords": _json_list(r.keywords)[:20],
+            "applicability": (
+                json.loads(r.applicability or "{}")
+                if (r.applicability or "").strip().startswith("{")
+                else {}
+            ),
             "quality_score": r.quality_score,
             "scope": r.scope,
             "city_id": r.city_id,
@@ -160,6 +193,40 @@ def knowledge_brief(db: Session, *, limit: int = 15, city_id: Optional[int] = No
         }
         for r in rows
     ]
+
+
+def normalize_knowledge_metadata(db: Session, *, city_id: Optional[int] = None) -> int:
+    """Backfill retrieval metadata for knowledge created before structured search."""
+
+    query = db.query(AgentKnowledge)
+    if city_id is not None:
+        query = query.filter(or_(AgentKnowledge.scope == "global", AgentKnowledge.city_id == city_id))
+    changed = 0
+    for row in query.all():
+        if not _json_list(row.keywords):
+            row.keywords = json.dumps(
+                _derive_keywords(row.topic, row.title, row.summary, row.content, row.principles),
+                ensure_ascii=False,
+            )
+            changed += 1
+        try:
+            applicability = json.loads(row.applicability or "{}")
+        except json.JSONDecodeError:
+            applicability = {}
+        if not isinstance(applicability, dict) or not applicability:
+            row.applicability = json.dumps(
+                {
+                    "scope": row.scope,
+                    "city_id": row.city_id,
+                    "place_id": row.place_id,
+                    "categories": [row.category],
+                },
+                ensure_ascii=False,
+            )
+            changed += 1
+    if changed:
+        db.commit()
+    return changed
 
 
 def rebuild_knowledge_base(db: Session) -> dict[str, int]:

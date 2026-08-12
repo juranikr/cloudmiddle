@@ -1593,6 +1593,19 @@ textarea {
 .admin__knowledge p { margin: 8px 0; line-height: 1.55; }
 .admin__knowledge ul { margin: 8px 0; padding-left: 1.2rem; line-height: 1.55; }
 .admin__knowledge details summary { cursor: pointer; color: var(--teal-deep); font-weight: 700; }
+.admin__knowledge-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.admin__knowledge-tags span { padding: 3px 7px; border-radius: 999px; background: rgba(15,118,110,.1); color: var(--teal-deep); font-size: .7rem; font-weight: 700; }
+.admin__continuity { margin-top: 18px; display: grid; gap: 10px; }
+.admin__continuity h3 { margin: 0; }
+.admin__mission { padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: linear-gradient(145deg, #fff, rgba(15,118,110,.04)); }
+.admin__mission > div:first-child { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.admin__mission > div:first-child span, .admin__mission small { color: var(--muted); font-size: .78rem; }
+.admin__mission > p { margin: 8px 0; line-height: 1.45; }
+.admin__checkpoint { display: grid; gap: 6px; margin: 10px 0; padding: 10px; border-radius: 10px; background: rgba(15,118,110,.07); }
+.admin__checkpoint > span { color: var(--teal-deep); font-size: .75rem; font-weight: 800; }
+.admin__checkpoint p { margin: 0; }
+.admin__checkpoint code { padding: 7px; border-radius: 7px; white-space: pre-wrap; word-break: break-word; background: rgba(255,255,255,.8); font-size: .75rem; }
+.admin__checkpoint details summary { cursor: pointer; font-weight: 700; }
 .admin__runs { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
 .admin__runs > li { padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
 .admin__runs li > div { display: flex; justify-content: space-between; gap: 8px; }
