@@ -35,6 +35,7 @@ from app.agent.memory import (
     learn_from_recent_runs,
     retrieve_contextual_knowledge,
     rotate_blocked_work_item,
+    reconcile_work_items,
     observe_lesson,
     active_work_item_for_mission,
 )
@@ -1004,6 +1005,77 @@ class AgentCityScopeTests(unittest.TestCase):
 
         self.assertEqual(result["error"], "target_confirmation_required")
         self.assertNotEqual(marker.travel_role, "nature")
+
+    def test_place_update_preserves_existing_korean_name(self) -> None:
+        marker = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        marker.title = "선양 타오셴 국제공항"
+        self.db.commit()
+        result = run_tool(
+            self.db,
+            "update_place_fields",
+            {
+                "place_id": marker.id,
+                "expected_title": marker.title,
+                "replace_title": "沈阳桃仙国际机场 (선양 타오셉 국제공항)",
+            },
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "existing_korean_name_must_be_preserved")
+
+    def test_place_insight_rejects_other_district_branch(self) -> None:
+        marker = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        marker.description = "Shenhe Middle Street, Shenyang"
+        self.db.commit()
+        result = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                "place_id": marker.id,
+                "insights": [{
+                    "kind": "location",
+                    "title": "주소",
+                    "content": "Tiexi Jingxing North Street 3에 위치합니다.",
+                    "source_url": "https://example.test/tiexi",
+                    "source_title": "Liaomingyan Tiexi branch",
+                    "confidence": 0.9,
+                }],
+                "_validated_source_urls": ["https://example.test/tiexi"],
+            },
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "insight_branch_mismatch")
+
+    def test_reconcile_pauses_instead_of_reactivating_blocked_item(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.description = (
+            "충분히 긴 한국어 장소 설명입니다. 여행자가 방문 전에 이해할 수 있도록 "
+            "핵심 위치와 특징을 자세히 정리했습니다."
+        )
+        place.insights.extend([
+            PlaceInsight(kind="location", title="위치", content="위치 정보", source_url="https://example.test/1"),
+            PlaceInsight(kind="tip", title="팁", content="방문 정보", source_url="https://example.test/2"),
+        ])
+        task = AgentTask(city_id=2, kind="quality_information", title="정보 보강", status="pending")
+        self.db.add(task)
+        self.db.flush()
+        mission = AgentMission(city_id=2, task_id=task.id, kind=task.kind, title=task.title, status="active")
+        self.db.add(mission)
+        self.db.flush()
+        blocked = AgentWorkItem(
+            mission_id=mission.id, city_id=2, target_key="task:blocked", title="차단 장소",
+            status="blocked", priority=90,
+        )
+        current = AgentWorkItem(
+            mission_id=mission.id, city_id=2, place_id=place.id, target_key=f"place:{place.id}",
+            title=place.title, status="active", priority=80,
+        )
+        self.db.add_all([blocked, current])
+        self.db.commit()
+        active = reconcile_work_items(self.db, mission=mission)
+        self.assertIsNone(active)
+        self.assertEqual(current.status, "done")
+        self.assertEqual(blocked.status, "blocked")
+        self.assertEqual(mission.status, "paused")
 
     def test_zone_and_chain_are_relationships_not_merges(self) -> None:
         zone = Marker(

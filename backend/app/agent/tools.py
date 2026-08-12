@@ -1998,6 +1998,16 @@ def run_tool(
                     "error": "korean_required",
                     "detail": "제목은 '中文名 (한국어 명칭)' 형식으로 한국어를 병기해 다시 호출하세요.",
                 }
+            existing_korean = "".join(re.findall(r"[가-힣]+", m.title or ""))
+            incoming_korean = "".join(re.findall(r"[가-힣]+", replace_title))
+            if len(existing_korean) >= 4 and existing_korean not in incoming_korean:
+                return {
+                    "error": "existing_korean_name_must_be_preserved",
+                    "detail": (
+                        f"기존 한국어 장소명 '{m.title}'을 replace_title에서 그대로 보존해야 합니다. "
+                        "중국어 원문명만 추가하려면 기존 한국어 표기를 변경하지 마세요."
+                    ),
+                }
             prospective_title = replace_title[:200]
         replace_description = str(args.get("replace_description") or "").strip()
         if replace_description and replace_description != m.description:
@@ -2279,6 +2289,29 @@ def run_tool(
         raw_items = args.get("insights") or []
         if not isinstance(raw_items, list):
             return {"error": "bad_insights"}
+        marker_context = " ".join(
+            str(value or "")
+            for value in (m.title, m.description, m.branch_name, m.coordinate_query)
+        )
+        marker_districts = _district_tokens(marker_context)
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            source_districts = _district_tokens(
+                " ".join(
+                    str(value or "")
+                    for value in (raw.get("source_title"), raw.get("content"))
+                )
+            )
+            if marker_districts and source_districts and marker_districts.isdisjoint(source_districts):
+                return {
+                    "error": "insight_branch_mismatch",
+                    "detail": (
+                        f"장소의 구역 단서 {sorted(marker_districts)}와 인사이트 출처·내용의 "
+                        f"구역 단서 {sorted(source_districts)}가 다릅니다. 같은 체인의 다른 지점 "
+                        "정보를 현재 장소에 저장할 수 없습니다."
+                    ),
+                }
         if m.branch_name:
             for raw in raw_items:
                 if not isinstance(raw, dict):

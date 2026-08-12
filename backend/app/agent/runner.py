@@ -1583,7 +1583,7 @@ def run_agent(
                     active_work_item = canonical_active
                     agent_run.work_item_id = canonical_active.id
                 if material_change:
-                    active_work_item = reconcile_work_items(db, mission=active_mission) or active_work_item
+                    active_work_item = reconcile_work_items(db, mission=active_mission)
                     if active_work_item is not None:
                         agent_run.work_item_id = active_work_item.id
                         continuity = mission_context(active_mission, active_work_item) if active_mission else continuity

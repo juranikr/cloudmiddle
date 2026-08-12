@@ -809,22 +809,35 @@ def reconcile_work_items(db: Session, *, mission: Optional[AgentMission]) -> Opt
         )[0] if any(item.status == "ready" for item in items) else None
         if active is not None:
             active.status = "active"
-    remaining = [item for item in items if item.status in {"ready", "active", "blocked"}]
-    if not remaining:
+    executable = [item for item in items if item.status in {"ready", "active"}]
+    blocked = [item for item in items if item.status == "blocked"]
+    remaining = [*executable, *blocked]
+    if not executable and blocked:
+        mission.status = "paused"
+        mission.progress = _dump({
+            "active_work_item_id": None,
+            "done": len([item for item in items if item.status == "done"]),
+            "ready": 0,
+            "blocked": len(blocked),
+            "total": len([item for item in items if item.status != "superseded"]),
+            "retry_condition": "새 출처 또는 냉각 시간 경과 후 재평가",
+        })
+    elif not remaining:
         mission.status = "completed"
         mission.completed_at = now
         if task is not None:
             task.status = "completed"
             task.completed_at = now
             task.result = "모든 세부 대상의 운영 DB 성공조건을 재측정해 완료했습니다."
-    mission.progress = _dump({
-        "active_work_item_id": active.id if active else None,
-        "done": len([item for item in items if item.status == "done"]),
-        "ready": len([item for item in items if item.status == "ready"]),
-        "blocked": len([item for item in items if item.status == "blocked"]),
-        "total": len([item for item in items if item.status != "superseded"]),
-        "next_action": _json_dict(active.next_action) if active else {},
-    })
+    if mission.status not in {"paused", "completed"}:
+        mission.progress = _dump({
+            "active_work_item_id": active.id if active else None,
+            "done": len([item for item in items if item.status == "done"]),
+            "ready": len([item for item in items if item.status == "ready"]),
+            "blocked": len(blocked),
+            "total": len([item for item in items if item.status != "superseded"]),
+            "next_action": _json_dict(active.next_action) if active else {},
+        })
     db.commit()
     return active
 
