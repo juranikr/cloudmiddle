@@ -1114,8 +1114,42 @@ def _place_brief(m: Marker) -> dict[str, Any]:
 
 def _candidate_title_key(value: str) -> str:
     """Stable local-name key used only for pending-proposal/task reconciliation."""
-    local_name = value.split("(", 1)[0]
+    local_name = value.split("(", 1)[0].strip()
+    # Search/article titles often wrap the real business in marketing copy such
+    # as "必吃！鸣记脆皮烤鱼，香辣酸甜一网打尽".  Identity must be the shop,
+    # otherwise the same candidate can pass through chat-card and proposal paths
+    # as two different places.
+    if "！" in local_name or "!" in local_name:
+        local_name = re.split(r"[！!]", local_name)[-1]
+    local_name = re.split(r"[，,｜|]", local_name, maxsplit=1)[0]
+    local_name = re.sub(r"^(?:必吃|推荐|探店|打卡)[:：\s]*", "", local_name).strip()
     return re.sub(r"[^\w]+", "", local_name, flags=re.UNICODE).casefold()
+
+
+def _matching_existing_place(
+    db: Session,
+    *,
+    city_id: int,
+    title: str,
+    lat: float,
+    lng: float,
+    max_distance_m: float = 800.0,
+) -> Optional[Marker]:
+    key = _candidate_title_key(title)
+    if len(key) < 4:
+        return None
+    rows = db.query(Marker).filter(
+        Marker.city_id == city_id,
+        Marker.shape == MarkerShape.point,
+        Marker.merged_into_id.is_(None),
+    ).all()
+    for row in rows:
+        row_key = _candidate_title_key(row.title)
+        if len(row_key) < 4 or not (key in row_key or row_key in key):
+            continue
+        if _haversine_m(lat, lng, row.lat, row.lng) <= max_distance_m:
+            return row
+    return None
 
 
 def _complete_matching_proposal_tasks(
@@ -1181,6 +1215,24 @@ def _pending_proposal(
     confidence: float,
     place_id: Optional[int] = None,
 ) -> dict[str, Any]:
+    try:
+        existing_place = _matching_existing_place(
+            db,
+            city_id=city_id,
+            title=title,
+            lat=float(payload["lat"]),
+            lng=float(payload["lng"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        existing_place = None
+    if existing_place is not None:
+        return {
+            "ok": True,
+            "proposal_created": False,
+            "proposal_id": None,
+            "duplicate": True,
+            "existing_place_id": existing_place.id,
+        }
     canonical = json.dumps(
         {"city_id": city_id, "action": action, "payload": payload},
         ensure_ascii=False,
@@ -2179,6 +2231,20 @@ def run_tool(
                 source_urls=source_urls,
                 confidence=float(args.get("confidence") or 0.5),
             )
+        existing_place = _matching_existing_place(
+            db,
+            city_id=city_id,
+            title=title,
+            lat=payload["lat"],
+            lng=payload["lng"],
+        )
+        if existing_place is not None:
+            return {
+                "ok": True,
+                "place_id": existing_place.id,
+                "duplicate": True,
+                "created": False,
+            }
         m = Marker(
             user_id=None,
             city_id=city_id,

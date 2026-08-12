@@ -3,13 +3,22 @@ import json
 import logging
 import re
 import urllib.parse
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
 
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
-from app.models import City, Marker, MarkerShape, TravelChatMessage, TravelPlan, TravelPlanItem
+from app.models import (
+    City,
+    Marker,
+    MarkerShape,
+    TravelChatMessage,
+    TravelChatWork,
+    TravelPlan,
+    TravelPlanItem,
+)
 from app.personalization import build_user_travel_profile, profile_prompt_context
 
 
@@ -17,18 +26,6 @@ RESEARCH_TOOLS = {"web_search", "fetch_page", "geocode_place"}
 WRITE_TOOLS = {"propose_place", "upsert_place_insights"}
 URL_RE = re.compile(r"https?://[^\s<>\])}]+")
 PLACE_ID_RE = re.compile(r"(?:장소|place)[_ ]?(?:id)?\s*[:#]?\s*(\d+)", re.IGNORECASE)
-WRITE_INTENT_RE = re.compile(
-    r"지도(?:에|에다가).{0,24}(?:넣|찍|추가|저장|등록)|"
-    r"(?:추가|저장|등록|보강|갱신)(?:해|하|시켜|해달|해줬|해주|했으면|하고\s*싶)"
-)
-WEB_INTENT_RE = re.compile(
-    r"찾아|검색|확인|최신|오늘|지금|영업|운영|휴무|예약|가격|요금|"
-    r"지점|체인|가까운|근처|어디|주소|전화|메뉴"
-)
-FOOD_DISCOVERY_RE = re.compile(
-    r"먹어야|먹을\s*(?:것|거|음식)|음식\s*종류|향토\s*음식|대표\s*음식|현지\s*음식|"
-    r"맛집|식당|餐厅|美食|小吃|名菜"
-)
 BRAND_SEARCH_ALIASES = {
     "헤이티": "喜茶 HEYTEA",
     "희차": "喜茶 HEYTEA",
@@ -53,20 +50,13 @@ GENERIC_CLARIFICATION_RE = re.compile(
     r"어떤 정보를 원하시는지 알려|구체적인 질문을 파악하기 어렵|"
     r"확인된 자료가 부족해 답을 완성하지 못"
 )
-SHORT_FOLLOWUP_RE = re.compile(
-    r"^(?:(?:그거|그것|둘\s*다|전부|모두|찾은\s*것|위\s*장소)(?:를|도|부터)?\s*)?"
-    r"(?:지도에\s*)?(?:추가|등록|저장|넣)(?:해|하|해줘|해주세요|시켜줘)?[.!?\s]*$"
-)
-CONTEXTUAL_WRITE_FOLLOWUP_RE = re.compile(
-    r"^(?=.{1,100}$)(?=.*(?:추가|등록|저장|넣))(?=.*(?:검색|찾|충분|다시|더|계속|제대로|그럼)).*$"
-)
 META_FOLLOWUP_RE = re.compile(
     r"(?:충족|통과).{0,12}(?:기준|조건)|(?:기준|조건).{0,12}(?:무엇|뭐)|"
     r"왜.{0,16}(?:실패|못|안\s*(?:돼|되))|뭐가.{0,12}(?:부족|문제)"
 )
 FAILURE_QUESTION_RE = re.compile(r"왜.{0,12}(?:실패|못|안\s*(?:돼|되)|자료.{0,5}부족)|자꾸.{0,10}(?:실패|못|안\s*(?:돼|되))")
 MAX_RESEARCH_TOOL_ROUNDS = 3
-MAX_WRITE_TOOL_ROUNDS = 5
+MAX_WRITE_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS_PER_ROUND = 4
 # City-local bootstrap evidence is deliberately small and auditable. It provides
 # a stable floor when general search engines omit Chinese map/detail pages; the
@@ -81,19 +71,49 @@ CITY_FOOD_DETAIL_SOURCES: dict[str, tuple[str, ...]] = {
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class ChatIntent:
+    """Semantic request contract returned by the model, never by phrase regexes."""
+
+    action: str = "answer"
+    scope: str = "unspecified"
+    subject: str = ""
+    goal: str = ""
+    wants_research: bool = False
+    wants_write: bool = False
+    continuation: bool = False
+    starts_new_work: bool = False
+    requested_count: int | None = None
+    target_keys: list[str] | None = None
+    confidence: float = 0.0
+
+    def normalized(self) -> "ChatIntent":
+        valid_actions = {
+            "answer", "research", "write", "research_and_write", "continue",
+            "correct", "explain_failure",
+        }
+        valid_scopes = {"single", "selected", "remaining", "all", "unspecified"}
+        self.action = self.action if self.action in valid_actions else "answer"
+        self.scope = self.scope if self.scope in valid_scopes else "unspecified"
+        self.subject = self.subject.strip()[:120]
+        self.goal = self.goal.strip()[:500]
+        self.target_keys = [str(item)[:80] for item in (self.target_keys or []) if str(item).strip()][:30]
+        if self.requested_count is not None:
+            self.requested_count = max(1, min(int(self.requested_count), 20))
+        self.confidence = max(0.0, min(float(self.confidence or 0), 1.0))
+        return self
+
+
 def _tool_subset(names: set[str]) -> list[dict[str, Any]]:
     return [tool for tool in TOOLS if tool.get("function", {}).get("name") in names]
 
 
-def _chat_capabilities(message: str, *, context_message: str = "") -> tuple[bool, set[str]]:
-    """Route simple map conversation to one model call and reserve web tools for real research."""
-    write_intent = bool(WRITE_INTENT_RE.search(message))
-    combined = f"{context_message}\n{message}" if context_message else message
-    research_intent = write_intent or bool(WEB_INTENT_RE.search(combined))
-    allowed = set(RESEARCH_TOOLS) if research_intent else set()
-    if write_intent:
+def _chat_capabilities(intent: ChatIntent) -> tuple[bool, set[str]]:
+    """Grant tools from the structured semantic decision, not matched phrases."""
+    allowed = set(RESEARCH_TOOLS) if intent.wants_research or intent.wants_write else set()
+    if intent.wants_write:
         allowed |= WRITE_TOOLS
-    return write_intent, allowed
+    return intent.wants_write, allowed
 
 
 def _needs_answer_retry(content: str) -> bool:
@@ -109,43 +129,252 @@ def _recent_user_requests(rows: list[TravelChatMessage], *, limit: int = 8) -> l
     ][-limit:]
 
 
-def _is_contextual_write_followup(content: str) -> bool:
-    """True when a write command depends on a target stated earlier."""
-    if not CONTEXTUAL_WRITE_FOLLOWUP_RE.search(content.strip()):
-        return False
-    folded = content.casefold()
-    has_brand = any(
-        alias.casefold() in folded
-        for aliases in BRAND_ANSWER_ALIASES.values()
-        for alias in aliases
+def _work_state(work: TravelChatWork | None) -> dict[str, Any]:
+    if work is None:
+        return {}
+    try:
+        state = json.loads(work.state or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _active_chat_work(db: Session, *, user_id: int, city_id: int) -> TravelChatWork | None:
+    return (
+        db.query(TravelChatWork)
+        .filter(
+            TravelChatWork.user_id == user_id,
+            TravelChatWork.city_id == city_id,
+            TravelChatWork.status == "active",
+        )
+        .order_by(TravelChatWork.id.desc())
+        .first()
     )
-    return not has_brand and not FOOD_DISCOVERY_RE.search(content)
 
 
-def _resolve_context_message(message: str, rows: list[TravelChatMessage]) -> str:
-    """Attach the previous concrete user request to short commands such as `추가해줘`."""
-    if not (
-        SHORT_FOLLOWUP_RE.search(message.strip())
-        or _is_contextual_write_followup(message)
-    ):
+def _work_summary(work: TravelChatWork | None) -> dict[str, Any] | None:
+    if work is None:
+        return None
+    state = _work_state(work)
+    candidates = [item for item in state.get("candidates", []) if isinstance(item, dict)]
+    return {
+        "work_id": work.id,
+        "action": work.action,
+        "scope": work.scope,
+        "subject": work.subject,
+        "goal": work.goal,
+        "requested_count": work.requested_count,
+        "phase": state.get("phase", "understand"),
+        "next_action": state.get("next_action", ""),
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "key": item.get("key"),
+                "title": item.get("title"),
+                "status": item.get("status"),
+                "proposal_id": item.get("proposal_id"),
+                "address": item.get("address", ""),
+                "category": item.get("category", "other"),
+                "source_urls": list(item.get("source_urls") or [])[:3],
+                "lat": item.get("lat"),
+                "lng": item.get("lng"),
+            }
+            for item in candidates[:20]
+        ],
+        "completed_keys": list(state.get("completed_keys") or [])[:30],
+        "failed": list(state.get("failed") or [])[-10:],
+    }
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    text = (content or "").strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            value = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _classify_chat_intent(
+    client: Any,
+    *,
+    model: str,
+    message: str,
+    recent_requests: list[str],
+    active_work: TravelChatWork | None,
+) -> ChatIntent:
+    """Understand arbitrary Korean/Chinese phrasing through a typed model decision."""
+    payload = {
+        "current_message": message,
+        "recent_user_requests": recent_requests[-8:],
+        "active_work": _work_summary(active_work),
+    }
+    request: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "너는 여행 지도 대화의 의도 라우터다. 단어나 정규식처럼 표면 표현에 의존하지 말고 "
+                    "문장의 의미와 active_work를 함께 이해하라. 반드시 JSON 객체 하나만 반환한다. "
+                    "action은 answer|research|write|research_and_write|continue|correct|explain_failure, "
+                    "scope는 single|selected|remaining|all|unspecified 중 하나다. "
+                    "subject는 food|drink|spa|lodging|tourism|transport|shopping|itinerary|place_detail|general "
+                    "중 가장 가까운 값으로 정규화한다. "
+                    "wants_write는 사용자가 지도/DB/일정에 반영·추가·수정하기를 실제로 원할 때만 true다. "
+                    "다만 active_work가 조사 후 저장까지 포함하고 사용자가 계속·승인·나머지 처리를 뜻하면 "
+                    "그 저장 의도를 이어받는다. starts_new_work는 새 주제일 때만 true다. "
+                    "requested_count는 사용자가 수량을 말했거나 '여러 개/다양하게'의 합리적 실행 목표가 "
+                    "필요할 때 2~6으로 정하고, 전부/나머지는 null과 scope로 표현한다. "
+                    "target_keys에는 active_work의 특정 후보를 가리킬 때만 key를 넣는다. "
+                    "반환 필드: action,scope,subject,goal,wants_research,wants_write,continuation,"
+                    "starts_new_work,requested_count,target_keys,confidence."
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+        ],
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+    }
+    if "gpt-oss" in model:
+        request["extra_body"] = {"reasoning_effort": "low"}
+    try:
+        try:
+            response = client.chat.completions.create(**request)
+        except Exception:
+            # Some compatible providers/models do not implement JSON mode even
+            # though they reliably follow a JSON-only instruction.
+            request.pop("response_format", None)
+            response = client.chat.completions.create(**request)
+        data = _parse_json_object(response.choices[0].message.content or "")
+        if not data:
+            raise ValueError("empty structured intent")
+        return ChatIntent(
+            action=str(data.get("action") or "answer"),
+            scope=str(data.get("scope") or "unspecified"),
+            subject=str(data.get("subject") or ""),
+            goal=str(data.get("goal") or message),
+            wants_research=bool(data.get("wants_research", False)),
+            wants_write=bool(data.get("wants_write", False)),
+            continuation=bool(data.get("continuation", False)),
+            starts_new_work=bool(data.get("starts_new_work", False)),
+            requested_count=data.get("requested_count"),
+            target_keys=data.get("target_keys") if isinstance(data.get("target_keys"), list) else [],
+            confidence=float(data.get("confidence") or 0),
+        ).normalized()
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed for mutations but keep ordinary conversation available.
+        logger.warning("travel_chat intent classification failed error=%s", str(exc)[:300])
+        return ChatIntent(action="answer", goal=message, confidence=0.0)
+
+
+def _inherit_active_intent(intent: ChatIntent, work: TravelChatWork | None) -> ChatIntent:
+    if work is None or not intent.continuation:
+        return intent
+    state = _work_state(work)
+    intent.subject = intent.subject or work.subject
+    intent.goal = intent.goal or work.goal
+    intent.wants_research = intent.wants_research or bool(state.get("wants_research"))
+    intent.wants_write = intent.wants_write or bool(state.get("wants_write"))
+    if intent.action in {"answer", "continue"}:
+        if intent.wants_research and intent.wants_write:
+            intent.action = "research_and_write"
+        elif intent.wants_write:
+            intent.action = "write"
+        elif intent.wants_research:
+            intent.action = "research"
+    if intent.scope == "unspecified":
+        intent.scope = work.scope
+    if intent.requested_count is None:
+        intent.requested_count = work.requested_count
+    return intent.normalized()
+
+
+def _ensure_chat_work(
+    db: Session,
+    *,
+    user_id: int,
+    city_id: int,
+    intent: ChatIntent,
+    active_work: TravelChatWork | None,
+) -> TravelChatWork | None:
+    needs_work = intent.wants_research or intent.wants_write or intent.continuation
+    if not needs_work:
+        # An unrelated informational turn may happen while durable work is
+        # still open. Keep that ledger untouched so the user can resume it
+        # later instead of letting this answer overwrite its phase/candidates.
+        return None
+    if active_work is not None and intent.starts_new_work and not intent.continuation:
+        active_work.status = "superseded"
+        active_work = None
+    if active_work is None:
+        active_work = TravelChatWork(
+            user_id=user_id,
+            city_id=city_id,
+            status="active",
+            action=intent.action,
+            scope=intent.scope,
+            subject=intent.subject,
+            goal=intent.goal,
+            requested_count=intent.requested_count,
+            state=json.dumps({
+                "version": 1,
+                "phase": "understand",
+                "next_action": "research" if intent.wants_research else "write",
+                "wants_research": intent.wants_research,
+                "wants_write": intent.wants_write,
+                "candidates": [],
+                "completed_keys": [],
+                "failed": [],
+            }, ensure_ascii=False),
+        )
+        db.add(active_work)
+        db.flush()
+    else:
+        state = _work_state(active_work)
+        state["wants_research"] = bool(state.get("wants_research")) or intent.wants_research
+        state["wants_write"] = bool(state.get("wants_write")) or intent.wants_write
+        state["next_action"] = "write" if intent.wants_write else state.get("next_action", "research")
+        active_work.action = intent.action if intent.action != "continue" else active_work.action
+        active_work.scope = intent.scope if intent.scope != "unspecified" else active_work.scope
+        active_work.subject = intent.subject or active_work.subject
+        active_work.goal = intent.goal or active_work.goal
+        active_work.requested_count = intent.requested_count or active_work.requested_count
+        active_work.state = json.dumps(state, ensure_ascii=False, default=str)
+    db.commit()
+    db.refresh(active_work)
+    return active_work
+
+
+def _resolve_context_message(
+    message: str,
+    rows: list[TravelChatMessage],
+    *,
+    intent: ChatIntent,
+    work: TravelChatWork | None,
+) -> str:
+    """Resolve semantic continuations against durable structured work."""
+    if not intent.continuation:
         return message
-    candidate = _latest_chat_candidate(rows)
-    if candidate:
+    summary = _work_summary(work)
+    if summary:
         return (
-            "이전 도구 조사에서 구조화해 보존한 장소 후보: "
-            + json.dumps(candidate, ensure_ascii=False, default=str)
+            "이어갈 활성 작업: "
+            + json.dumps(summary, ensure_ascii=False, default=str)
             + f"\n현재 후속 지시: {message}"
         )
     previous = _recent_user_requests(rows, limit=8)
-    for content in reversed(previous):
-        if (
-            not SHORT_FOLLOWUP_RE.search(content)
-            and not _is_contextual_write_followup(content)
-            and not FAILURE_QUESTION_RE.search(content)
-            and not META_FOLLOWUP_RE.search(content)
-        ):
-            return f"이전 사용자 요청: {content}\n현재 후속 지시: {message}"
-    return message
+    return (
+        "활성 작업 원장은 없지만 다음 사용자 요청 흐름을 이어가야 한다: "
+        + json.dumps(previous, ensure_ascii=False)
+        + f"\n현재 후속 지시: {message}"
+    )
 
 
 def _json_list(value: Any) -> list[Any]:
@@ -176,6 +405,122 @@ def _latest_chat_candidate(rows: list[TravelChatMessage]) -> dict[str, Any] | No
     return None
 
 
+def _latest_chat_candidates(
+    rows: list[TravelChatMessage],
+    *,
+    subject: str = "",
+) -> list[dict[str, Any]]:
+    """Recover pre-ledger candidates for a semantic continuation.
+
+    This is only a compatibility bridge for conversations created before
+    ``TravelChatWork`` existed. Empty failure/clarification answers may sit
+    between the user's continuation and the last useful candidate list, so we
+    inspect a small recent window and use the classified subject to avoid
+    reviving an unrelated older task.
+    """
+    subject_categories = {
+        "food": {"restaurant"},
+        "drink": {"restaurant", "shopping", "other"},
+        "spa": {"other"},
+        "lodging": {"hotel"},
+        "tourism": {"attraction"},
+        "transport": {"transport"},
+        "shopping": {"shopping"},
+    }
+    expected = subject_categories.get(str(subject or "").strip().lower())
+    for row in reversed(rows[-16:]):
+        if getattr(row, "role", "") != "assistant":
+            continue
+        candidates = [
+            dict(item) for item in _json_list(getattr(row, "candidates", "[]"))
+            if isinstance(item, dict) and str(item.get("title") or "").strip()
+            and str(item.get("status") or "") not in {"mapped", "dismissed", "approved"}
+        ]
+        if expected:
+            candidates = [
+                item for item in candidates
+                if str(item.get("category") or "").strip().lower() in expected
+            ]
+        if candidates:
+            return candidates
+    return []
+
+
+def _work_candidates(work: TravelChatWork | None) -> list[dict[str, Any]]:
+    return [
+        dict(item)
+        for item in _work_state(work).get("candidates", [])
+        if isinstance(item, dict) and str(item.get("title") or "").strip()
+    ]
+
+
+def _pending_work_candidates(
+    work: TravelChatWork | None,
+    *,
+    target_keys: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    selected = set(target_keys or [])
+    terminal = {"proposed", "mapped", "dismissed", "approved", "duplicate"}
+    return [
+        item for item in _work_candidates(work)
+        if str(item.get("status") or "") not in terminal
+        and (not selected or str(item.get("key") or "") in selected)
+    ]
+
+
+def _merge_work_candidates(
+    work: TravelChatWork | None,
+    candidates: list[dict[str, Any]],
+    *,
+    proposal_ids: list[int] | None = None,
+    proposal_titles: list[str] | None = None,
+    phase: str = "research",
+    next_action: str = "research",
+    failures: list[dict[str, Any]] | None = None,
+) -> None:
+    if work is None:
+        return
+    state = _work_state(work)
+    existing = {
+        str(item.get("key") or _compact_candidate_text(str(item.get("title") or ""))): dict(item)
+        for item in state.get("candidates", [])
+        if isinstance(item, dict)
+    }
+    for raw in candidates:
+        if not isinstance(raw, dict) or not str(raw.get("title") or "").strip():
+            continue
+        item = dict(raw)
+        key = str(item.get("key") or _compact_candidate_text(str(item.get("title") or "")))
+        item["key"] = key
+        previous = existing.get(key, {})
+        merged = {**previous, **{field: value for field, value in item.items() if value not in (None, "", [])}}
+        merged["source_urls"] = list(dict.fromkeys([
+            *(previous.get("source_urls") or []),
+            *(item.get("source_urls") or []),
+        ]))[:8]
+        existing[key] = merged
+    completed = set(str(item) for item in state.get("completed_keys", []))
+    titles = [str(item) for item in (proposal_titles or [])]
+    proposal_values = list(dict.fromkeys(int(item) for item in (proposal_ids or [])))
+    for key, item in existing.items():
+        title_key = _compact_candidate_text(str(item.get("title") or ""))
+        if any(
+            title_key in _compact_candidate_text(title) or _compact_candidate_text(title) in title_key
+            for title in titles
+        ):
+            item["status"] = "proposed"
+            if proposal_values:
+                item["proposal_id"] = proposal_values[min(len(completed), len(proposal_values) - 1)]
+            completed.add(key)
+    state["candidates"] = list(existing.values())[:30]
+    state["completed_keys"] = sorted(completed)
+    state["phase"] = phase
+    state["next_action"] = next_action
+    if failures:
+        state["failed"] = [*list(state.get("failed") or []), *failures][-30:]
+    work.state = json.dumps(state, ensure_ascii=False, default=str)
+
+
 def _candidate_seed_query(city: City, candidate: dict[str, Any]) -> str:
     parts = [city.name_local, str(candidate.get("title") or "").strip()]
     address = str(candidate.get("address") or "").strip()
@@ -187,6 +532,25 @@ def _candidate_seed_query(city: City, candidate: dict[str, Any]) -> str:
 
 def _compact_candidate_text(value: str) -> str:
     return re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", (value or "").casefold())
+
+
+def _entity_text_matches(left: str, right: str) -> bool:
+    """Require a meaningful shared entity/address fragment, not merely the city name."""
+    a = _compact_candidate_text(left)
+    b = _compact_candidate_text(right)
+    for generic in ("辽宁省", "沈阳市", "沈阳", "中国", "地址", "추천", "장소"):
+        token = _compact_candidate_text(generic)
+        a = a.replace(token, "")
+        b = b.replace(token, "")
+    if not a or not b:
+        return False
+    if min(len(a), len(b)) >= 3 and (a in b or b in a):
+        return True
+    max_size = min(len(a), len(b), 20)
+    for size in range(max_size, 2, -1):
+        if any(a[start:start + size] in b for start in range(len(a) - size + 1)):
+            return True
+    return False
 
 
 def _candidate_title_from_page(value: str) -> str:
@@ -334,7 +698,7 @@ def _extract_grounded_candidates(
             ]))[:8]
         candidates = [matching]
 
-    for candidate in candidates[:4]:
+    for candidate in candidates[:12]:
         title = str(candidate.get("title") or "")
         address = str(candidate.get("address") or "")
         title_key = _compact_candidate_text(title)
@@ -372,7 +736,7 @@ def _extract_grounded_candidates(
         candidate["status"] = "located" if candidate.get("lat") is not None else "location_needed"
         candidate["confidence"] = round(float(candidate.get("confidence") or 0.55), 3)
     candidates.sort(key=lambda row: (-float(row.get("confidence") or 0), str(row.get("title") or "")))
-    return candidates[:4]
+    return candidates[:12]
 
 
 def _supporting_sources(answer: str, tool_results: list[dict[str, Any]]) -> list[str]:
@@ -410,7 +774,7 @@ def _compact_tool_trace(tool_results: list[dict[str, Any]]) -> list[dict[str, An
         urls: list[str] = []
         _collect_sources(result_dict, set_urls := set())
         urls.extend(sorted(set_urls)[:5])
-        trace.append({
+        trace_item: dict[str, Any] = {
             "sequence": sequence,
             "tool": str(item.get("name") or "")[:80],
             "args": item.get("args") if isinstance(item.get("args"), dict) else {},
@@ -420,7 +784,25 @@ def _compact_tool_trace(tool_results: list[dict[str, Any]]) -> list[dict[str, An
             "error": str(result_dict.get("error") or result_dict.get("detail") or "")[:300],
             "result_count": len(result_dict.get("results") or []),
             "urls": urls,
-        })
+        }
+        if item.get("name") == "semantic_intent":
+            trace_item["decision"] = result_dict.get("intent")
+            trace_item["work_id"] = result_dict.get("work_id")
+        elif item.get("name") == "geocode_place":
+            trace_item["matches"] = [
+                {
+                    "display_name": str(hit.get("display_name") or "")[:200],
+                    "lat": hit.get("lat"),
+                    "lng": hit.get("lng"),
+                    "source": hit.get("source"),
+                    "confidence": hit.get("confidence"),
+                    "storage_allowed": hit.get("storage_allowed"),
+                    "matched_query": hit.get("matched_query"),
+                }
+                for hit in (result_dict.get("results") or [])[:5]
+                if isinstance(hit, dict)
+            ]
+        trace.append(trace_item)
     return trace[-40:]
 
 
@@ -504,7 +886,7 @@ def _research_seed_query(city: City, message: str) -> str:
     return query if city.name_local in query else f"{city.name_local} {query}"
 
 
-def _research_seed_queries(city: City, message: str) -> list[str]:
+def _research_seed_queries(city: City, message: str, *, subject: str = "") -> list[str]:
     """Prefer short Chinese brand queries; long Korean action sentences produce noisy results."""
     queries: list[str] = []
     folded = message.casefold()
@@ -515,7 +897,7 @@ def _research_seed_queries(city: City, message: str) -> list[str]:
     if not queries and any(term in folded for term in ("마사지", "스파", "按摩", "spa", "足疗", "洗浴")):
         area = " 中街" if any(term in folded for term in ("중제", "中街")) else ""
         queries.append(f"{city.name_local}{area} 正规 洗浴 按摩 推荐")
-    if not queries and FOOD_DISCOVERY_RE.search(message):
+    if not queries and subject == "food":
         queries.extend([
             f"{city.name_local} 必吃 特色美食 传统小吃",
             f"{city.name_local} 老字号 特色餐厅 推荐",
@@ -656,13 +1038,50 @@ def answer_travel_chat(
         .all()
     )
     prior.reverse()
-    contextual_followup = bool(
-        SHORT_FOLLOWUP_RE.search(message.strip()) or _is_contextual_write_followup(message)
+
+    from groq import Groq
+
+    client = Groq(api_key=settings.groq_api_key)
+    model = settings.groq_chat_model or settings.groq_model or "openai/gpt-oss-20b"
+    active_work = _active_chat_work(db, user_id=user_id, city_id=city_id)
+    intent = _classify_chat_intent(
+        client,
+        model=model,
+        message=message,
+        recent_requests=_recent_user_requests(prior, limit=10),
+        active_work=active_work,
     )
-    locked_candidate = _latest_chat_candidate(prior) if contextual_followup else None
-    resolved_message = _resolve_context_message(message, prior)
-    write_intent, allowed = _chat_capabilities(message, context_message=resolved_message)
-    food_discovery = bool(FOOD_DISCOVERY_RE.search(resolved_message))
+    intent = _inherit_active_intent(intent, active_work)
+    active_work = _ensure_chat_work(
+        db,
+        user_id=user_id,
+        city_id=city_id,
+        intent=intent,
+        active_work=active_work,
+    )
+    if active_work is not None and intent.continuation and not _work_candidates(active_work):
+        _merge_work_candidates(
+            active_work,
+            _latest_chat_candidates(prior, subject=intent.subject),
+            phase="research",
+            next_action="write" if intent.wants_write else "research",
+        )
+        db.commit()
+        db.refresh(active_work)
+    resolved_message = _resolve_context_message(
+        message,
+        prior,
+        intent=intent,
+        work=active_work,
+    )
+    write_intent, allowed = _chat_capabilities(intent)
+    pending_work = (
+        _pending_work_candidates(active_work, target_keys=intent.target_keys)
+        if intent.continuation or intent.wants_write
+        else []
+    )
+    locked_candidate = pending_work[0] if len(pending_work) == 1 else None
+    food_discovery = intent.subject == "food"
     brand_targets = _brand_targets(resolved_message)
     travel_profile = build_user_travel_profile(db, user_id=user_id, city_id=city_id)
     existing_target_places: dict[str, Marker] = {}
@@ -694,7 +1113,7 @@ def answer_travel_chat(
 - 현재 지도의 편중 이유를 물으면 도시 정책을 지어내지 말고, 기존 자동 연구가 역사 명소와 박물관 건수에 높은 성과를 주었던 수집 편향이 원인이라고 솔직히 설명한다.
 - 지도에 음식 장소가 없으면 임의의 식당이나 메뉴를 일정에 넣지 말고 `현재 지도에 음식 데이터가 비어 있다`고 말한 뒤 조사/추가를 제안한다.
 - 사용자가 명시적으로 지도 저장/추가를 요청한 경우에만 propose_place 또는 upsert_place_insights를 사용한다. 신규 장소는 곧바로 공개하지 않고 승인 제안으로 저장한다.
-- 웹 조사가 필요한 질문은 중국어 원명 검색을 포함하되 검색어를 2~4개 핵심 후보로 좁힌다. 같은 검색을 반복하지 말고, 일반 조사는 3번·저장 요청은 최대 5번의 도구 왕복 안에 조사·좌표 확인·저장 제안을 마친 뒤 반드시 답한다.
+- 웹 조사가 필요한 질문은 중국어 원명 검색을 포함하되 검색어를 2~4개 핵심 후보로 좁힌다. 같은 검색을 반복하지 말고, 일반 조사는 3번·저장 요청은 최대 8번의 도구 왕복 안에 조사·좌표 확인·저장 제안을 마친 뒤 반드시 답한다.
 - 단순 추천·동선·설명 질문에는 웹 도구가 제공되지 않을 수 있다. 그 경우 현재 지도 DB와 일정만으로 바로 답한다.
 - 근거가 부족하면 모른다고 말하고 확인 방법을 제시한다. 도구의 내부 JSON은 노출하지 않는다.
 
@@ -702,6 +1121,8 @@ def answer_travel_chat(
 현재 도시 공용 일정표: {_plan_context(db, user_id=user_id, city_id=city_id)}
 현재 사용자 여행 행동 프로필: {profile_prompt_context(travel_profile)}
 현재 선택 장소 ID: {selected_place_id or '없음'}
+현재 요청의 구조화된 의미: {json.dumps(asdict(intent), ensure_ascii=False, default=str)}
+현재 이어가는 작업 원장: {json.dumps(_work_summary(active_work) if intent.continuation else None, ensure_ascii=False, default=str)}
 """
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     # Prior assistant text may itself be hallucinated. Preserve user intent, never assistant claims.
@@ -719,7 +1140,7 @@ def answer_travel_chat(
         "role": "system",
         "content": "이전 대화의 assistant 문장도 근거가 아니다. 현재 DB나 이번 도구 결과로 확인되지 않은 수치·교통·정책 설명은 반복하지 말고 바로잡아라.",
     })
-    if resolved_message != message:
+    if intent.continuation:
         messages.append({
             "role": "system",
             "content": (
@@ -727,38 +1148,62 @@ def answer_travel_chat(
                 "현재 지시를 새 질문처럼 버리지 말고 실제 행동까지 이어가라:\n" + resolved_message
             ),
         })
-    if locked_candidate:
+    if pending_work:
         messages.append({
             "role": "system",
             "content": (
-                "이번 후속 명령의 대상은 아래 구조화 후보로 고정되어 있다. 다른 업소나 비슷한 상호로 "
-                "대체하지 마라. 이름·주소·출처를 유지한 채 같은 후보의 좌표와 상세 근거만 보강하고, "
-                "저장 요청이면 이 후보만 propose_place로 처리하라:\n"
-                + json.dumps(locked_candidate, ensure_ascii=False, default=str)
+                "이번 후속 명령이 이어갈 미완료 후보 목록이다. 다른 업소나 비슷한 상호로 대체하지 마라. "
+                "scope가 remaining/all이면 한 곳 처리 후 끝내지 말고 이 목록의 검증 가능한 후보를 모두 처리하라. "
+                "이름·주소·출처와 key를 유지하고, 저장 요청이면 각 후보를 propose_place로 처리하라:\n"
+                + json.dumps(pending_work, ensure_ascii=False, default=str)
             ),
         })
     messages.append({"role": "user", "content": message})
-
-    from groq import Groq
-
-    client = Groq(api_key=settings.groq_api_key)
-    model = settings.groq_chat_model or settings.groq_model or "openai/gpt-oss-20b"
     sources: set[str] = set()
     final_text = ""
     seen_tool_calls: set[str] = set()
-    tool_results: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = [{
+        "name": "semantic_intent",
+        "args": {"message": message},
+        "result": {
+            "ok": True,
+            "intent": asdict(intent),
+            "work_id": active_work.id if active_work else None,
+        },
+    }]
     proposal_ids: list[int] = []
     proposal_titles: list[str] = []
+    existing_write_place_ids: list[int] = []
     write_attempted = False
     write_succeeded = bool(existing_target_places)
+    successful_write_count = len(existing_target_places)
+    successful_candidate_keys: set[str] = set()
     successful_write_targets: set[str] = set(existing_target_places)
     actionable_targets: set[str] = set()
     verified_coordinates: list[tuple[float, float]] = []
+    verified_coordinate_records: list[dict[str, Any]] = []
     target_business_sources: dict[str, list[str]] = {}
     fetched_food_urls: set[str] = set()
+    fetched_source_urls: set[str] = set()
     food_detail_queries: set[str] = set()
     food_business_names: list[str] = []
     food_geo_candidates: list[dict[str, Any]] = []
+    for item in pending_work:
+        try:
+            lat, lng = float(item["lat"]), float(item["lng"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        verified_coordinates.append((lat, lng))
+        verified_coordinate_records.append({
+            "lat": lat,
+            "lng": lng,
+            "query": " ".join(filter(None, [
+                str(item.get("title") or ""),
+                str(item.get("address") or ""),
+            ])),
+            "display_name": str(item.get("title") or ""),
+            "confidence": float(item.get("confidence") or 0.5),
+        })
 
     def add_food_geo_candidate(query: str, results: list[dict[str, Any]]) -> None:
         if not results:
@@ -808,6 +1253,13 @@ def answer_travel_chat(
             except (KeyError, TypeError, ValueError):
                 continue
             verified_coordinates.append(point)
+            verified_coordinate_records.append({
+                "lat": point[0],
+                "lng": point[1],
+                "query": query,
+                "display_name": str(coordinate.get("display_name") or fetch_result.get("title") or query),
+                "confidence": float(coordinate.get("confidence") or 0.5),
+            })
             grounded.append({
                 "display_name": str(fetch_result.get("title") or query)[:300],
                 **coordinate,
@@ -844,6 +1296,10 @@ def answer_travel_chat(
             fetched_food_urls.add(url)
             fetch_args = {"url": url}
             fetch_result = run_tool(db, "fetch_page", fetch_args, city_id=city_id)
+            if isinstance(fetch_result, dict) and (
+                fetch_result.get("text") or fetch_result.get("coordinate_candidates")
+            ):
+                fetched_source_urls.add(url)
             seen_tool_calls.add(
                 f"fetch_page:{json.dumps(fetch_args, ensure_ascii=False, sort_keys=True, default=str)}"
             )
@@ -870,6 +1326,10 @@ def answer_travel_chat(
             fetched_food_urls.add(url)
             fetch_args = {"url": url}
             fetch_result = run_tool(db, "fetch_page", fetch_args, city_id=city_id)
+            if isinstance(fetch_result, dict) and (
+                fetch_result.get("text") or fetch_result.get("coordinate_candidates")
+            ):
+                fetched_source_urls.add(url)
             seen_tool_calls.add(
                 f"fetch_page:{json.dumps(fetch_args, ensure_ascii=False, sort_keys=True, default=str)}"
             )
@@ -879,11 +1339,16 @@ def answer_travel_chat(
             food_bootstrap_pages.append({"url": url, "page": fetch_result})
 
     def writes_complete() -> bool:
-        if food_discovery and write_intent and not brand_targets:
-            return len(set(proposal_ids)) >= 2
-        return write_succeeded and (
-            not brand_targets or set(brand_targets).issubset(successful_write_targets)
-        )
+        if not write_intent:
+            return True
+        if brand_targets:
+            return set(brand_targets).issubset(successful_write_targets)
+        if pending_work:
+            return {
+                str(item.get("key") or "") for item in pending_work if item.get("key")
+            }.issubset(successful_candidate_keys)
+        target_count = intent.requested_count or (2 if food_discovery else 1)
+        return successful_write_count >= target_count
 
     def complete(
         *,
@@ -934,11 +1399,15 @@ def answer_travel_chat(
 
     seed_results: list[dict[str, Any]] = []
     if allowed:
-        seed_queries = (
-            [_candidate_seed_query(city, locked_candidate)]
-            if locked_candidate
-            else _research_seed_queries(city, resolved_message)
-        )
+        if pending_work:
+            seed_queries = [_candidate_seed_query(city, item) for item in pending_work[:6]]
+        elif food_discovery:
+            seed_queries = [
+                f"{city.name_local} 必吃 特色美食 传统小吃",
+                f"{city.name_local} 老字号 特色餐厅 推荐",
+            ]
+        else:
+            seed_queries = _research_seed_queries(city, resolved_message)
         for seed_query in seed_queries:
             seed_args = {"query": seed_query, "max_results": 8}
             seed_result = run_tool(db, "web_search", seed_args, city_id=city_id)
@@ -1010,6 +1479,10 @@ def answer_travel_chat(
                     if not url.startswith(("http://", "https://")):
                         continue
                     fetch_result = run_tool(db, "fetch_page", {"url": url}, city_id=city_id)
+                    if isinstance(fetch_result, dict) and (
+                        fetch_result.get("text") or fetch_result.get("coordinate_candidates")
+                    ):
+                        fetched_source_urls.add(url)
                     _collect_tool_sources("fetch_page", fetch_result, sources)
                     tool_results.append({"name": "fetch_page", "args": {"url": url}, "result": fetch_result})
                     fetched.append(fetch_result)
@@ -1038,9 +1511,17 @@ def answer_travel_chat(
                 for hit in geo_hits:
                     if isinstance(hit, dict) and hit.get("storage_allowed") is not False:
                         try:
-                            verified_coordinates.append((float(hit["lat"]), float(hit["lng"])))
+                            point = (float(hit["lat"]), float(hit["lng"]))
                         except (KeyError, TypeError, ValueError):
                             continue
+                        verified_coordinates.append(point)
+                        verified_coordinate_records.append({
+                            "lat": point[0],
+                            "lng": point[1],
+                            "query": geo_query,
+                            "display_name": str(hit.get("display_name") or ""),
+                            "confidence": float(hit.get("confidence") or 0.5),
+                        })
                 if target_business_sources[target] and geo_hits:
                     actionable_targets.add(target)
                 enrichment.append({
@@ -1091,6 +1572,40 @@ def answer_travel_chat(
                     "도구가 오류를 반환하면 내용을 고쳐 다음 호출에서 재시도하라."
                 ),
             })
+        elif pending_work and write_intent:
+            remaining = [
+                item for item in pending_work
+                if str(item.get("key") or "") not in successful_candidate_keys
+            ]
+            ready = [
+                item for item in remaining
+                if item.get("lat") is not None and item.get("lng") is not None
+                and item.get("source_urls")
+            ]
+            if ready:
+                round_tools = set(allowed)
+                round_choice = {"type": "function", "function": {"name": "propose_place"}}
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "활성 작업의 아래 후보는 출처와 좌표가 준비됐다. 검색을 반복하지 말고 이번 호출에서 "
+                        "propose_place를 사용해 승인 대기에 저장하라. 한 응답에서 최대 4개 도구를 병렬 호출할 수 "
+                        "있으므로 remaining/all 요청은 하나씩 끊지 말고 처리한다. 후보 key와 대상을 바꾸지 마라:\n"
+                        + json.dumps(ready[:4], ensure_ascii=False, default=str)
+                    ),
+                })
+            else:
+                round_tools = set(allowed)
+                round_choice = "required" if force_required else "auto"
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "활성 작업의 미완료 후보를 이어서 처리하라. 각 후보의 기존 출처를 열고 정확한 주소와 "
+                        "좌표를 확인한 뒤 propose_place까지 진행한다. 새로운 주제로 바꾸거나 이미 완료한 후보를 "
+                        "다시 조사하지 마라. 미완료 후보:\n"
+                        + json.dumps(remaining[:8], ensure_ascii=False, default=str)
+                    ),
+                })
         elif (
             food_discovery
             and write_intent
@@ -1208,20 +1723,27 @@ def answer_travel_chat(
                 result = {"error": "이 대화에서 허용되지 않은 작업입니다"}
             else:
                 unsupported_evidence: list[str] = []
+                unread_fact_sources: list[str] = []
                 missing_business_evidence = False
                 coordinate_mismatch = False
+                coordinate_target_unmatched = False
                 if name == "propose_place":
-                    if locked_candidate:
+                    if pending_work:
                         proposed_key = _compact_candidate_text(str(args.get("title") or ""))
-                        locked_key = _compact_candidate_text(str(locked_candidate.get("title") or ""))
-                        if not proposed_key or not locked_key or (
-                            proposed_key not in locked_key and locked_key not in proposed_key
-                        ):
+                        matching_work_target = next((
+                            item for item in pending_work
+                            if proposed_key and _compact_candidate_text(str(item.get("title") or ""))
+                            and (
+                                proposed_key in _compact_candidate_text(str(item.get("title") or ""))
+                                or _compact_candidate_text(str(item.get("title") or "")) in proposed_key
+                            )
+                        ), None)
+                        if matching_work_target is None:
                             result = {
                                 "error": "candidate_target_changed",
                                 "detail": (
-                                    "후속 명령은 보존된 장소 후보에 고정되어 있습니다. 다른 업소로 바꾸지 말고 "
-                                    f"{locked_candidate.get('title')}만 제안하세요."
+                                    "후속 명령은 작업 원장에 보존된 후보에 고정되어 있습니다. 다른 업소로 "
+                                    "바꾸지 말고 미완료 후보만 제안하세요."
                                 ),
                             }
                             tool_results.append({"name": name, "args": args, "result": result})
@@ -1262,19 +1784,40 @@ def answer_travel_chat(
                     unsupported_evidence = [
                         url for url in supplied_urls if url and url not in sources
                     ]
+                    unread_fact_sources = [
+                        str(item.get("source_url") or "")
+                        for item in (args.get("insights") or [])
+                        if isinstance(item, dict)
+                        and str(item.get("source_url") or "")
+                        and str(item.get("source_url") or "") not in fetched_source_urls
+                    ]
                     missing_business_evidence = bool(proposed_targets) and not any(
                         url in target_business_sources.get(target, [])
                         for target in proposed_targets
                         for url in supplied_urls
                     )
-                    if verified_coordinates:
+                    target_text = " ".join(filter(None, [
+                        str(args.get("title") or ""),
+                        str(args.get("description") or ""),
+                        str(args.get("coordinate_query") or ""),
+                    ]))
+                    relevant_coordinates = [
+                        item for item in verified_coordinate_records
+                        if _entity_text_matches(
+                            target_text,
+                            f"{item.get('query', '')} {item.get('display_name', '')}",
+                        )
+                    ]
+                    if not relevant_coordinates:
+                        coordinate_target_unmatched = True
+                    else:
                         try:
                             proposed_lat = float(args["lat"])
                             proposed_lng = float(args["lng"])
                             coordinate_mismatch = min(
-                                ((proposed_lat - lat) * 111_000) ** 2
-                                + ((proposed_lng - lng) * 85_000) ** 2
-                                for lat, lng in verified_coordinates
+                                ((proposed_lat - float(item["lat"])) * 111_000) ** 2
+                                + ((proposed_lng - float(item["lng"])) * 85_000) ** 2
+                                for item in relevant_coordinates
                             ) ** 0.5 > 1_500
                         except (KeyError, TypeError, ValueError):
                             coordinate_mismatch = True
@@ -1284,12 +1827,29 @@ def answer_travel_chat(
                         "detail": "검색·페이지·지오코딩 결과에 실제로 있던 URL만 사용해 다시 호출하세요.",
                         "unsupported": unsupported_evidence[:6],
                     }
+                elif unread_fact_sources:
+                    result = {
+                        "error": "fact_source_not_fetched",
+                        "detail": (
+                            "장소의 위치·영업·메뉴·팁 사실을 저장하기 전에 해당 source_url 본문을 "
+                            "fetch_page로 읽어야 합니다. 검색 결과 제목만 근거로 저장할 수 없습니다."
+                        ),
+                        "unread": list(dict.fromkeys(unread_fact_sources))[:6],
+                    }
                 elif missing_business_evidence:
                     result = {
                         "error": "business_evidence_required",
                         "detail": (
                             "source_urls에 이 대상의 search_results에서 받은 영업점 근거 URL을 "
                             "1개 이상 넣으세요. OpenStreetMap만으로는 매장 존재를 입증할 수 없습니다."
+                        ),
+                    }
+                elif coordinate_target_unmatched:
+                    result = {
+                        "error": "coordinate_target_not_verified",
+                        "detail": (
+                            "제안 대상의 상호나 주소와 일치하는 지오코딩 결과가 없습니다. 다른 후보의 좌표나 "
+                            "도시 중심 좌표를 재사용하지 말고, 정확한 상호·주소로 geocode_place를 실행하세요."
                         ),
                     }
                 elif coordinate_mismatch:
@@ -1306,6 +1866,10 @@ def answer_travel_chat(
             _collect_tool_sources(name, result, sources)
             tool_results.append({"name": name, "args": args, "result": result})
             if name == "fetch_page":
+                if isinstance(result, dict) and (
+                    result.get("text") or result.get("coordinate_candidates")
+                ):
+                    fetched_source_urls.add(str(args.get("url") or ""))
                 register_page_coordinates(result, query=str(args.get("url") or ""))
             if name == "geocode_place" and isinstance(result, dict):
                 grounded_hits: list[dict[str, Any]] = []
@@ -1317,6 +1881,13 @@ def answer_travel_chat(
                     except (KeyError, TypeError, ValueError):
                         continue
                     verified_coordinates.append(coordinate)
+                    verified_coordinate_records.append({
+                        "lat": coordinate[0],
+                        "lng": coordinate[1],
+                        "query": str(args.get("query") or ""),
+                        "display_name": str(hit.get("display_name") or ""),
+                        "confidence": float(hit.get("confidence") or 0.5),
+                    })
                     grounded_hits.append(hit)
                 if grounded_hits:
                     add_food_geo_candidate(str(args.get("query") or ""), grounded_hits)
@@ -1352,6 +1923,7 @@ def answer_travel_chat(
                         }
             if name in WRITE_TOOLS and isinstance(result, dict) and result.get("ok"):
                 write_succeeded = True
+                successful_write_count += 1
                 serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
                 for target in brand_targets:
                     if any(
@@ -1361,9 +1933,18 @@ def answer_travel_chat(
                         successful_write_targets.add(target)
                 if result.get("proposal_id") is not None:
                     proposal_ids.append(int(result["proposal_id"]))
-                    proposal_title = str(args.get("title") or "").strip()
-                    if proposal_title and proposal_title not in proposal_titles:
-                        proposal_titles.append(proposal_title)
+                if result.get("existing_place_id") is not None:
+                    existing_write_place_ids.append(int(result["existing_place_id"]))
+                proposal_title = str(args.get("title") or "").strip()
+                if proposal_title and proposal_title not in proposal_titles:
+                    proposal_titles.append(proposal_title)
+                proposed_title_key = _compact_candidate_text(str(args.get("title") or ""))
+                for item in pending_work:
+                    item_title_key = _compact_candidate_text(str(item.get("title") or ""))
+                    if proposed_title_key and item_title_key and (
+                        proposed_title_key in item_title_key or item_title_key in proposed_title_key
+                    ):
+                        successful_candidate_keys.add(str(item.get("key") or ""))
             logger.info(
                 "travel_chat tool user=%s city=%s round=%s tool=%s ok=%s error=%s",
                 user_id,
@@ -1380,57 +1961,59 @@ def answer_travel_chat(
                     "content": json.dumps(result, ensure_ascii=False, default=str)[:7000],
                 }
             )
-        if writes_complete():
+        if write_intent and writes_complete():
             break
 
     if not final_text:
-        action_state = ""
-        if write_intent and writes_complete():
-            action_state = (
-                f" 실제 저장 상태: 관리자 승인 대기 제안 {sorted(set(proposal_ids)) or '생성 완료'}가 DB에 생성되었다. "
-                "반드시 완료 사실과 승인 대기임을 구분해 말하라."
-            )
-        elif write_intent:
+        if write_intent:
             errors = [
                 str(item["result"].get("error") or item["result"].get("detail") or "")[:180]
                 for item in tool_results
                 if isinstance(item.get("result"), dict)
                 and (item["result"].get("error") or item["result"].get("detail"))
             ]
-            action_state = (
-                " 실제 저장 상태: 성공한 저장 도구가 0건이다. 저장했다고 말하지 마라. "
-                f"확인된 실패 이유: {errors[-4:] or ['모델이 저장 도구를 끝까지 실행하지 않음']}"
-            )
-        messages.append({
-            "role": "system",
-            "content": (
-                "도구 조사를 종료한다. 이제 도구를 절대 호출하지 말고 일반 텍스트로만 답하라. "
-                "현재 DB와 도구 결과만으로 최종 답을 작성하라. 검색 결과에 없던 URL·주소·좌표·"
-                "영업시간을 만들지 말고, 핵심 조사 대상을 각각 언급한다. 내부 과정 대신 사용자에게 필요한 결론을 준다."
-                + action_state
-            ),
-        })
-        if food_discovery and write_intent and not writes_complete():
-            saved_count = len(set(proposal_ids))
-            final_fallback = (
-                "선양의 대표 음식 유형과 식당 후보를 조사했지만, 정확한 지점 근거와 좌표를 모두 검증해 "
-                f"저장한 후보는 {saved_count}건입니다. 최소 2건의 승인 대기 제안을 만들지 못했으므로 완료로 처리하지 않았습니다."
-            )
-        elif food_discovery and not write_intent:
-            final_fallback = "선양의 대표 음식과 식당 후보를 조사했지만, 확인된 결과를 안전하게 요약하는 마지막 단계가 실패했습니다."
+            if writes_complete():
+                pieces: list[str] = []
+                if proposal_ids:
+                    pieces.append(
+                        f"관리자 승인 대기 제안 #{', #'.join(map(str, sorted(set(proposal_ids))))}"
+                    )
+                if existing_write_place_ids:
+                    pieces.append(
+                        "이미 등록된 장소 #" + ", #".join(map(str, sorted(set(existing_write_place_ids))))
+                    )
+                result_text = "과 ".join(pieces) or f"확인된 저장 {successful_write_count}건"
+                final_text = f"요청한 대상을 처리했습니다. {result_text}으로 확인됐습니다."
+            else:
+                expected = (
+                    len(pending_work)
+                    or intent.requested_count
+                    or len(brand_targets)
+                    or (2 if food_discovery else 1)
+                )
+                final_text = (
+                    f"요청한 작업은 아직 완료되지 않았습니다. 목표 {expected}건 중 "
+                    f"저장 확인 {successful_write_count}건이며, 작업 원장에 남겨 다음 대화에서 이어갑니다. "
+                    f"마지막 차단 원인: {(errors[-1] if errors else '검증 가능한 좌표·출처를 갖춘 저장 호출이 완료되지 않음')}"
+                )
         else:
-            final_fallback = (
-                "요청한 모든 대상의 저장을 완료했습니다."
-                if writes_complete()
-                else "요청을 전부 완료하지 못했습니다. 실제 저장이 확인된 대상만 완료로 처리했습니다."
-                if write_intent
+            messages.append({
+                "role": "system",
+                "content": (
+                    "도구 조사를 종료한다. 이제 일반 텍스트로만 답하라. 현재 DB와 도구 결과만으로 "
+                    "최종 답을 작성하고, 확인하지 않은 URL·주소·좌표·영업시간을 만들지 마라."
+                ),
+            })
+            fallback = (
+                "선양의 대표 음식과 식당 후보를 조사했지만 확인된 결과를 안전하게 요약하지 못했습니다."
+                if food_discovery
                 else "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다."
             )
-        final_text = complete_text(final_fallback)
+            final_text = complete_text(fallback)
 
     missing_targets = _missing_brand_targets(resolved_message, final_text)
     bad_urls = _unsupported_urls(final_text, sources)
-    if _needs_answer_retry(final_text) or missing_targets or bad_urls:
+    if not write_intent and (_needs_answer_retry(final_text) or missing_targets or bad_urls):
         messages.extend([
             {"role": "assistant", "content": final_text},
             {
@@ -1540,8 +2123,11 @@ def answer_travel_chat(
                     if target in existing_target_places
                 )
                 final_text = f"{existing_refs}로 이미 지도에 등록되어 있습니다. 중복 제안은 만들지 않았습니다."
-            elif "실제" not in final_text:
-                final_text = f"{target_text}의 확인된 정보를 기존 지도 장소에 실제 반영했습니다.\n\n{final_text}"
+            elif existing_write_place_ids:
+                final_text = (
+                    "동일한 장소가 이미 지도에 있어 중복 제안은 만들지 않았습니다. 기존 장소 #"
+                    + ", #".join(map(str, sorted(set(existing_write_place_ids))))
+                )
         else:
             completed = [target for target in brand_targets if target in successful_write_targets]
             unverified = [target for target in brand_targets if target not in actionable_targets]
@@ -1573,8 +2159,29 @@ def answer_travel_chat(
                 parts.append("성공한 저장 도구가 없어 DB 변경은 발생하지 않았습니다.")
             if food_discovery:
                 parts.append("음식 유형 → 실제 식당 → 지점 근거·좌표 순으로 검증했지만 최소 2개 식당 저장 기준을 충족하지 못했습니다.")
-            parts.append("말로만 ‘추가하겠다’고 한 상태는 완료로 처리하지 않습니다.")
+            parts.append("미완료 대상과 다음 행동은 작업 원장에 보존했으며, 다음 ‘계속’ 요청에서 이어갑니다.")
             final_text = " ".join(parts)
+
+    work_failures = [
+        {
+            "tool": str(item.get("name") or ""),
+            "error": str((item.get("result") or {}).get("error") or (item.get("result") or {}).get("detail") or "")[:300],
+        }
+        for item in tool_results
+        if isinstance(item.get("result"), dict)
+        and ((item.get("result") or {}).get("error") or (item.get("result") or {}).get("detail"))
+    ]
+    _merge_work_candidates(
+        active_work,
+        turn_candidates,
+        proposal_ids=proposal_ids,
+        proposal_titles=proposal_titles,
+        phase="complete" if write_intent and writes_complete() else "write" if write_intent else "research",
+        next_action="done" if write_intent and writes_complete() else "write" if write_intent else "await_user",
+        failures=work_failures,
+    )
+    if active_work is not None and write_intent and writes_complete():
+        active_work.status = "completed"
 
     final_text = _strip_unsupported_urls(final_text, sources)
     display_sources = _supporting_sources(final_text, tool_results)
@@ -1585,6 +2192,7 @@ def answer_travel_chat(
         for match in PLACE_ID_RE.findall(final_text)
         if int(match) in existing_ids
     }
+    place_ids.update(pid for pid in existing_write_place_ids if pid in existing_ids)
     user_row = TravelChatMessage(
         user_id=user_id,
         city_id=city_id,

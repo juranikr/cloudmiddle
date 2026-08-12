@@ -120,6 +120,48 @@ def _normalize(value: str) -> str:
     return re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", value)
 
 
+def _meaningful_entity_match(query: str, display_name: str, city_name: str = "") -> bool:
+    """Reject city-centre/provider fallbacks that do not name the requested entity or address."""
+    generic = {
+        _normalize(item) for item in (
+            city_name, f"{city_name}市", "沈阳", "沈阳市", "济南", "济南市",
+            "辽宁省", "山东省", "中国", "地址", "位置", "地图",
+            "추천", "장소", "검색", "어디",
+        ) if item
+    }
+
+    def fragments(value: str) -> list[str]:
+        raw = re.split(r"[\s,，、;；:：!！?？()（）\[\]【】·|/\\]+", value or "")
+        out: list[str] = []
+        for part in raw:
+            normalized = _normalize(part)
+            for token in generic:
+                normalized = normalized.replace(token, "")
+            if len(normalized) >= 2:
+                out.append(normalized)
+        return out
+
+    query_parts = fragments(query)
+    display_parts = fragments(display_name)
+    if not query_parts or not display_parts:
+        return False
+    query_text = "".join(query_parts)
+    display_text = "".join(display_parts)
+    if min(len(query_text), len(display_text)) >= 4 and (
+        query_text in display_text or display_text in query_text
+    ):
+        return True
+    for left in query_parts:
+        for right in display_parts:
+            if min(len(left), len(right)) >= 3 and (left in right or right in left):
+                return True
+            max_size = min(len(left), len(right), 16)
+            for size in range(max_size, 3, -1):
+                if any(left[start:start + size] in right for start in range(len(left) - size + 1)):
+                    return True
+    return False
+
+
 def _haversine_m(a: dict[str, Any], b: dict[str, Any]) -> float:
     lat1, lng1 = math.radians(float(a["lat"])), math.radians(float(a["lng"]))
     lat2, lng2 = math.radians(float(b["lat"])), math.radians(float(b["lng"]))
@@ -223,6 +265,8 @@ def _search_nominatim(
             if bounds and not bounds.contains(lat, lng):
                 continue
             display_name = str(item.get("display_name") or query)
+            if not _meaningful_entity_match(query, display_name, city_name):
+                continue
             importance = max(0.0, min(float(item.get("importance") or 0.35), 1.0))
             exact_bonus = 0.07 if query_norm and query_norm in _normalize(display_name) else 0.0
             results.append(
@@ -448,6 +492,8 @@ def _search_wikidata(
                 continue
             label = _entity_label(entity, languages, matched_names.get(entity_id, query))
             description = _entity_description(entity, languages)
+            if not _meaningful_entity_match(query, f"{label} {description}"):
+                continue
             exact_bonus = 0.08 if _normalize(label) == query_norm else 0.0
             rank_score = max(0.0, 0.86 - rank * 0.025 + exact_bonus)
             results.append(

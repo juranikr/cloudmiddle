@@ -11,8 +11,9 @@ from sqlalchemy.orm import sessionmaker
 from app.agent.tools import TOOLS, _filter_search_results, _search_result_quality
 from app.config import settings
 from app.db import Base
-from app.models import City, Marker, MarkerCategory, TravelChatMessage
+from app.models import City, Marker, MarkerCategory, TravelChatMessage, TravelChatWork
 from app.travel_chat import (
+    ChatIntent,
     CITY_FOOD_DETAIL_SOURCES,
     RESEARCH_TOOLS,
     WRITE_TOOLS,
@@ -21,9 +22,13 @@ from app.travel_chat import (
     _food_business_name,
     _food_detail_recovery_query,
     _extract_grounded_candidates,
+    _ensure_chat_work,
     _latest_chat_candidate,
+    _latest_chat_candidates,
+    _inherit_active_intent,
     _missing_brand_targets,
     _needs_answer_retry,
+    _pending_work_candidates,
     _research_seed_queries,
     _research_seed_query,
     _resolve_context_message,
@@ -133,11 +138,48 @@ class TravelChatRoutingTests(unittest.TestCase):
             ),
         ]
 
-        resolved = _resolve_context_message("등록해줘", rows)
+        work = SimpleNamespace(
+            id=1,
+            action="research",
+            scope="single",
+            subject="spa",
+            goal="중제 마사지 후보 조사",
+            requested_count=1,
+            state=json.dumps({"phase": "research", "candidates": [candidate]}, ensure_ascii=False),
+        )
+        resolved = _resolve_context_message(
+            "등록해줘",
+            rows,
+            intent=ChatIntent(action="write", continuation=True, wants_write=True),
+            work=work,
+        )
 
         self.assertEqual(_latest_chat_candidate(rows)["key"], "abc")
         self.assertIn("绿波廊SPA会馆", resolved)
         self.assertIn("小什字街66号", resolved)
+
+    def test_legacy_continuation_skips_empty_failure_and_matches_subject(self) -> None:
+        food = {
+            "key": "food-1",
+            "title": "Food candidate",
+            "category": "restaurant",
+            "status": "located",
+        }
+        spa = {
+            "key": "spa-1",
+            "title": "Spa candidate",
+            "category": "other",
+            "status": "located",
+        }
+        rows = [
+            SimpleNamespace(role="assistant", candidates=json.dumps([spa])),
+            SimpleNamespace(role="assistant", candidates=json.dumps([food])),
+            SimpleNamespace(role="assistant", candidates="[]"),
+        ]
+
+        recovered = _latest_chat_candidates(rows, subject="food")
+
+        self.assertEqual([item["key"] for item in recovered], ["food-1"])
 
     def test_shenyang_food_bootstrap_uses_auditable_detail_pages(self) -> None:
         urls = CITY_FOOD_DETAIL_SOURCES["shenyang"]
@@ -146,27 +188,29 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertTrue(all("ctrip.com" in url or "qunar.com" in url for url in urls))
 
     def test_simple_map_question_skips_web_tools(self) -> None:
-        write_intent, tools = _chat_capabilities("내 일정의 이동 동선을 줄여줘")
+        write_intent, tools = _chat_capabilities(ChatIntent(action="answer"))
 
         self.assertFalse(write_intent)
         self.assertEqual(tools, set())
 
-        write_intent, tools = _chat_capabilities("박물관 말고 현재 지도 장소로 반나절을 짜줘")
+        write_intent, tools = _chat_capabilities(ChatIntent(action="answer"))
         self.assertFalse(write_intent)
         self.assertEqual(tools, set())
 
     def test_fresh_place_lookup_enables_research_only(self) -> None:
-        write_intent, tools = _chat_capabilities("헤이티 지점이 호텔 근처 어디 있는지 찾아줘")
+        write_intent, tools = _chat_capabilities(ChatIntent(action="research", wants_research=True))
 
         self.assertFalse(write_intent)
         self.assertEqual(tools, RESEARCH_TOOLS)
 
-        write_intent, tools = _chat_capabilities("다른 후보도 추가로 찾아줘")
+        write_intent, tools = _chat_capabilities(ChatIntent(action="continue", wants_research=True))
         self.assertFalse(write_intent)
         self.assertEqual(tools, RESEARCH_TOOLS)
 
     def test_explicit_registration_enables_research_and_write(self) -> None:
-        write_intent, tools = _chat_capabilities("가까운 지점을 찾아서 지도에 등록해줘")
+        write_intent, tools = _chat_capabilities(ChatIntent(
+            action="research_and_write", wants_research=True, wants_write=True
+        ))
 
         self.assertTrue(write_intent)
         self.assertEqual(tools, RESEARCH_TOOLS | WRITE_TOOLS)
@@ -195,16 +239,37 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertNotIn("사용자 요청", queries[0])
 
     def test_short_write_followup_inherits_previous_targets(self) -> None:
-        rows = [
-            SimpleNamespace(role="user", content="모어요거트와 헤이티를 찾아줘"),
-            SimpleNamespace(role="assistant", content="검증되지 않은 답"),
-        ]
-        resolved = _resolve_context_message("추가해줘", rows)
-        write_intent, tools = _chat_capabilities("추가해줘", context_message=resolved)
+        work = SimpleNamespace(
+            id=1,
+            action="research_and_write",
+            scope="all",
+            subject="drink",
+            goal="모어요거트와 헤이티를 찾아 지도에 추가",
+            requested_count=2,
+            state=json.dumps({"wants_research": True, "wants_write": True, "candidates": []}),
+        )
+        intent = _inherit_active_intent(
+            ChatIntent(action="continue", continuation=True, wants_write=True), work
+        )
+        resolved = _resolve_context_message("추가해줘", [], intent=intent, work=work)
+        write_intent, tools = _chat_capabilities(intent)
 
         self.assertIn("모어요거트와 헤이티", resolved)
         self.assertTrue(write_intent)
         self.assertEqual(tools, RESEARCH_TOOLS | WRITE_TOOLS)
+
+    def test_remaining_scope_uses_unfinished_work_candidates(self) -> None:
+        work = SimpleNamespace(state=json.dumps({
+            "candidates": [
+                {"key": "a", "title": "A", "status": "proposed"},
+                {"key": "b", "title": "B", "status": "located"},
+                {"key": "c", "title": "C", "status": "location_needed"},
+            ]
+        }))
+
+        remaining = _pending_work_candidates(work)
+
+        self.assertEqual([item["key"] for item in remaining], ["b", "c"])
 
     def test_search_more_followup_skips_meta_question_and_inherits_food_request(self) -> None:
         rows = [
@@ -217,13 +282,27 @@ class TravelChatRoutingTests(unittest.TestCase):
             SimpleNamespace(role="assistant", content="주소와 좌표가 필요합니다."),
         ]
 
-        resolved = _resolve_context_message("검색 충분히 해서 지도에 추가해줘.", rows)
+        work = SimpleNamespace(
+            id=1,
+            action="research_and_write",
+            scope="all",
+            subject="food",
+            goal="선양에서 먹어야 되는 음식 종류를 찾고 그 식당을 지도에 등록",
+            requested_count=4,
+            state=json.dumps({"wants_research": True, "wants_write": True, "candidates": []}),
+        )
+        intent = _inherit_active_intent(ChatIntent(
+            action="continue", continuation=True, wants_research=True, wants_write=True
+        ), work)
+        resolved = _resolve_context_message(
+            "검색 충분히 해서 지도에 추가해줘.", rows, intent=intent, work=work
+        )
         city = City(name_local="沈阳")
 
         self.assertIn("먹어야 되는 음식 종류", resolved)
         self.assertNotIn("충족하지 못한 기준", resolved)
         self.assertEqual(
-            _research_seed_queries(city, resolved),
+            _research_seed_queries(city, resolved, subject="food"),
             ["沈阳 必吃 特色美食 传统小吃", "沈阳 老字号 特色餐厅 推荐"],
         )
 
@@ -255,8 +334,10 @@ class TravelChatRoutingTests(unittest.TestCase):
         city = City(name_local="沈阳")
         message = "선양에서 먹어야 되는 음식 종류를 찾고 식당을 지도에 등록해줬으면 좋겠어"
 
-        write_intent, tools = _chat_capabilities(message)
-        queries = _research_seed_queries(city, message)
+        write_intent, tools = _chat_capabilities(ChatIntent(
+            action="research_and_write", subject="food", wants_research=True, wants_write=True
+        ))
+        queries = _research_seed_queries(city, message, subject="food")
 
         self.assertTrue(write_intent)
         self.assertEqual(tools, RESEARCH_TOOLS | WRITE_TOOLS)
@@ -329,7 +410,7 @@ class _ForcedWriteCompletions:
                         name="propose_place",
                         arguments=json.dumps(
                             {
-                                "title": "喜茶中街店 (헤이티 중제점)",
+                                "title": "喜茶沈阳大悦城店 (헤이티 선양 다웨청점)",
                                 "lat": 41.8,
                                 "lng": 123.45,
                                 "source_urls": ["https://example.com/branch"],
@@ -344,7 +425,7 @@ class _ForcedWriteCompletions:
                         name="propose_place",
                         arguments=json.dumps(
                             {
-                                "title": "茉酸奶中街店 (모어요거트 중제점)",
+                                "title": "茉酸奶沈阳大悦城旗舰店 (모어요거트 선양 다웨청 플래그십점)",
                                 "lat": 41.8,
                                 "lng": 123.45,
                                 "source_urls": ["https://example.com/branch"],
@@ -389,6 +470,36 @@ class TravelChatLoopTests(unittest.TestCase):
         self.db.close()
         self.engine.dispose()
 
+    def test_unrelated_answer_does_not_mutate_open_work(self) -> None:
+        work = TravelChatWork(
+            user_id=1,
+            city_id=1,
+            action="research_and_write",
+            scope="remaining",
+            subject="food",
+            goal="Add the remaining restaurants",
+            state=json.dumps({
+                "phase": "write",
+                "next_action": "write",
+                "candidates": [{"key": "food-1", "title": "Food candidate"}],
+            }),
+        )
+        self.db.add(work)
+        self.db.commit()
+        original_state = work.state
+
+        selected = _ensure_chat_work(
+            self.db,
+            user_id=1,
+            city_id=1,
+            intent=ChatIntent(action="answer", subject="itinerary"),
+            active_work=work,
+        )
+
+        self.assertIsNone(selected)
+        self.db.refresh(work)
+        self.assertEqual(work.state, original_state)
+
     def test_tool_budget_always_ends_with_no_tool_synthesis(self) -> None:
         completions = _FakeCompletions(tool_rounds=3)
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -398,6 +509,10 @@ class TravelChatLoopTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="research", subject="drink", goal="호텔 근처 차 지점 조사",
+                wants_research=True, starts_new_work=True,
+            )),
             patch("app.travel_chat.run_tool", return_value={"items": [], "source": "https://example.com"}) as tool,
         ):
             result = answer_travel_chat(
@@ -427,6 +542,9 @@ class TravelChatLoopTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="answer", subject="itinerary", goal="동선 단축",
+            )),
         ):
             answer_travel_chat(self.db, user_id=1, city_id=1, message="내 일정 동선을 줄여줘")
 
@@ -473,7 +591,13 @@ class TravelChatLoopTests(unittest.TestCase):
             if name == "geocode_place":
                 if "茉酸奶" in _args["query"] or "喜茶" in _args["query"]:
                     return {"results": []}
-                return {"results": [{"lat": 41.8, "lng": 123.45, "source": "osm"}]}
+                return {"results": [{
+                    "display_name": "沈阳大悦城",
+                    "lat": 41.8,
+                    "lng": 123.45,
+                    "source": "osm",
+                    "storage_allowed": True,
+                }]}
             if name == "propose_place":
                 return {"ok": True, "proposal_created": True, "proposal_id": 31}
             return {"error": "unexpected_tool"}
@@ -481,6 +605,11 @@ class TravelChatLoopTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="write", scope="all", subject="drink",
+                goal="모어요거트와 헤이티를 지도에 추가", wants_research=True,
+                wants_write=True, continuation=True, requested_count=2,
+            )),
             patch("app.travel_chat.run_tool", side_effect=fake_tool) as tool,
         ):
             result = answer_travel_chat(self.db, user_id=1, city_id=1, message="추가해줘")
@@ -496,7 +625,9 @@ class TravelChatLoopTests(unittest.TestCase):
             completions.requests[0]["tool_choice"],
             {"type": "function", "function": {"name": "propose_place"}},
         )
-        self.assertNotIn("tools", completions.requests[-1])
+        # Write results are rendered deterministically from the execution ledger;
+        # no final tool-disabled model call can swallow a ready proposal anymore.
+        self.assertEqual(len(completions.requests), 1)
 
     def test_grounded_candidate_survives_failed_followup_without_target_drift(self) -> None:
         candidate = {
@@ -538,6 +669,10 @@ class TravelChatLoopTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="write", scope="single", subject="spa", goal="마사지 후보 등록",
+                wants_research=True, wants_write=True, continuation=True, requested_count=1,
+            )),
             patch("app.travel_chat.run_tool", return_value={"results": []}) as tool,
         ):
             result = answer_travel_chat(self.db, user_id=1, city_id=1, message="등록해줘")
@@ -580,6 +715,11 @@ class TravelChatLoopTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="research_and_write", scope="all", subject="drink",
+                goal="헤이티와 모어요거트를 지도에 추가", wants_research=True,
+                wants_write=True, starts_new_work=True, requested_count=2,
+            )),
             patch("app.travel_chat.run_tool") as tool,
         ):
             result = answer_travel_chat(
@@ -601,6 +741,9 @@ class TravelChatLoopTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="answer", subject="general", goal="현재 지도 설명",
+            )),
         ):
             result = answer_travel_chat(
                 self.db,

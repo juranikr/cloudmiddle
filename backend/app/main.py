@@ -43,6 +43,7 @@ from app.models import (
     PlaceNote,
     PlaceChain,
     TravelChatMessage,
+    TravelChatWork,
     TravelPlan,
     TravelPlanDay,
     TravelPlanItem,
@@ -1662,6 +1663,10 @@ def clear_travel_chat(
     db.query(TravelChatMessage).filter(
         TravelChatMessage.user_id == current_user.id,
         TravelChatMessage.city_id == city_id,
+    ).delete(synchronize_session=False)
+    db.query(TravelChatWork).filter(
+        TravelChatWork.user_id == current_user.id,
+        TravelChatWork.city_id == city_id,
     ).delete(synchronize_session=False)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

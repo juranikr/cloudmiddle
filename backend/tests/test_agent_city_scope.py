@@ -1044,6 +1044,53 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(self.db.query(AgentProposal).count(), 1)
         self.assertEqual(legacy_task.status, "completed")
 
+    def test_existing_marker_blocks_seo_title_duplicate_proposal(self) -> None:
+        existing = Marker(
+            city_id=2,
+            category=MarkerCategory.restaurant,
+            shape=MarkerShape.point,
+            title="必吃！鸣记脆皮烤鱼，香辣酸甜一网打尽",
+            description="기존 대화 후보입니다.",
+            lat=41.8007,
+            lng=123.4637,
+        )
+        self.db.add(existing)
+        self.db.commit()
+
+        result = run_tool(
+            self.db,
+            "propose_place",
+            {
+                "title": "鸣记脆皮烤鱼 (밍지 바삭 구이생선)",
+                "description": "주소: 辽宁省沈阳市大东区小东路6号. 구이 생선 전문점입니다.",
+                "category": "restaurant",
+                "lat": 41.8007,
+                "lng": 123.4637,
+                "evidence": "동일 지점의 상호와 주소를 확인했습니다.",
+                "source_urls": ["https://example.org/mingji"],
+                "confidence": 0.9,
+                "insights": [
+                    {
+                        "kind": "location",
+                        "title": "위치",
+                        "content": "다웨청 A관에 있는 지점입니다.",
+                        "source_url": "https://example.org/mingji",
+                    },
+                    {
+                        "kind": "tip",
+                        "title": "메뉴",
+                        "content": "구이 생선을 중심으로 주문하는 식당입니다.",
+                        "source_url": "https://example.org/mingji",
+                    },
+                ],
+            },
+            city_id=2,
+        )
+
+        self.assertTrue(result["duplicate"])
+        self.assertEqual(result["existing_place_id"], existing.id)
+        self.assertEqual(self.db.query(AgentProposal).count(), 0)
+
     def test_place_proposal_cannot_masquerade_as_backlog_task(self) -> None:
         result = run_tool(
             self.db,

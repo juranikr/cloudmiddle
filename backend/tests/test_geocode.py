@@ -4,7 +4,7 @@ import unittest
 
 from app.agent.tools import _extract_embedded_coordinates
 from app.gcj02 import gcj02_to_wgs84
-from app.geocode import _local_hits, _merge_hits, parse_viewbox
+from app.geocode import _local_hits, _meaningful_entity_match, _merge_hits, parse_viewbox
 
 
 def hit(
@@ -34,6 +34,18 @@ def hit(
 
 
 class GeocodeMergeTests(unittest.TestCase):
+    def test_city_only_fallback_does_not_verify_a_business(self) -> None:
+        self.assertFalse(_meaningful_entity_match(
+            "沈阳 必吃！鸣记脆皮烤鱼，香辣酸甜一网打尽",
+            "沈阳市 铁西区",
+            "沈阳",
+        ))
+        self.assertTrue(_meaningful_entity_match(
+            "沈阳 鸣记脆皮烤鱼 大悦城A馆",
+            "鸣记脆皮烤鱼, 小东路6号大悦城A馆",
+            "沈阳",
+        ))
+
     def test_ctrip_food_detail_coordinate_is_converted_for_storage(self) -> None:
         html = '<script>{"GDCoord":{"Lat":41.7890215,"Lng":123.4169422}}</script>'
 

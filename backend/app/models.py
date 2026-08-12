@@ -931,3 +931,27 @@ class TravelChatMessage(Base):
     tool_trace: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
+
+class TravelChatWork(Base):
+    """Durable, resumable work behind a user's multi-turn travel request."""
+
+    __tablename__ = "travel_chat_work"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(30), default="answer", nullable=False)
+    scope: Mapped[str] = mapped_column(String(20), default="unspecified", nullable=False)
+    subject: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    goal: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    requested_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Candidate/action state is intentionally separate from prose.  A later
+    # "continue" or "add the rest" resumes these exact entities rather than
+    # asking the model to reconstruct a task from its previous answer.
+    state: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
+    )
+
