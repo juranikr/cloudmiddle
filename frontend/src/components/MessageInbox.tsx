@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import * as api from "../api";
 import type { UserMessage } from "../types";
+import PlaceIdBadge from "./PlaceIdBadge";
 
 interface Props {
   token: string;
@@ -134,7 +135,7 @@ export default function MessageInbox({
                     if (m.place_id) onOpenPlace?.(m.place_id);
                   }}
                 >
-                  <strong>{m.title}</strong>
+                  <strong>{m.place_id ? <PlaceIdBadge id={m.place_id} /> : null}{m.title}</strong>
                   <span className="inbox__kind">{m.kind}</span>
                   <p>{m.body}</p>
                 </button>

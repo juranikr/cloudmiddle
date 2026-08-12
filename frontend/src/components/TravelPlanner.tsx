@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "../api";
 import type { City, MarkerItem, TravelPlan, TravelPlanDay, TravelPlanItem } from "../types";
 import BrandMark from "./BrandMark";
+import PlaceIdBadge from "./PlaceIdBadge";
 
 function chinaToday(): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -215,7 +216,7 @@ export default function TravelPlanner({ token, city, markers, initialPlace, onOp
         </div>
         <button type="button" className="plan-item__place" onClick={() => onOpen(item.place)}>
           {item.place.images[0]?.url ? <img src={item.place.images[0].url} alt="" /> : <i>{item.place.title.slice(0, 1)}</i>}
-          <span><strong>{item.place.title}</strong><small>{item.place.zone_title || item.place.travel_role}</small></span>
+          <span><strong><PlaceIdBadge id={item.place.id} />{item.place.title}</strong><small>{item.place.zone_title || item.place.travel_role}</small></span>
         </button>
         <div className="plan-item__details">
           <select
@@ -271,7 +272,7 @@ export default function TravelPlanner({ token, city, markers, initialPlace, onOp
         </div>
         <div className="planner-item-add">
           <strong>장소와 시간 추가</strong>
-          <label className="planner-place-field"><span>장소</span><select value={placeId} onChange={(event) => setPlaceId(Number(event.target.value))}><option value={0}>장소를 선택하세요</option>{points.map((marker) => <option key={marker.id} value={marker.id}>{marker.title}</option>)}</select></label>
+          <label className="planner-place-field"><span>장소</span><select value={placeId} onChange={(event) => setPlaceId(Number(event.target.value))}><option value={0}>장소를 선택하세요</option>{points.map((marker) => <option key={marker.id} value={marker.id}>#{marker.id} · {marker.title}</option>)}</select></label>
           <label><span>날짜</span><select value={planDayId} onChange={(event) => setPlanDayId(Number(event.target.value))}><option value={0}>날짜 미정</option>{plan?.days.map((day) => <option key={day.id} value={day.id}>{dateLabel(day.calendar_date)}</option>)}</select></label>
           <label><span>시작</span><input type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} /></label>
           <label><span>종료</span><input type="time" value={endTime} onChange={(event) => setEndTime(event.target.value)} /></label>

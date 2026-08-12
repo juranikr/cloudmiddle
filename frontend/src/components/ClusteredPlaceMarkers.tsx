@@ -4,6 +4,7 @@ import { Marker, Popup, useMapEvents } from "react-leaflet";
 import { CATEGORY_META } from "../categories";
 import { getCategoryIcon } from "../markerIcons";
 import type { MarkerItem } from "../types";
+import PlaceIdBadge from "./PlaceIdBadge";
 
 interface PlaceCluster {
   lat: number;
@@ -111,7 +112,7 @@ export default function ClusteredPlaceMarkers({ markers, onSelect }: Props) {
                 >
                   <i style={{ background: CATEGORY_META[item.category].color }} />
                   <span>
-                    <b>{item.title}</b>
+                    <b><PlaceIdBadge id={item.id} />{item.title}</b>
                     <small>
                       {CATEGORY_META[item.category].label}
                       {item.zone_title ? ` · ${item.zone_title}` : ""}

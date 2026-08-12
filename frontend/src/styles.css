@@ -831,6 +831,21 @@ textarea {
   user-select: all;
 }
 
+.place-id-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  margin-right: 6px;
+  padding: 2px 5px;
+  border: 1px solid rgba(53, 103, 92, 0.16);
+  border-radius: 6px;
+  background: rgba(53, 103, 92, 0.07);
+  color: var(--wonrae-jade, #35675c);
+  font: 750 0.62rem/1.15 ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: 0;
+  vertical-align: 0.08em;
+}
+
 .panel__header-fav {
   display: grid;
   place-items: center;
@@ -2260,6 +2275,12 @@ textarea {
   }
   .map-floating-mode .seg button,
   .map-floating-mode .locate-btn { padding: 8px 10px; font-size: .72rem; }
+  .wonrae-app.map-app--panel .map-floating-mode,
+  .wonrae-app.map-app--panel .map-floating-filters {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+  }
   .confirm-bar {
     left: 12px !important;
     right: 12px !important;
@@ -2418,7 +2439,7 @@ textarea {
   .wonrae-app .map-side--open .search { margin-top: 14px; }
   .wonrae-app .map-side--open .side-tools { margin-top: 14px; }
   .wonrae-app .map-side--open .map-side__hint { margin-top: 12px; }
-  .wonrae-app .mobile-sheets { position: fixed; bottom: 80px; }
+  .wonrae-app .mobile-sheets { position: fixed; z-index: 900; bottom: 80px; }
   .wonrae-app .mobile-sheets .panel { max-height: min(68dvh, 650px); border-radius: 22px 22px 0 0; }
   .wonrae-app:not(.map-app--map) > .map-side, .wonrae-app:not(.map-app--map) > .map-shell, .wonrae-app:not(.map-app--map) > .mobile-sheets { display: none !important; }
   .workspace-content { position: absolute; inset: 0 0 76px; overflow: auto; }

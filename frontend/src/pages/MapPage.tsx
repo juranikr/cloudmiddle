@@ -25,6 +25,7 @@ import UserLocation, { type LocateStatus } from "../components/UserLocation";
 import ZoneDrawer from "../components/ZoneDrawer";
 import BrandMark from "../components/BrandMark";
 import PlaceFeed from "../components/PlaceFeed";
+import PlaceIdBadge from "../components/PlaceIdBadge";
 import TravelAgent from "../components/TravelAgent";
 import TravelPlanner from "../components/TravelPlanner";
 import WorkspaceNav, { type WorkspaceView } from "../components/WorkspaceNav";
@@ -629,7 +630,10 @@ export default function MapPage() {
           <li key={`${hit.lat},${hit.lng},${hit.display_name}`}>
             <button type="button" onClick={() => void handleSearchPick(hit)}>
               <span className="result-list__title-row">
-                <strong>{geocodeShortName(hit)}</strong>
+                <strong>
+                  {hit.existing_marker_id ? <PlaceIdBadge id={hit.existing_marker_id} /> : null}
+                  {geocodeShortName(hit)}
+                </strong>
                 <span className="result-list__badges">
                   {hit.sources.map((source) => (
                     <em key={source} className={`source-badge source-badge--${source}`}>
@@ -868,6 +872,7 @@ export default function MapPage() {
                         }}
                       >
                         <strong>
+                          <PlaceIdBadge id={m.id} />
                           {m.title}
                           {m.is_agent_suggested ? " · 추천" : ""}
                           {m.is_favorite ? " \u2605" : ""}

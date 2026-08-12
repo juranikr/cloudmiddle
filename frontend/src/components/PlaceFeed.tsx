@@ -1,6 +1,7 @@
 import { CATEGORY_META } from "../categories";
 import type { City, MarkerItem, TravelRole } from "../types";
 import BrandMark from "./BrandMark";
+import PlaceIdBadge from "./PlaceIdBadge";
 
 const ROLE_LABEL: Record<TravelRole, string> = {
   history: "시간 여행",
@@ -50,7 +51,7 @@ export default function PlaceFeed({
                 {marker.images.length > 1 ? <small>1 / {marker.images.length}</small> : null}
               </button>
               <div className="feed-card__body">
-                <div><span>{CATEGORY_META[marker.category].label}{marker.zone_title ? ` · ${marker.zone_title}` : ""}</span>{marker.is_favorite ? <b>★</b> : null}</div>
+                <div><span><PlaceIdBadge id={marker.id} />{CATEGORY_META[marker.category].label}{marker.zone_title ? ` · ${marker.zone_title}` : ""}</span>{marker.is_favorite ? <b>★</b> : null}</div>
                 <h2>{marker.title}</h2>
                 <p>{marker.description || marker.insights[0]?.content || "여행 지도에 저장된 장소입니다."}</p>
                 <footer><button type="button" onClick={() => onOpen(marker)}>지도에서 보기</button><button type="button" onClick={() => onPlan(marker)}>일정에 담기</button></footer>
