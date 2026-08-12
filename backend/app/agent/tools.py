@@ -988,7 +988,11 @@ TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "integer"},
+                    # Groq commonly emits explicit null for optional fields.
+                    # The handler already treats null as "create a new task";
+                    # keep the tool schema aligned so validation does not abort
+                    # an otherwise resumable batch before the call reaches us.
+                    "task_id": {"type": ["integer", "null"]},
                     "kind": {"type": "string"},
                     "title": {"type": "string"},
                     "detail": {"type": "string", "description": "다음 실행이 바로 행동할 수 있는 대상·근거·차단 원인"},

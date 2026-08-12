@@ -260,6 +260,21 @@ class AgentCityScopeTests(unittest.TestCase):
         task = self.db.get(AgentTask, result["task_id"])
         self.assertEqual(task.kind, "research")
 
+    def test_optional_agent_task_id_accepts_explicit_null(self) -> None:
+        schema = next(
+            tool["function"]["parameters"]
+            for tool in TOOLS
+            if tool["function"]["name"] == "upsert_agent_task"
+        )
+        self.assertEqual(schema["properties"]["task_id"]["type"], ["integer", "null"])
+        result = run_tool(
+            self.db,
+            "upsert_agent_task",
+            {"task_id": None, "title": "근거 재수집", "status": "blocked"},
+            city_id=2,
+        )
+        self.assertTrue(result["created"])
+
     def test_explicit_place_call_cannot_drift_from_active_target(self) -> None:
         work_item = AgentWorkItem(
             mission_id=1,
