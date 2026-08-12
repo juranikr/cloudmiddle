@@ -23,6 +23,7 @@ from app.agent.runner import (
     count_unread,
 )
 from app.agent.tools import TOOLS, run_tool
+from app.agent.tools import is_useful_fetched_page
 from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
 from app.rollback import list_agent_actions
@@ -140,6 +141,8 @@ class AgentCityScopeTests(unittest.TestCase):
             _new_evidence_keys("fetch_page", useful_page, set()),
             {"page:https://example.test/guide"},
         )
+        self.assertFalse(is_useful_fetched_page(challenge))
+        self.assertTrue(is_useful_fetched_page(useful_page))
 
         self.assertEqual(
             _tool_signature("web_search", {"limit": 5, "query": "沈阳"}),
@@ -313,6 +316,75 @@ class AgentCityScopeTests(unittest.TestCase):
             gaps=["이전 조사 백로그 확인", "구역 현황 확인"],
         )
         self.assertEqual(ids, [])
+
+    def test_verification_requires_read_source_and_rejects_other_district_branch(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.title = "辽铭宴 (沈河店)"
+        place.description = "沈河区中街"
+        self.db.commit()
+
+        no_read = run_tool(
+            self.db,
+            "verify_place",
+            {
+                "place_id": place.id,
+                "status": "valid",
+                "note": "https://example.test/tiexi 에서 영업 확인",
+            },
+            city_id=2,
+        )
+        self.assertEqual(no_read["error"], "verification_source_not_validated")
+        other_branch = run_tool(
+            self.db,
+            "verify_place",
+            {
+                "place_id": place.id,
+                "status": "valid",
+                "note": "铁西店 景星北街3号 https://example.test/tiexi",
+                "_validated_source_urls": ["https://example.test/tiexi"],
+            },
+            city_id=2,
+        )
+        self.assertEqual(other_branch["error"], "verification_branch_mismatch")
+        uncertain = run_tool(
+            self.db,
+            "verify_place",
+            {
+                "place_id": place.id,
+                "status": "uncertain",
+                "note": "현재 지점을 뒷받침할 유효 본문을 찾지 못함",
+            },
+            city_id=2,
+        )
+        self.assertTrue(uncertain["ok"])
+
+    def test_place_insights_require_a_fetched_source(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        insight = {
+            "kind": "visit",
+            "title": "방문 팁",
+            "content": "실제 본문에서 확인한 한국어 방문 팁입니다.",
+            "source_url": "https://example.test/place-guide",
+            "confidence": 0.8,
+        }
+        rejected = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {"place_id": place.id, "insights": [insight]},
+            city_id=2,
+        )
+        self.assertEqual(rejected["error"], "insight_source_not_validated")
+        accepted = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                "place_id": place.id,
+                "insights": [insight],
+                "_validated_source_urls": ["https://example.test/place-guide"],
+            },
+            city_id=2,
+        )
+        self.assertEqual(accepted["changed"], 1)
 
     def test_admin_agent_history_can_be_scoped_to_city(self) -> None:
         for city_id in (1, 2):

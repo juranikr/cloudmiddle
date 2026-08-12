@@ -113,6 +113,33 @@ _QUERY_ACTION_WORDS = {
     "추가해줘", "지도에", "주소", "推荐", "攻略", "地址", "찾아", "등록", "추가",
 }
 
+_PAGE_CHALLENGE_MARKERS = (
+    "验证中心",
+    "安全验证",
+    "身份核实",
+    "请登录",
+    "扫码登录",
+    "登录后查看",
+    "captcha",
+    "access denied",
+)
+
+_SHENYANG_DISTRICTS = {
+    "shenhe": ("沈河", "shenhe"),
+    "huanggu": ("皇姑", "huanggu"),
+    "heping": ("和平", "heping"),
+    "dadong": ("大东", "dadong"),
+    "tiexi": ("铁西", "tiexi"),
+    "hunnan": ("浑南", "hunnan"),
+    "shenbei": ("沈北", "shenbei"),
+    "yuhong": ("于洪", "yuhong"),
+    "sujiatun": ("苏家屯", "sujiatun"),
+    "liaozhong": ("辽中", "liaozhong"),
+    "xinmin": ("新民", "xinmin"),
+    "kangping": ("康平", "kangping"),
+    "faku": ("法库", "faku"),
+}
+
 
 def _search_host(url: str) -> str:
     try:
@@ -129,6 +156,45 @@ def _blocked_search_url(url: str) -> bool:
         re.search(r"/archives?/\d+/?$", url, re.IGNORECASE)
         and (host.endswith(".cc") or host.endswith("cloudfront.net"))
     )
+
+
+def is_useful_fetched_page(result: dict[str, Any]) -> bool:
+    """A login/challenge shell is not evidence even if the HTTP request succeeded."""
+    title = str(result.get("title") or "").strip()
+    body = str(result.get("text") or "").strip()
+    if len(body) < 120:
+        return False
+    sample = f"{title}\n{body[:1200]}".casefold()
+    return not any(marker in sample for marker in _PAGE_CHALLENGE_MARKERS)
+
+
+def _normalize_evidence_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").strip())
+    except ValueError:
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    path = urllib.parse.unquote(parsed.path).rstrip("/") or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}{path}{query}"
+
+
+def _note_urls(note: str) -> set[str]:
+    return {
+        normalized
+        for raw in re.findall(r"https?://[^\s)）\]}>]+", note)
+        if (normalized := _normalize_evidence_url(raw.rstrip(".,;")))
+    }
+
+
+def _district_tokens(value: str) -> set[str]:
+    folded = str(value or "").casefold()
+    return {
+        district
+        for district, aliases in _SHENYANG_DISTRICTS.items()
+        if any(alias.casefold() in folded for alias in aliases)
+    }
 
 
 def _search_relevance_groups(query: str) -> list[tuple[str, ...]]:
@@ -812,6 +878,8 @@ TOOLS: list[dict[str, Any]] = [
                 "valid + note로 기록하고 좌표를 옮기지 말 것. "
                 "같은 지점의 이전이 확실할 때만 geocode_place→update_place_fields로 좌표를 "
                 "갱신한 뒤 moved로 기록한다. closed는 삭제하지 말고 기록만 남긴다. "
+                "valid/closed/moved는 이번 실행에서 fetch_page로 유효한 본문을 읽은 URL을 note에 반드시 "
+                "포함해야 하며, 지점의 구(区)가 다르면 거부된다. 판단 불가면 uncertain을 사용한다. "
                 "closed/moved/uncertain의 note는 agent_context에 자동 병합된다."
             ),
             "parameters": {
@@ -2164,6 +2232,25 @@ def run_tool(
         raw_items = args.get("insights") or []
         if not isinstance(raw_items, list):
             return {"error": "bad_insights"}
+        validated_urls = {
+            normalized
+            for raw in (args.get("_validated_source_urls") or [])
+            if (normalized := _normalize_evidence_url(str(raw)))
+        }
+        requested_urls = {
+            normalized
+            for raw in raw_items
+            if isinstance(raw, dict)
+            if (normalized := _normalize_evidence_url(str(raw.get("source_url") or "")))
+        }
+        if requested_urls - validated_urls:
+            return {
+                "error": "insight_source_not_validated",
+                "detail": (
+                    "구조화 정보의 모든 source_url은 이번 실행에서 fetch_page로 유효한 본문을 읽어야 합니다. "
+                    "검색 결과 요약·로그인 화면·다른 지점 페이지를 그대로 저장하지 마세요."
+                ),
+            }
         allowed_kinds = {"location", "history", "visit", "tip"}
         changed = 0
         now = datetime.now(timezone.utc)
@@ -2864,6 +2951,16 @@ def run_tool(
         page_text = f"{page.get('title') or ''} {page.get('text') or ''}"
         if _UNSAFE_SEARCH_TEXT_RE.search(page_text):
             return {"error": "unsafe_source_content", "detail": "여행 정보에 부적합한 출처를 제외했습니다."}
+        candidate_page = {
+            "url": url,
+            "title": page.get("title") or "",
+            "text": page.get("text") or "",
+        }
+        if not is_useful_fetched_page(candidate_page):
+            return {
+                "error": "page_not_useful_evidence",
+                "detail": "로그인·인증 화면이거나 여행 정보 본문이 없어 검증 근거로 사용할 수 없습니다.",
+            }
         _record_visit(db, url, page.get("title") or "", city_id=city_id)
         return {
             "url": url,
@@ -3108,6 +3205,45 @@ def run_tool(
         ).first()
         if not m:
             return {"error": "not_found"}
+        if status != "uncertain":
+            note_urls = _note_urls(note)
+            validated_urls = {
+                normalized
+                for raw in (args.get("_validated_source_urls") or [])
+                if (normalized := _normalize_evidence_url(str(raw)))
+            }
+            if not note_urls:
+                return {
+                    "error": "verification_source_required",
+                    "detail": "valid/closed/moved 판정에는 실제로 읽은 근거 URL을 note에 포함해야 합니다.",
+                }
+            if not note_urls.intersection(validated_urls):
+                return {
+                    "error": "verification_source_not_validated",
+                    "detail": (
+                        "note의 URL은 유효한 본문을 읽은 근거 목록에 없습니다. 검색 결과 제목이나 로그인·인증 "
+                        "화면만으로 판정하지 말고 fetch_page로 본문을 확인하세요."
+                    ),
+                }
+            marker_context = " ".join(
+                str(value or "")
+                for value in (
+                    m.title,
+                    m.description,
+                    m.branch_name,
+                    m.coordinate_query,
+                )
+            )
+            marker_districts = _district_tokens(marker_context)
+            source_districts = _district_tokens(note)
+            if marker_districts and source_districts and marker_districts.isdisjoint(source_districts):
+                return {
+                    "error": "verification_branch_mismatch",
+                    "detail": (
+                        f"장소의 구역 단서 {sorted(marker_districts)}와 근거의 구역 단서 "
+                        f"{sorted(source_districts)}가 다릅니다. 다른 지점 근거를 현재 장소에 적용하지 마세요."
+                    ),
+                }
         before = marker_field_snapshot(m)
         now = datetime.now(timezone.utc)
         m.last_verified_at = now

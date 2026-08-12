@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.agent.tools import TOOLS, run_tool
+from app.agent.tools import TOOLS, is_useful_fetched_page, run_tool
 from app.config import settings
 from app.knowledge import knowledge_brief
 from app.models import (
@@ -477,7 +477,7 @@ def _new_evidence_keys(name: str, result: Any, seen: set[str]) -> set[str]:
             if isinstance(item, dict) and item.get("seen") is False and item.get("href"):
                 candidates.add(f"url:{item['href']}")
     elif name == "fetch_page":
-        if not result.get("already_visited") and _useful_fetched_page(result):
+        if not result.get("already_visited") and is_useful_fetched_page(result):
             candidates.add(f"page:{result.get('url') or result.get('title')}")
     elif name == "geocode_place":
         for item in result.get("results") or []:
@@ -496,26 +496,6 @@ def _new_evidence_keys(name: str, result: Any, seen: set[str]) -> set[str]:
             if image_url:
                 candidates.add(f"image:{image_url}")
     return candidates - seen
-
-
-def _useful_fetched_page(result: dict[str, Any]) -> bool:
-    """Reject login/challenge shells that previously inflated evidence counts."""
-    title = str(result.get("title") or "").strip()
-    body = str(result.get("text") or "").strip()
-    if len(body) < 120:
-        return False
-    challenge_markers = (
-        "验证中心",
-        "安全验证",
-        "身份核实",
-        "请登录",
-        "扫码登录",
-        "登录后查看",
-        "captcha",
-        "access denied",
-    )
-    sample = f"{title}\n{body[:1200]}".lower()
-    return not any(marker in sample for marker in challenge_markers)
 
 
 def _evidence_handoff_items(name: str, result: Any, new_keys: set[str]) -> list[str]:
@@ -1151,6 +1131,7 @@ def run_agent(
         if _normalize_research_query(row[0])
     }
     evidence_keys: set[str] = set()
+    validated_source_urls: set[str] = set()
     material_changes: list[dict[str, Any]] = []
     repeated_calls = 0
     image_searches_by_place: dict[int, int] = {}
@@ -1160,6 +1141,7 @@ def run_agent(
     schema_retries = 0
     no_progress_actions = 0
     no_material_actions = 0
+    research_actions_since_material = 0
     evidence_handoff: list[str] = []
     action_sequence = 0
     current_score = 0.0
@@ -1302,13 +1284,13 @@ def run_agent(
                     and image_searches_by_place.get(image_place_id, 0) >= 3
                 )
                 decision_required = bool(
-                    no_material_actions >= 12 and name not in MUTATION_TOOLS
+                    research_actions_since_material >= 8 and name not in MUTATION_TOOLS
                 )
                 if decision_required:
                     result = {
                         "error": "material_decision_required",
                         "detail": (
-                            "연속 12개 행동에서 실제 DB 변화가 없었습니다. 추가 조회·검색을 중단하고 "
+                            "실제 DB 변화 없이 조사 도구를 8회 사용했습니다. 추가 조회·검색을 중단하고 "
                             "이미 확보한 근거만 사용해 장소 정보·인사이트·검증·사진·구역·체인 중 하나를 "
                             "안전하게 갱신하세요. 근거가 부족하면 해당 장소의 차단 원인과 다음 검증 방법을 "
                             "과제 result에 남기고 다른 정확한 대상의 저장 행동으로 전환하세요. 추측 저장은 금지합니다."
@@ -1347,7 +1329,21 @@ def run_agent(
                         image_searches_by_place[image_place_id] = (
                             image_searches_by_place.get(image_place_id, 0) + 1
                         )
-                    result = run_tool(db, name, args, city_id=city_id)
+                    tool_args = args
+                    if name in {"verify_place", "upsert_place_insights"}:
+                        tool_args = {
+                            **args,
+                            "_validated_source_urls": sorted(validated_source_urls),
+                        }
+                    result = run_tool(db, name, tool_args, city_id=city_id)
+                    if (
+                        name == "fetch_page"
+                        and isinstance(result, dict)
+                        and not result.get("error")
+                        and is_useful_fetched_page(result)
+                        and result.get("url")
+                    ):
+                        validated_source_urls.add(str(result["url"]))
                     if normalized_query:
                         recent_search_queries.add(normalized_query)
                 error = isinstance(result, dict) and bool(result.get("error"))
@@ -1379,8 +1375,11 @@ def run_agent(
                         _material_change_summary(action_sequence + 1, name, args, result)
                     )
                     no_material_actions = 0
+                    research_actions_since_material = 0
                 else:
                     no_material_actions += 1
+                    if name in EXPENSIVE_RESEARCH_TOOLS:
+                        research_actions_since_material += 1
                 observation_progress = (
                     not error
                     and (
@@ -1423,7 +1422,7 @@ def run_agent(
                         "content": json.dumps(result, ensure_ascii=False)[:12000],
                     }
                 )
-            if no_material_actions in {12, 16} and material_nudges < 2:
+            if no_material_actions in {12, 18} and material_nudges < 2:
                 material_nudges += 1
                 messages.append({
                     "role": "user",
@@ -1434,10 +1433,10 @@ def run_agent(
                         "측정 가능한 upsert_agent_task로 남긴 뒤 다른 목표로 이동하세요."
                     ),
                 })
-            if no_material_actions >= 20:
+            if no_material_actions >= 24:
                 final_text = (
                     f"연속 {no_material_actions}개 행동이 실제 DB 변화로 이어지지 않아 안전 종료했습니다. "
-                    "12번째 행동부터 추가 조사를 막고 저장 여부 결정을 요구했으며, 확보한 근거와 "
+                    "무성과 조사 8회부터 추가 조사를 막고 저장 여부 결정을 요구했으며, 확보한 근거와 "
                     "차단 사유는 다음 실행의 정확한 백로그로 넘깁니다."
                 )
                 break
@@ -1573,6 +1572,7 @@ def run_agent(
                 "primary_task_id": primary_task.id if primary_task is not None else None,
                 "no_progress_actions": no_progress_actions,
                 "no_material_actions": no_material_actions,
+                "research_actions_since_material": research_actions_since_material,
                 "duration_seconds": round((finished_at - started_at).total_seconds(), 1),
             },
             ensure_ascii=False,
