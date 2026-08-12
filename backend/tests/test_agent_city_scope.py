@@ -32,6 +32,7 @@ from app.agent.memory import (
     learn_from_recent_runs,
     retrieve_contextual_knowledge,
     rotate_blocked_work_item,
+    observe_lesson,
 )
 from app.rollback import list_agent_actions
 from app.models import (
@@ -260,6 +261,22 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.assertIsNone(final)
         self.assertEqual(mission.status, "paused")
+
+    def test_first_lesson_observation_handles_database_defaults_before_commit(self) -> None:
+        lesson = observe_lesson(
+            self.db,
+            key="first_observation",
+            city_id=2,
+            category="workflow",
+            trigger="처음 관찰",
+            action="다음 실행에 적용",
+            expected_effect="반복 방지",
+            evidence_ref="run:1:step:1",
+            successful=False,
+        )
+        self.db.commit()
+        self.assertEqual(lesson.observation_count, 1)
+        self.assertGreater(lesson.confidence, 0.5)
 
     def test_batch_progress_ignores_noop_mutations_and_repeated_evidence(self) -> None:
         self.assertFalse(_is_material_change("upsert_agent_task", {"ok": True, "changed": False}))

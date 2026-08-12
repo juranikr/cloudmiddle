@@ -574,10 +574,12 @@ def observe_lesson(
     if evidence_ref and evidence_ref not in refs:
         refs.append(evidence_ref[:500])
     lesson.evidence_refs = _dump(refs[-20:])
-    lesson.confidence = min(0.98, 0.45 + lesson.observation_count * 0.08 + lesson.success_count * 0.07)
-    if lesson.success_count >= 2 and lesson.observation_count >= 3:
+    observation_count = int(lesson.observation_count or 0)
+    success_count = int(lesson.success_count or 0)
+    lesson.confidence = min(0.98, 0.45 + observation_count * 0.08 + success_count * 0.07)
+    if success_count >= 2 and observation_count >= 3:
         lesson.status = "validated"
-    elif lesson.observation_count >= 2:
+    elif observation_count >= 2:
         lesson.status = "testing"
     lesson.updated_at = datetime.now(timezone.utc)
     db.flush()

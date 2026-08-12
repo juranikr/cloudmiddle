@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from typing import Any
 
 import boto3
@@ -112,7 +113,25 @@ def run_scheduled_agent() -> list[dict[str, Any]]:
 
 
 def main() -> None:
-    results = run_scheduled_agent()
+    try:
+        results = run_scheduled_agent()
+    except Exception as exc:
+        failure = {
+            "city_id": int(os.getenv("AGENT_CITY_ID") or 0) or None,
+            "ok": False,
+            "status": "failed",
+            "steps": 0,
+            "score": 0.0,
+            "message": f"scheduled agent crashed: {type(exc).__name__}: {exc}"[:4000],
+        }
+        results = [failure]
+        traceback.print_exc()
+        task_token = os.getenv("SFN_TASK_TOKEN")
+        if task_token:
+            outcome = report_step_function_result(task_token, results)
+            print(json.dumps({"step_functions_outcome": outcome}), flush=True)
+            return
+        raise
     print(_compact_result(results), flush=True)
 
     task_token = os.getenv("SFN_TASK_TOKEN")
