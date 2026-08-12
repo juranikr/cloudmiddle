@@ -436,6 +436,25 @@ MUTATION_TOOLS = {
     "upsert_agent_task",
 }
 
+# Tools whose ``place_id`` must follow the durable work-item cursor.  Read-only
+# list tools are intentionally excluded because they can provide mission-wide
+# context, but an explicit action on another place is model drift and must not
+# silently steal or contaminate the current target.
+TARGET_SCOPED_PLACE_TOOLS = {
+    "get_place",
+    "find_nearby_candidates",
+    "update_place_context",
+    "update_place_fields",
+    "upsert_place_insights",
+    "reorder_images",
+    "upsert_knowledge",
+    "search_place_images",
+    "attach_image_from_url",
+    "verify_place",
+    "assign_place_zone",
+    "assign_place_chain",
+}
+
 
 def _tool_signature(name: str, args: dict[str, Any]) -> str:
     return f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
@@ -443,6 +462,39 @@ def _tool_signature(name: str, args: dict[str, Any]) -> str:
 
 def _normalize_research_query(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
+
+
+def _active_target_mismatch(
+    name: str,
+    args: dict[str, Any],
+    work_item: AgentWorkItem | None,
+) -> dict[str, Any] | None:
+    """Reject a target-scoped tool call that drifts from the durable cursor."""
+
+    if (
+        work_item is None
+        or work_item.place_id is None
+        or name not in TARGET_SCOPED_PLACE_TOOLS
+        or args.get("place_id") is None
+    ):
+        return None
+    try:
+        requested_place_id = int(args["place_id"])
+    except (TypeError, ValueError):
+        return None
+    active_place_id = int(work_item.place_id)
+    if requested_place_id == active_place_id:
+        return None
+    return {
+        "error": "active_work_item_mismatch",
+        "detail": (
+            f"현재 연속 작업 대상은 장소 #{active_place_id} ({work_item.title})입니다. "
+            f"장소 #{requested_place_id} 호출은 실행하지 않았습니다. 현재 대상의 완료 조건을 "
+            "충족하거나 차단 근거를 남긴 뒤 오케스트레이터가 다음 대상으로 전환하게 하세요."
+        ),
+        "active_place_id": active_place_id,
+        "requested_place_id": requested_place_id,
+    }
 
 
 def _is_material_change(name: str, result: Any) -> bool:
@@ -1366,7 +1418,10 @@ def run_agent(
                     and name not in MUTATION_TOOLS
                     and not is_new_evidence_followup
                 )
-                if decision_required:
+                target_mismatch = _active_target_mismatch(name, args, active_work_item)
+                if target_mismatch is not None:
+                    result = target_mismatch
+                elif decision_required:
                     result = {
                         "error": "material_decision_required",
                         "detail": (

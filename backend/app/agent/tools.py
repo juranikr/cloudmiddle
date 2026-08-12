@@ -2715,7 +2715,11 @@ def run_tool(
                 row = AgentTask(city_id=city_id, title=title)
                 db.add(row)
                 created = True
-        managed_existing = bool(row.kind.startswith("quality_"))
+        # SQLAlchemy column defaults are applied when a new row is flushed.  A
+        # just-created backlog item therefore has ``kind is None`` here even
+        # though the database column defaults to ``research``.  Scheduled runs
+        # used to crash before persisting their checkpoint on this exact path.
+        managed_existing = str(row.kind or "").startswith("quality_")
         before = (
             row.kind,
             row.detail,

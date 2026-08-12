@@ -15,6 +15,7 @@ from app.agent.runner import (
     _performance_snapshot,
     _new_evidence_keys,
     _normalize_research_query,
+    _active_target_mismatch,
     _research_gaps,
     _run_outcome_status,
     _sync_quality_tasks,
@@ -239,6 +240,40 @@ class AgentCityScopeTests(unittest.TestCase):
             "喜茶沈阳大悦城店",
         )
         self.assertGreater(score, 0)
+
+    def test_new_agent_task_handles_defaults_before_first_flush(self) -> None:
+        result = run_tool(
+            self.db,
+            "upsert_agent_task",
+            {
+                "title": "공식 교통 페이지를 다른 출처로 재검증",
+                "detail": "다음 실행에서 확인",
+                "success_metric": "본문 근거 1건",
+                "status": "pending",
+            },
+            city_id=2,
+        )
+        self.assertTrue(result["created"])
+        self.assertTrue(result["changed"])
+        task = self.db.get(AgentTask, result["task_id"])
+        self.assertEqual(task.kind, "research")
+
+    def test_explicit_place_call_cannot_drift_from_active_target(self) -> None:
+        work_item = AgentWorkItem(
+            mission_id=1,
+            city_id=2,
+            place_id=83,
+            target_key="place:83",
+            title="현재 장소",
+        )
+        mismatch = _active_target_mismatch(
+            "search_place_images", {"place_id": 90, "query": "다른 장소"}, work_item
+        )
+        self.assertEqual(mismatch["error"], "active_work_item_mismatch")
+        self.assertEqual(mismatch["active_place_id"], 83)
+        self.assertIsNone(
+            _active_target_mismatch("search_place_images", {"place_id": 83}, work_item)
+        )
 
     def test_blocked_target_rotates_and_pauses_only_when_every_target_is_blocked(self) -> None:
         places = self.db.query(Marker).filter(Marker.city_id == 2).all()

@@ -666,6 +666,16 @@ def checkpoint_after_tool(
         facts.append("출처 본문을 읽어 저장 판단이 가능함")
         item.stage = "decide"
         next_action = {"tool": "decide", "source_url": evidence_rows[0].url, "purpose": "주장-대상 일치 확인 후 안전한 저장 또는 기각"}
+    elif error == "active_work_item_mismatch":
+        # Model drift is not evidence that the active place is blocked.  Keep
+        # the cursor and definition of done intact without poisoning the
+        # target's failed-approach count (which drives deliberate rotation).
+        rejected.append(detail or error)
+        next_action = {
+            "tool": "get_place" if item.place_id else "continue",
+            "args": {"place_id": item.place_id} if item.place_id else {},
+            "purpose": "현재 활성 대상에 다시 집중",
+        }
     elif error:
         failure = f"{tool}: {error}" + (f" - {detail[:400]}" if detail else "")
         if failure not in failures:
