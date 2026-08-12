@@ -106,7 +106,7 @@ class AgentCityScopeTests(unittest.TestCase):
 
     def test_batch_progress_ignores_noop_mutations_and_repeated_evidence(self) -> None:
         self.assertFalse(_is_material_change("upsert_agent_task", {"ok": True, "changed": False}))
-        self.assertTrue(_is_material_change("upsert_agent_task", {"ok": True, "created": True}))
+        self.assertFalse(_is_material_change("upsert_agent_task", {"ok": True, "created": True}))
         self.assertTrue(_is_material_change("propose_place", {"proposal_id": 91}))
 
         result = {"results": [{"seen": False, "href": "https://example.test/place"}]}
@@ -160,6 +160,23 @@ class AgentCityScopeTests(unittest.TestCase):
         image_task = self.db.query(AgentTask).filter(AgentTask.kind == "quality_images").one()
         self.assertIn(f"#{place.id}", image_task.detail)
         self.assertNotIn(f"#{zone.id}", image_task.detail)
+        duplicate = run_tool(
+            self.db,
+            "upsert_agent_task",
+            {
+                "title": f"이미지 보강 실패: {place.title}",
+                "detail": "자유 라이선스 사진 부재",
+                "status": "pending",
+            },
+            city_id=2,
+        )
+        self.assertEqual(duplicate["error"], "quality_gap_already_tracked")
+        self.assertEqual(duplicate["task_id"], image_task.id)
+        image_task.attempts = 1
+        self.db.commit()
+        _sync_quality_tasks(self.db, city_id=2, run_id=21)
+        self.db.refresh(image_task)
+        self.assertLess(image_task.priority, 96)
 
         self.db.add(PlaceImage(place_id=place.id, s3_key="places/test.jpg"))
         self.db.commit()

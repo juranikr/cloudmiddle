@@ -2512,6 +2512,34 @@ def run_tool(
                     str(args.get("success_metric") or ""),
                 ]
             ).lower()
+            managed_quality_kind = None
+            quality_keywords = {
+                "quality_images": ("이미지", "사진", "image"),
+                "quality_drafts": ("초안", "draft"),
+                "quality_information": ("인사이트", "정보 구조", "description"),
+                "quality_zones": ("구역", "zone"),
+                "quality_verification": ("운영 검증", "존재 검증", "verify"),
+            }
+            for quality_kind, keywords in quality_keywords.items():
+                if any(keyword in task_text for keyword in keywords):
+                    managed_quality_kind = quality_kind
+                    break
+            if managed_quality_kind:
+                managed = db.query(AgentTask).filter(
+                    AgentTask.city_id == city_id,
+                    AgentTask.kind == managed_quality_kind,
+                    AgentTask.status == "pending",
+                ).first()
+                if managed is not None:
+                    return {
+                        "error": "quality_gap_already_tracked",
+                        "task_id": managed.id,
+                        "detail": (
+                            f"같은 품질 결손은 자동 과제 #{managed.id}에서 이미 추적 중입니다. "
+                            "새 과제를 만들어 성과로 세지 말고, 차단 내용을 기존 과제 result에 기록한 뒤 "
+                            "다른 대상 또는 다른 품질 과제로 이동하세요."
+                        ),
+                    }
             if any(
                 marker in task_text
                 for marker in (

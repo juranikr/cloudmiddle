@@ -429,6 +429,11 @@ def _tool_signature(name: str, args: dict[str, Any]) -> str:
 def _is_material_change(name: str, result: Any) -> bool:
     if name not in MUTATION_TOOLS or not isinstance(result, dict) or result.get("error"):
         return False
+    # Backlog bookkeeping is an orchestration aid, not a traveler-facing DB
+    # improvement. It must not reset the no-material-progress guard or appear in
+    # the run's "actual changes" list.
+    if name == "upsert_agent_task":
+        return False
     if result.get("proposal_id") is not None:
         return True
     # A mutation tool can successfully execute without changing a row.  When it
