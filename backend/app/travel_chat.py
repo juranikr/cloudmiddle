@@ -1294,11 +1294,18 @@ def answer_travel_chat(
     }]
     proposal_ids: list[int] = []
     proposal_titles: list[str] = []
+    successful_write_candidates: list[dict[str, Any]] = []
     existing_write_place_ids: list[int] = []
+    completed_work_candidates = [
+        item for item in _work_candidates(active_work)
+        if str(item.get("status") or "") in {"proposed", "mapped", "approved", "duplicate"}
+    ]
     write_attempted = False
-    write_succeeded = bool(existing_target_places)
-    successful_write_count = len(existing_target_places)
-    successful_candidate_keys: set[str] = set()
+    write_succeeded = bool(existing_target_places or completed_work_candidates)
+    successful_write_count = len(existing_target_places) + len(completed_work_candidates)
+    successful_candidate_keys: set[str] = {
+        str(item.get("key") or "") for item in completed_work_candidates if item.get("key")
+    }
     successful_write_targets: set[str] = set(existing_target_places)
     actionable_targets: set[str] = set()
     verified_coordinates: list[tuple[float, float]] = []
@@ -2114,6 +2121,43 @@ def answer_travel_chat(
                 proposal_title = str(args.get("title") or "").strip()
                 if proposal_title and proposal_title not in proposal_titles:
                     proposal_titles.append(proposal_title)
+                if proposal_title:
+                    # Keep insight boundaries so address extraction cannot run
+                    # into the next tip/menu sentence.
+                    insight_text = "\n".join(
+                        str(item.get("content") or "")
+                        for item in (args.get("insights") or [])
+                        if isinstance(item, dict)
+                    )
+                    proposal_address = str(args.get("address") or "").strip() or _extract_address(
+                        str(args.get("description") or ""),
+                        str(args.get("evidence") or ""),
+                        insight_text,
+                    )
+                    proposal_key = hashlib.sha256(
+                        (
+                            f"{_compact_candidate_text(proposal_title)}|"
+                            f"{_compact_candidate_text(proposal_address)}"
+                        ).encode("utf-8")
+                    ).hexdigest()[:16]
+                    saved_candidate = {
+                        "key": proposal_key,
+                        "title": proposal_title,
+                        "address": proposal_address,
+                        "category": str(args.get("category") or "other"),
+                        "source_urls": list(dict.fromkeys(
+                            str(url) for url in (args.get("source_urls") or []) if str(url)
+                        ))[:8],
+                        "lat": args.get("lat"),
+                        "lng": args.get("lng"),
+                        "confidence": float(args.get("confidence") or 0.5),
+                        "status": "proposed" if result.get("proposal_id") is not None else "mapped",
+                    }
+                    if result.get("proposal_id") is not None:
+                        saved_candidate["proposal_id"] = int(result["proposal_id"])
+                    if result.get("existing_place_id") is not None:
+                        saved_candidate["place_id"] = int(result["existing_place_id"])
+                    successful_write_candidates.append(saved_candidate)
                 proposed_title_key = _compact_candidate_text(str(args.get("title") or ""))
                 for item in pending_work:
                     item_title_key = _compact_candidate_text(str(item.get("title") or ""))
@@ -2243,6 +2287,34 @@ def answer_travel_chat(
         locked_candidate=locked_candidate,
         subject=intent.subject,
     )
+    # A successful mutation is stronger state than a generated summary. The
+    # final partial-response text often says only "1 candidate was saved", so
+    # text extraction cannot recover its identity. Persist the exact tool args
+    # and result to make the next "continue" count prior progress and avoid
+    # rediscovering or reproposing the same business.
+    for saved_candidate in successful_write_candidates:
+        saved_key = _compact_candidate_text(str(saved_candidate.get("title") or ""))
+        existing_candidate = next(
+            (
+                item for item in turn_candidates
+                if saved_key and (
+                    saved_key in _compact_candidate_text(str(item.get("title") or ""))
+                    or _compact_candidate_text(str(item.get("title") or "")) in saved_key
+                )
+            ),
+            None,
+        )
+        if existing_candidate is None:
+            turn_candidates.append(dict(saved_candidate))
+        else:
+            existing_candidate.update({
+                key: value for key, value in saved_candidate.items()
+                if value not in (None, "", [])
+            })
+            existing_candidate["source_urls"] = list(dict.fromkeys([
+                *(existing_candidate.get("source_urls") or []),
+                *(saved_candidate.get("source_urls") or []),
+            ]))[:8]
     # A grounded recommendation is useful conversation state even before a write
     # request. Resolve its exact position once on the server so the next short
     # command can act deterministically instead of asking the model to rediscover it.

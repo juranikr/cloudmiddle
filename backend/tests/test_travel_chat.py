@@ -705,7 +705,118 @@ class TravelChatLoopTests(unittest.TestCase):
         )
         self.assertTrue(any(call.args[1] == "web_search" for call in tool.call_args_list))
         self.assertEqual(sum(call.args[1] == "propose_place" for call in tool.call_args_list), 2)
+        work = self.db.query(TravelChatWork).one()
+        state = json.loads(work.state)
+        self.assertEqual(len(state["candidates"]), 2)
+        self.assertEqual({item["status"] for item in state["candidates"]}, {"proposed"})
+        self.assertEqual(len(state["completed_keys"]), 2)
+        self.assertEqual(work.status, "completed")
         self.assertIn("승인 대기 제안", result["row"].content)
+
+    def test_continuation_counts_a_prior_success_and_only_writes_the_remainder(self) -> None:
+        prior = {
+            "key": "prior-snack",
+            "title": "Prior Snack Stall",
+            "address": "Zhongjie 1",
+            "category": "restaurant",
+            "status": "proposed",
+            "proposal_id": 40,
+            "source_urls": ["https://example.com/prior"],
+            "lat": 41.8,
+            "lng": 123.45,
+        }
+        self.db.add(TravelChatWork(
+            user_id=1,
+            city_id=1,
+            action="research_and_write",
+            scope="all",
+            subject="food_snack",
+            goal="add_snack_places",
+            requested_count=2,
+            state=json.dumps({
+                "phase": "write",
+                "next_action": "write",
+                "candidates": [prior],
+                "completed_keys": ["prior-snack"],
+                "constraints": ["snack_portion"],
+                "exclusions": ["full_meal"],
+            }),
+        ))
+        self.db.commit()
+
+        class OneWriteCompletions:
+            def __init__(self) -> None:
+                self.requests: list[dict] = []
+
+            def create(inner_self, **kwargs):
+                inner_self.requests.append(kwargs)
+                call = _SnackResearchThenWriteCompletions.proposal_call(
+                    "new-snack",
+                    "New Snack Stall",
+                    "https://example.com/new",
+                    41.801,
+                    123.451,
+                )
+                return SimpleNamespace(choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="", tool_calls=[call]),
+                )])
+
+        completions = OneWriteCompletions()
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+        proposal_calls = 0
+
+        def fake_tool(_db, name, args, *, city_id):
+            nonlocal proposal_calls
+            self.assertEqual(city_id, 1)
+            if name == "web_search":
+                return {"results": [{
+                    "href": "https://example.com/new",
+                    "title": "New Snack Stall",
+                    "body": "Shenyang portable snack stall",
+                }]}
+            if name == "fetch_page":
+                return {
+                    "url": "https://example.com/new",
+                    "title": "New Snack Stall",
+                    "text": "New Snack Stall sells portable snacks.",
+                    "coordinate_candidates": [{
+                        "display_name": "New Snack Stall",
+                        "lat": 41.801,
+                        "lng": 123.451,
+                        "confidence": 0.9,
+                        "storage_allowed": True,
+                    }],
+                }
+            if name == "propose_place":
+                proposal_calls += 1
+                return {"ok": True, "proposal_created": True, "proposal_id": 41}
+            return {"results": []}
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="continue", scope="all", subject="food_snack",
+                goal="add_snack_places", wants_research=True, wants_write=True,
+                continuation=True, requested_count=2,
+                constraints=["snack_portion"], exclusions=["full_meal"],
+            )),
+            patch("app.travel_chat._classify_snack_fit", return_value={
+                "ok": True, "allowed": True, "consumption_mode": "snack",
+                "reason": "portable snack", "confidence": 0.99,
+            }),
+            patch("app.travel_chat.run_tool", side_effect=fake_tool),
+        ):
+            answer_travel_chat(self.db, user_id=1, city_id=1, message="continue")
+
+        work = self.db.query(TravelChatWork).one()
+        state = json.loads(work.state)
+        self.assertEqual(proposal_calls, 1)
+        self.assertEqual(work.status, "completed")
+        self.assertEqual(len(state["candidates"]), 2)
+        self.assertEqual(len(state["completed_keys"]), 2)
 
     def test_simple_question_uses_one_tool_free_completion(self) -> None:
         completions = _FakeCompletions(tool_rounds=0)
