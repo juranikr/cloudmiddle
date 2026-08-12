@@ -16,6 +16,7 @@ from app.agent.runner import (
     _new_evidence_keys,
     _normalize_research_query,
     _active_target_mismatch,
+    _mission_has_no_executable_target,
     _research_gaps,
     _run_outcome_status,
     _sync_quality_tasks,
@@ -273,6 +274,24 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(mismatch["active_place_id"], 83)
         self.assertIsNone(
             _active_target_mismatch("search_place_images", {"place_id": 83}, work_item)
+        )
+
+    def test_paused_mission_stops_remaining_parallel_tool_calls(self) -> None:
+        mission = AgentMission(city_id=2, title="사진 보강", status="paused")
+        self.assertTrue(_mission_has_no_executable_target(mission, None))
+        mission.status = "active"
+        self.assertFalse(_mission_has_no_executable_target(mission, None))
+        self.assertFalse(
+            _mission_has_no_executable_target(
+                mission,
+                AgentWorkItem(
+                    mission_id=1,
+                    city_id=2,
+                    target_key="place:83",
+                    title="장소",
+                    status="active",
+                ),
+            )
         )
 
     def test_blocked_target_rotates_and_pauses_only_when_every_target_is_blocked(self) -> None:

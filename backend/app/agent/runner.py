@@ -497,6 +497,19 @@ def _active_target_mismatch(
     }
 
 
+def _mission_has_no_executable_target(
+    mission: AgentMission | None,
+    work_item: AgentWorkItem | None,
+) -> bool:
+    """True when the orchestrator has deliberately ended this tool round."""
+
+    return bool(
+        mission is not None
+        and work_item is None
+        and mission.status in {"paused", "completed"}
+    )
+
+
 def _is_material_change(name: str, result: Any) -> bool:
     if name not in MUTATION_TOOLS or not isinstance(result, dict) or result.get("error"):
         return False
@@ -1380,6 +1393,7 @@ def run_agent(
                 }
             )
             continuity_updates: list[dict[str, Any]] = []
+            mission_halted = False
             for tc in tool_calls:
                 raw_args = tc.function.arguments or "{}"
                 try:
@@ -1602,6 +1616,18 @@ def run_agent(
                 )
                 if continuity:
                     continuity_updates.append(continuity)
+                if _mission_has_no_executable_target(active_mission, active_work_item):
+                    # One model response may contain parallel calls. Once the
+                    # orchestrator pauses/completes the mission, later calls no
+                    # longer have a durable target and must not be executed.
+                    mission_halted = True
+                    break
+            if mission_halted:
+                final_text = (
+                    "현재 미션의 실행 가능한 대상이 모두 완료되었거나 차단되어 종료했습니다. "
+                    "저장된 체크포인트와 재시도 조건에서 다음 실행이 이어집니다."
+                )
+                break
             if continuity_updates:
                 messages.append(
                     {
