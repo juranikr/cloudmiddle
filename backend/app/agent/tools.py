@@ -68,6 +68,7 @@ _TRUSTED_SEARCH_HOSTS = (
     "trip.com",
     "baidu.com",
     "amap.com",
+    "360.cn",
     "openstreetmap.org",
     "wikidata.org",
     "wikipedia.org",
@@ -562,6 +563,11 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "판단에 사용한 실제 출처 URL. 최소 1개",
                     },
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "consumption_mode": {
+                        "type": ["string", "null"],
+                        "enum": ["snack", "dessert", "drink", "packaged", "full_meal", "unknown", None],
+                        "description": "먹는 방식. 간식 요청에서는 full_meal을 제안하지 않는다.",
+                    },
                     "insights": {
                         "type": "array",
                         "minItems": 2,
@@ -577,11 +583,11 @@ TOOLS: list[dict[str, Any]] = [
                                 "source_title": {"type": ["string", "null"]},
                                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                             },
-                            "required": ["kind", "title", "content", "source_url", "confidence"],
+                            "required": ["kind", "title", "content", "source_url"],
                         },
                     },
                 },
-                "required": ["title", "lat", "lng", "evidence", "source_urls", "confidence", "insights"],
+                "required": ["title", "lat", "lng", "source_urls", "insights"],
             },
         },
     },
@@ -1384,6 +1390,7 @@ def _extract_embedded_coordinates(html_text: str, url: str) -> list[dict[str, An
     source = ""
     lat_gcj: float
     lng_gcj: float
+    metadata: dict[str, Any] = {}
     if "ctrip.com" in host and re.search(r"/(?:food|foods|fooddetail)/", path):
         # Do not turn a stale search-engine hit into a map proposal.
         if "营业提示：暂停营业" in html_text:
@@ -1404,6 +1411,31 @@ def _extract_embedded_coordinates(html_text: str, url: str) -> list[dict[str, An
             return []
         lat_gcj, lng_gcj = float(lat_match.group(1)), float(lng_match.group(1))
         source = "qunar_embedded_poi"
+    elif host == "m.map.360.cn" and path.startswith("/m/search/detail"):
+        # 360's mobile POI page exposes the selected business as JSON.  It is a
+        # useful account-free fallback for China branch addresses and GCJ-02
+        # coordinates when OSM/Nominatim do not know a local business.
+        marker = re.search(r"window\.__STATE__\s*=\s*", html_text)
+        if not marker:
+            return []
+        try:
+            state, _ = json.JSONDecoder().raw_decode(html_text[marker.end():])
+            poi = state["searchDetailByPguid"]["data"]["poi"]
+            lat_gcj, lng_gcj = float(poi["y"]), float(poi["x"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(poi, dict):
+            return []
+        source = "360map_embedded_poi"
+        metadata = {
+            "display_name": ", ".join(filter(None, [
+                str(poi.get("name") or "").strip(),
+                str(poi.get("address") or "").strip(),
+            ]))[:500],
+            "address": str(poi.get("address") or "").strip()[:300],
+            "external_id": str(poi.get("primaryid") or poi.get("pguid") or "")[:100],
+            "tags": str(poi.get("tags") or "")[:500],
+        }
     else:
         return []
     if not (-90 <= lat_gcj <= 90 and -180 <= lng_gcj <= 180):
@@ -1418,6 +1450,7 @@ def _extract_embedded_coordinates(html_text: str, url: str) -> list[dict[str, An
         "storage_crs": "WGS84",
         "confidence": 0.86,
         "storage_allowed": True,
+        **metadata,
     }]
 
 
@@ -1427,7 +1460,10 @@ def _extract_page_text(url: str) -> dict[str, Any]:
         (
             parsed.scheme,
             parsed.netloc.encode("idna").decode("ascii"),
-            urllib.parse.quote(urllib.parse.unquote(parsed.path), safe="/%:@"),
+            # Some Chinese mobile map detail routes use ``pid=<id>`` as a path
+            # segment.  Encoding that equals sign changes the resource into an
+            # empty shell, so preserve it while still escaping unsafe bytes.
+            urllib.parse.quote(urllib.parse.unquote(parsed.path), safe="/%:@="),
             urllib.parse.quote(urllib.parse.unquote(parsed.query), safe="=&%:+,;@/?"),
             "",
         )
@@ -3212,7 +3248,7 @@ def run_tool(
             "title": page.get("title") or "",
             "text": page.get("text") or "",
         }
-        if not is_useful_fetched_page(candidate_page):
+        if not page.get("coordinate_candidates") and not is_useful_fetched_page(candidate_page):
             return {
                 "error": "page_not_useful_evidence",
                 "detail": "로그인·인증 화면이거나 여행 정보 본문이 없어 검증 근거로 사용할 수 없습니다.",

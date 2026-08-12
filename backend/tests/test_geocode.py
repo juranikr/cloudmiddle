@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from app.agent.tools import _extract_embedded_coordinates
@@ -91,6 +92,37 @@ class GeocodeMergeTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["source"], "qunar_embedded_poi")
+
+    def test_360_map_detail_coordinate_and_identity_are_supported(self) -> None:
+        state = {
+            "searchDetailByPguid": {
+                "data": {
+                    "poi": {
+                        "name": "孙丽丽烤猪蹄(总店)",
+                        "address": "沈阳市沈河区中央里118号",
+                        "x": 123.458152,
+                        "y": 41.801674,
+                        "primaryid": "2aa190301fafe141",
+                        "tags": "餐饮|小吃快餐|小吃|猪蹄",
+                    }
+                }
+            }
+        }
+        html = f"<script>window.__STATE__ = {json.dumps(state, ensure_ascii=False)};try{{}}</script>"
+
+        rows = _extract_embedded_coordinates(
+            html,
+            "https://m.map.360.cn/m/search/detail/pid=2aa190301fafe141",
+        )
+        expected_lat, expected_lng = gcj02_to_wgs84(41.801674, 123.458152)
+
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["lat"], expected_lat, places=6)
+        self.assertAlmostEqual(rows[0]["lng"], expected_lng, places=6)
+        self.assertEqual(rows[0]["source"], "360map_embedded_poi")
+        self.assertEqual(rows[0]["external_id"], "2aa190301fafe141")
+        self.assertIn("孙丽丽烤猪蹄", rows[0]["display_name"])
+        self.assertTrue(rows[0]["storage_allowed"])
 
     def test_paused_ctrip_restaurant_is_not_storable(self) -> None:
         html = (

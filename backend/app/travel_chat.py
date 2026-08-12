@@ -299,6 +299,69 @@ def _classify_chat_intent(
         return ChatIntent(action="answer", goal=message, confidence=0.0)
 
 
+def _classify_snack_fit(
+    client: Any,
+    *,
+    model: str,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Semantically enforce the snack boundary before a place mutation."""
+    payload = {
+        "title": str(candidate.get("title") or ""),
+        "description": str(candidate.get("description") or ""),
+        "evidence": str(candidate.get("evidence") or ""),
+        "insights": candidate.get("insights") if isinstance(candidate.get("insights"), list) else [],
+        "claimed_consumption_mode": str(candidate.get("consumption_mode") or ""),
+    }
+    request: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "사용자는 한 끼 식사가 아닌 여행 중 간식을 사 먹을 장소만 원한다. 후보의 의미를 판단해 "
+                    "JSON 하나로 답하라. 작은 길거리 먹거리, 디저트, 빵·과자·사탕, 아이스크림, 음료, "
+                    "소량 포장 간식은 허용한다. 테이크아웃이 가능하더라도 초밥·면·밥·정식·고기요리처럼 "
+                    "보통 한 끼로 먹는 주식/식당은 거부한다. 불명확하면 거부한다. 반환 필드: "
+                    "allowed(boolean), consumption_mode(snack|dessert|drink|packaged|full_meal|unknown), "
+                    "reason(짧은 한국어), confidence(0~1)."
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+        ],
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+    }
+    if "gpt-oss" in model:
+        request["extra_body"] = {"reasoning_effort": "low"}
+    try:
+        try:
+            response = client.chat.completions.create(**request)
+        except Exception:
+            request.pop("response_format", None)
+            response = client.chat.completions.create(**request)
+        data = _parse_json_object(response.choices[0].message.content or "")
+        mode = str(data.get("consumption_mode") or "unknown")
+        allowed_modes = {"snack", "dessert", "drink", "packaged"}
+        allowed = bool(data.get("allowed")) and mode in allowed_modes
+        return {
+            "ok": True,
+            "allowed": allowed,
+            "consumption_mode": mode if mode in allowed_modes | {"full_meal", "unknown"} else "unknown",
+            "reason": str(data.get("reason") or "간식 범위 판별 근거 없음")[:300],
+            "confidence": max(0.0, min(float(data.get("confidence") or 0), 1.0)),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("travel_chat snack fit classification failed error=%s", str(exc)[:300])
+        return {
+            "ok": False,
+            "allowed": False,
+            "consumption_mode": "unknown",
+            "reason": "간식 범위를 검증하지 못해 저장을 보류했습니다.",
+            "confidence": 0.0,
+        }
+
+
 def _inherit_active_intent(intent: ChatIntent, work: TravelChatWork | None) -> ChatIntent:
     if work is None or not intent.continuation:
         return intent
@@ -639,6 +702,7 @@ def _source_host_quality(url: str) -> float:
     host = (urllib.parse.urlsplit(url).hostname or "").casefold()
     if any(host == item or host.endswith(f".{item}") for item in (
         "dianping.com", "meituan.com", "ctrip.com", "qunar.com", "trip.com",
+        "360.cn",
         "shenyang.gov.cn", "ln.gov.cn", "bendibao.com", "maigoo.com",
     )):
         return 0.9
@@ -1505,6 +1569,18 @@ def answer_travel_chat(
                     + json.dumps(food_bootstrap_pages, ensure_ascii=False, default=str)[:14000]
                 ),
             })
+            if snack_discovery:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "좌표 복구 절차: 정확한 중국어 상호와 지점을 고른 뒤 geocode_place가 비어 있으면 "
+                        "그 상호 + 주소 단서 + 360地图로 web_search하라. 검색 결과의 "
+                        "m.map.360.cn/m/search/detail 상세 페이지를 fetch_page로 읽으면 "
+                        "coordinate_candidates에 GCJ-02에서 WGS84로 변환된 검증 좌표가 들어온다. "
+                        "좌표는 그 값을 그대로 사용하고 임의 추정하지 마라. 메뉴·간식 성격은 Ctrip/Qunar 같은 "
+                        "별도 상세 출처로 교차 확인하고, 360 지도는 지점명·주소·좌표 근거로 사용하라."
+                    ),
+                })
         if write_intent and brand_targets:
             enrichment: list[dict[str, Any]] = []
             chinese_names = {"모어요거트": "茉酸奶", "헤이티": "喜茶 HEYTEA"}
@@ -1694,8 +1770,12 @@ def answer_travel_chat(
                         "완전한 식사 식당은 제안하지 말고 실제 업종에 따라 category=restaurant|drink|shopping, "
                         if snack_discovery else "category=restaurant, "
                     )
-                    + "travel_role=food로 쓰고, 자동으로 "
-                    "읽은 페이지의 실제 URL을 source_urls와 최소 2개 insights에 넣어라. 아직 저장하지 않은 후보만 "
+                    + "travel_role=food로 쓰고, "
+                    + (
+                        "consumption_mode는 snack|dessert|drink|packaged 중 실제 값으로 명시하고, "
+                        if snack_discovery else ""
+                    )
+                    + "자동으로 읽은 페이지의 실제 URL을 source_urls와 최소 2개 insights에 넣어라. 아직 저장하지 않은 후보만 "
                     f"처리한다. 좌표 후보: {json.dumps(pending_geo[-2:], ensure_ascii=False, default=str)[:9000]}"
                 ),
             })
@@ -1798,7 +1878,22 @@ def answer_travel_chat(
                 missing_business_evidence = False
                 coordinate_mismatch = False
                 coordinate_target_unmatched = False
+                snack_scope_invalid = False
+                snack_scope_check: dict[str, Any] | None = None
                 if name == "propose_place":
+                    if snack_discovery:
+                        snack_scope_check = _classify_snack_fit(
+                            client,
+                            model=model,
+                            candidate=args,
+                        )
+                        tool_results.append({
+                            "name": "snack_scope_check",
+                            "args": {"title": str(args.get("title") or "")[:200]},
+                            "result": snack_scope_check,
+                        })
+                        snack_scope_invalid = not bool(snack_scope_check.get("allowed"))
+                        args["consumption_mode"] = snack_scope_check.get("consumption_mode", "unknown")
                     if pending_work:
                         proposed_key = _compact_candidate_text(str(args.get("title") or ""))
                         matching_work_target = next((
@@ -1892,7 +1987,17 @@ def answer_travel_chat(
                             ) ** 0.5 > 1_500
                         except (KeyError, TypeError, ValueError):
                             coordinate_mismatch = True
-                if unsupported_evidence:
+                if snack_scope_invalid:
+                    result = {
+                        "error": "snack_scope_not_met",
+                        "detail": (
+                            "이 후보는 한 끼 식사가 아닌 간식 판매점이라는 조건을 충족하지 않습니다. "
+                            "초밥·면·밥·정식 등 식사 후보를 제외하고 소량 간식·디저트·빵·과자·사탕·"
+                            "아이스크림·음료 판매점을 다시 찾으세요."
+                        ),
+                        "reason": str((snack_scope_check or {}).get("reason") or "")[:300],
+                    }
+                elif unsupported_evidence:
                     result = {
                         "error": "unsupported_source_urls",
                         "detail": "검색·페이지·지오코딩 결과에 실제로 있던 URL만 사용해 다시 호출하세요.",

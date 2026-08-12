@@ -19,6 +19,7 @@ from app.travel_chat import (
     WRITE_TOOLS,
     _brand_source_urls,
     _chat_capabilities,
+    _classify_snack_fit,
     _food_business_name,
     _food_detail_recovery_query,
     _extract_grounded_candidates,
@@ -393,9 +394,35 @@ class TravelChatRoutingTests(unittest.TestCase):
     def test_optional_proposal_fields_accept_model_nulls(self) -> None:
         proposal = next(tool for tool in TOOLS if tool["function"]["name"] == "propose_place")
         properties = proposal["function"]["parameters"]["properties"]
+        required = proposal["function"]["parameters"]["required"]
 
         for field in ("zone_id", "branch_name", "coordinate_external_id", "coordinate_source_url"):
             self.assertIn("null", properties[field]["type"])
+        self.assertNotIn("confidence", required)
+        self.assertNotIn("evidence", required)
+        self.assertIn("consumption_mode", properties)
+        self.assertNotIn("confidence", properties["insights"]["items"]["required"])
+
+    def test_semantic_snack_guard_rejects_meal_and_allows_treat(self) -> None:
+        responses = iter([
+            {"allowed": False, "consumption_mode": "full_meal", "reason": "초밥은 보통 한 끼 식사입니다.", "confidence": 0.96},
+            {"allowed": True, "consumption_mode": "packaged", "reason": "사탕은 소량 포장 간식입니다.", "confidence": 0.99},
+        ])
+
+        class Completions:
+            def create(self, **_kwargs):
+                content = json.dumps(next(responses), ensure_ascii=False)
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+        sushi = _classify_snack_fit(client, model="test-model", candidate={"title": "外带寿司"})
+        candy = _classify_snack_fit(client, model="test-model", candidate={"title": "不老林糖果"})
+
+        self.assertFalse(sushi["allowed"])
+        self.assertEqual(sushi["consumption_mode"], "full_meal")
+        self.assertTrue(candy["allowed"])
+        self.assertEqual(candy["consumption_mode"], "packaged")
 
 
 class _FakeCompletions:
@@ -658,6 +685,10 @@ class TravelChatLoopTests(unittest.TestCase):
                 wants_write=True, starts_new_work=True, requested_count=2,
                 constraints=["takeaway", "walk_and_eat"], exclusions=["full_meal"],
             )),
+            patch("app.travel_chat._classify_snack_fit", return_value={
+                "ok": True, "allowed": True, "consumption_mode": "snack",
+                "reason": "소량 포장 간식", "confidence": 0.99,
+            }),
             patch("app.travel_chat.run_tool", side_effect=fake_tool) as tool,
         ):
             result = answer_travel_chat(
