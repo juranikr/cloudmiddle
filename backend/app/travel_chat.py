@@ -50,11 +50,6 @@ GENERIC_CLARIFICATION_RE = re.compile(
     r"어떤 정보를 원하시는지 알려|구체적인 질문을 파악하기 어렵|"
     r"확인된 자료가 부족해 답을 완성하지 못"
 )
-META_FOLLOWUP_RE = re.compile(
-    r"(?:충족|통과).{0,12}(?:기준|조건)|(?:기준|조건).{0,12}(?:무엇|뭐)|"
-    r"왜.{0,16}(?:실패|못|안\s*(?:돼|되))|뭐가.{0,12}(?:부족|문제)"
-)
-FAILURE_QUESTION_RE = re.compile(r"왜.{0,12}(?:실패|못|안\s*(?:돼|되)|자료.{0,5}부족)|자꾸.{0,10}(?:실패|못|안\s*(?:돼|되))")
 MAX_RESEARCH_TOOL_ROUNDS = 3
 MAX_WRITE_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS_PER_ROUND = 4
@@ -2052,7 +2047,7 @@ def answer_travel_chat(
                 f"요청을 전부 완료하지 못했습니다.{progress} {attempted} "
                 "정확한 지점 좌표와 출처를 갖춘 제안을 만들지 못했습니다. 말로만 제안한 상태를 완료로 처리하지 않았습니다."
             )
-        elif FAILURE_QUESTION_RE.search(message):
+        elif intent.action == "explain_failure":
             final_text = (
                 "앞선 요청을 실제 저장 도구와 연결하지 못해 실패했습니다. 이전의 ‘등록 제안 요약’은 DB 저장 완료가 "
                 "아니었고, 그래서 이어진 짧은 명령도 대상을 잃었습니다. 이제 저장은 DB 제안 행이 생성된 경우에만 완료로 답합니다."
