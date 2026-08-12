@@ -1567,7 +1567,7 @@ def _openverse_image_search(query: str, limit: int = 8) -> list[dict[str, Any]]:
 def _image_relevance(item: dict[str, Any], query: str) -> float:
     haystack = f"{item.get('title', '')} {item.get('page_url', '')}".casefold()
     tokens = [token.casefold() for token in re.findall(r"[\w\u3400-\u9fff]{2,}", query)]
-    score = 24.0 if item.get("provider", "").startswith("Wikimedia") else 18.0
+    score = 24.0 if str(item.get("provider") or "").startswith("Wikimedia") else 18.0
     score += sum(16.0 for token in set(tokens) if token in haystack)
     width = int(item.get("width") or 0)
     height = int(item.get("height") or 0)

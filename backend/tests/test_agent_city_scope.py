@@ -23,7 +23,7 @@ from app.agent.runner import (
     count_unread,
 )
 from app.agent.tools import TOOLS, run_tool
-from app.agent.tools import is_useful_fetched_page
+from app.agent.tools import is_useful_fetched_page, _image_relevance
 from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
 from app.agent.memory import (
@@ -231,6 +231,13 @@ class AgentCityScopeTests(unittest.TestCase):
             "text": "登录 APP扫码，享七天免登录 二维码已失效 账号登录/注册 " * 15,
         }
         self.assertFalse(is_useful_fetched_page(shell))
+
+    def test_image_relevance_handles_nullable_provider_metadata(self) -> None:
+        score = _image_relevance(
+            {"provider": None, "title": "喜茶沈阳大悦城店", "page_url": "", "width": 1200, "height": 800},
+            "喜茶沈阳大悦城店",
+        )
+        self.assertGreater(score, 0)
 
     def test_blocked_target_rotates_and_pauses_only_when_every_target_is_blocked(self) -> None:
         places = self.db.query(Marker).filter(Marker.city_id == 2).all()
