@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
@@ -24,6 +25,7 @@ from app.agent.runner import (
     _step_detail_json,
     _tool_signature,
     count_unread,
+    run_agent,
 )
 from app.agent.tools import TOOLS, run_tool
 from app.agent.tools import is_useful_fetched_page, _image_relevance
@@ -697,6 +699,32 @@ class AgentCityScopeTests(unittest.TestCase):
             _run_outcome_status(unread_after=2, gaps=[], material_change_count=3),
             "partial",
         )
+
+    def test_batch_idles_when_every_durable_task_is_cooling_down(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        task_ids = _sync_quality_tasks(self.db, city_id=2, run_id=1)
+        for task_id in task_ids:
+            task = self.db.get(AgentTask, task_id)
+            self.db.add(AgentMission(
+                city_id=2,
+                task_id=task.id,
+                kind=task.kind,
+                title=task.title,
+                status="paused",
+                progress=json.dumps({"retry_condition": "cooldown"}),
+            ))
+        self.db.commit()
+
+        with patch("app.agent.runner.settings.groq_api_key", "test-key"):
+            result = run_agent(self.db, city_id=2, autonomous_research=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["steps"], 0)
+        run = self.db.query(AgentRun).order_by(AgentRun.id.desc()).first()
+        self.assertEqual(run.mode, "idle")
+        self.assertEqual(json.loads(run.metrics)["idle_reason"], "all_durable_targets_terminal_or_cooling_down")
 
     def test_procedural_checklists_are_not_persisted_as_performance_gaps(self) -> None:
         gaps = _research_gaps({}, {}, {"active_places": 0})

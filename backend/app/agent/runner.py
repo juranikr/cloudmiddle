@@ -1069,6 +1069,52 @@ def run_agent(
             primary_task.attempts += 1
             active_mission, active_work_item = ensure_mission_for_task(db, primary_task)
             db.commit()
+        elif unread_before == 0:
+            # Every durable mission is completed or intentionally cooling down.
+            # Starting a free-form research loop here loses the explicit cursor
+            # and tends to repeat broad searches without a measurable target.
+            # Record a normal idle cycle and let the next schedule re-evaluate
+            # cooldowns, new user events, and newly synchronized quality gaps.
+            performance = _performance_snapshot(db, city_id)
+            idle_run = AgentRun(
+                city_id=city_id,
+                mode="idle",
+                status="completed",
+                objective="No executable durable target; wait for retry conditions or new input.",
+                score=0,
+                metrics=json.dumps({
+                    "before": performance,
+                    "after": performance,
+                    "delta": {},
+                    "tool_counts": {},
+                    "material_changes": [],
+                    "material_change_count": 0,
+                    "idle_reason": "all_durable_targets_terminal_or_cooling_down",
+                    "quality_task_ids_before": quality_task_ids_before,
+                }, ensure_ascii=False),
+                summary=(
+                    "실행 가능한 지속 과제가 없습니다. 완료·차단 상태와 재시도 조건을 유지한 채 "
+                    "새 사용자 입력, 새 품질 공백 또는 냉각 시간 경과를 기다립니다."
+                ),
+                finished_at=datetime.now(timezone.utc),
+            )
+            db.add(idle_run)
+            db.commit()
+            db.refresh(idle_run)
+            return {
+                "ok": True,
+                "status": "completed",
+                "steps": 0,
+                "message": idle_run.summary,
+                "unread_before": 0,
+                "unread_after": 0,
+                "tool_counts": {},
+                "score": 0,
+                "performance": {},
+                "remaining_gaps": _research_gaps({}, {}, performance),
+                "run_id": idle_run.id,
+                "city_id": city_id,
+            }
     continuity_hint = (
         json.dumps(mission_context(active_mission, active_work_item), ensure_ascii=False)[:7000]
         if active_mission is not None and active_work_item is not None
