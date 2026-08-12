@@ -80,6 +80,8 @@ class ChatIntent:
     starts_new_work: bool = False
     requested_count: int | None = None
     target_keys: list[str] | None = None
+    constraints: list[str] | None = None
+    exclusions: list[str] | None = None
     confidence: float = 0.0
 
     def normalized(self) -> "ChatIntent":
@@ -93,6 +95,22 @@ class ChatIntent:
         self.subject = self.subject.strip()[:120]
         self.goal = self.goal.strip()[:500]
         self.target_keys = [str(item)[:80] for item in (self.target_keys or []) if str(item).strip()][:30]
+        self.constraints = [
+            str(item).strip()[:120] for item in (self.constraints or []) if str(item).strip()
+        ][:20]
+        self.exclusions = [
+            str(item).strip()[:120] for item in (self.exclusions or []) if str(item).strip()
+        ][:20]
+        if self.subject == "food_snack":
+            # These are execution semantics of the classified concept, not
+            # phrase matching against the user's wording. They keep a sparse
+            # model response from silently drifting back to full meals.
+            self.constraints = list(dict.fromkeys([
+                *self.constraints, "snack_portion", "takeaway_or_walk_and_eat",
+            ]))
+            self.exclusions = list(dict.fromkeys([
+                *self.exclusions, "full_meal", "sit_down_restaurant",
+            ]))
         if self.requested_count is not None:
             self.requested_count = max(1, min(int(self.requested_count), 20))
         self.confidence = max(0.0, min(float(self.confidence or 0), 1.0))
@@ -177,6 +195,8 @@ def _work_summary(work: TravelChatWork | None) -> dict[str, Any] | None:
             for item in candidates[:20]
         ],
         "completed_keys": list(state.get("completed_keys") or [])[:30],
+        "constraints": list(state.get("constraints") or [])[:20],
+        "exclusions": list(state.get("exclusions") or [])[:20],
         "failed": list(state.get("failed") or [])[-10:],
     }
 
@@ -220,16 +240,21 @@ def _classify_chat_intent(
                     "문장의 의미와 active_work를 함께 이해하라. 반드시 JSON 객체 하나만 반환한다. "
                     "action은 answer|research|write|research_and_write|continue|correct|explain_failure, "
                     "scope는 single|selected|remaining|all|unspecified 중 하나다. "
-                    "subject는 food|drink|spa|lodging|tourism|transport|shopping|itinerary|place_detail|general "
+                    "subject는 food|food_snack|drink|spa|lodging|tourism|transport|shopping|itinerary|place_detail|general "
                     "중 가장 가까운 값으로 정규화한다. "
+                    "한 끼 식사가 아닌 간식·디저트·빵·길거리 먹거리·포장 먹거리를 찾는 요청은 "
+                    "food가 아니라 food_snack이다. 같은 음식 범주여도 식사에서 간식처럼 대상 조건이 "
+                    "바뀌면 새 작업(starts_new_work=true, continuation=false)으로 본다. "
                     "wants_write는 사용자가 지도/DB/일정에 반영·추가·수정하기를 실제로 원할 때만 true다. "
                     "다만 active_work가 조사 후 저장까지 포함하고 사용자가 계속·승인·나머지 처리를 뜻하면 "
                     "그 저장 의도를 이어받는다. starts_new_work는 새 주제일 때만 true다. "
                     "requested_count는 사용자가 수량을 말했거나 '여러 개/다양하게'의 합리적 실행 목표가 "
                     "필요할 때 2~6으로 정하고, 전부/나머지는 null과 scope로 표현한다. "
-                    "target_keys에는 active_work의 특정 후보를 가리킬 때만 key를 넣는다. "
+                    "target_keys에는 active_work의 특정 후보를 가리킬 때만 key를 넣는다. constraints에는 "
+                    "takeaway·walk_and_eat·dessert처럼 반드시 지킬 의미 조건을, exclusions에는 full_meal·"
+                    "sit_down_restaurant처럼 제외할 대상을 짧은 영문 개념으로 넣는다. "
                     "반환 필드: action,scope,subject,goal,wants_research,wants_write,continuation,"
-                    "starts_new_work,requested_count,target_keys,confidence."
+                    "starts_new_work,requested_count,target_keys,constraints,exclusions,confidence."
                 ),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
@@ -250,7 +275,7 @@ def _classify_chat_intent(
         data = _parse_json_object(response.choices[0].message.content or "")
         if not data:
             raise ValueError("empty structured intent")
-        return ChatIntent(
+        intent = ChatIntent(
             action=str(data.get("action") or "answer"),
             scope=str(data.get("scope") or "unspecified"),
             subject=str(data.get("subject") or ""),
@@ -261,8 +286,13 @@ def _classify_chat_intent(
             starts_new_work=bool(data.get("starts_new_work", False)),
             requested_count=data.get("requested_count"),
             target_keys=data.get("target_keys") if isinstance(data.get("target_keys"), list) else [],
+            constraints=data.get("constraints") if isinstance(data.get("constraints"), list) else [],
+            exclusions=data.get("exclusions") if isinstance(data.get("exclusions"), list) else [],
             confidence=float(data.get("confidence") or 0),
         ).normalized()
+        if active_work is None and intent.starts_new_work and intent.scope == "remaining":
+            intent.scope = "all"
+        return intent
     except Exception as exc:  # noqa: BLE001
         # Fail closed for mutations but keep ordinary conversation available.
         logger.warning("travel_chat intent classification failed error=%s", str(exc)[:300])
@@ -277,6 +307,12 @@ def _inherit_active_intent(intent: ChatIntent, work: TravelChatWork | None) -> C
     intent.goal = intent.goal or work.goal
     intent.wants_research = intent.wants_research or bool(state.get("wants_research"))
     intent.wants_write = intent.wants_write or bool(state.get("wants_write"))
+    intent.constraints = list(dict.fromkeys([
+        *(intent.constraints or []), *list(state.get("constraints") or []),
+    ]))
+    intent.exclusions = list(dict.fromkeys([
+        *(intent.exclusions or []), *list(state.get("exclusions") or []),
+    ]))
     if intent.action in {"answer", "continue"}:
         if intent.wants_research and intent.wants_write:
             intent.action = "research_and_write"
@@ -326,6 +362,8 @@ def _ensure_chat_work(
                 "wants_write": intent.wants_write,
                 "candidates": [],
                 "completed_keys": [],
+                "constraints": intent.constraints or [],
+                "exclusions": intent.exclusions or [],
                 "failed": [],
             }, ensure_ascii=False),
         )
@@ -335,6 +373,12 @@ def _ensure_chat_work(
         state = _work_state(active_work)
         state["wants_research"] = bool(state.get("wants_research")) or intent.wants_research
         state["wants_write"] = bool(state.get("wants_write")) or intent.wants_write
+        state["constraints"] = list(dict.fromkeys([
+            *list(state.get("constraints") or []), *(intent.constraints or []),
+        ]))[:20]
+        state["exclusions"] = list(dict.fromkeys([
+            *list(state.get("exclusions") or []), *(intent.exclusions or []),
+        ]))[:20]
         state["next_action"] = "write" if intent.wants_write else state.get("next_action", "research")
         active_work.action = intent.action if intent.action != "continue" else active_work.action
         active_work.scope = intent.scope if intent.scope != "unspecified" else active_work.scope
@@ -415,6 +459,7 @@ def _latest_chat_candidates(
     """
     subject_categories = {
         "food": {"restaurant"},
+        "food_snack": {"restaurant", "drink", "shopping", "other"},
         "drink": {"restaurant", "shopping", "other"},
         "spa": {"other"},
         "lodging": {"hotel"},
@@ -559,7 +604,15 @@ def _candidate_title_from_page(value: str) -> str:
     return title[:160]
 
 
-def _candidate_category(message: str) -> str:
+def _candidate_category(message: str, *, subject: str = "") -> str:
+    if subject in {"food", "food_snack"}:
+        return "restaurant"
+    if subject == "drink":
+        return "drink"
+    if subject == "lodging":
+        return "lodging"
+    if subject == "transport":
+        return "transport"
     folded = message.casefold()
     if any(term in folded for term in ("마사지", "按摩", "spa", "스파", "足疗", "洗浴")):
         return "other"
@@ -613,6 +666,7 @@ def _extract_grounded_candidates(
     *,
     message: str,
     locked_candidate: dict[str, Any] | None = None,
+    subject: str = "",
 ) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
 
@@ -636,7 +690,7 @@ def _extract_grounded_candidates(
         row = grouped.setdefault(existing_key, {
             "title": clean_title,
             "address": "",
-            "category": _candidate_category(message),
+            "category": _candidate_category(message, subject=subject),
             "source_urls": [],
             "lat": None,
             "lng": None,
@@ -892,6 +946,12 @@ def _research_seed_queries(city: City, message: str, *, subject: str = "") -> li
     if not queries and any(term in folded for term in ("마사지", "스파", "按摩", "spa", "足疗", "洗浴")):
         area = " 中街" if any(term in folded for term in ("중제", "中街")) else ""
         queries.append(f"{city.name_local}{area} 正规 洗浴 按摩 推荐")
+    if not queries and subject == "food_snack":
+        queries.extend([
+            f"{city.name_local} 中街 特色小吃 外带 店 地址",
+            f"{city.name_local} 老字号 糕点 点心 门店 地址",
+            f"{city.name_local} 甜品 烘焙 零食 边走边吃 推荐",
+        ])
     if not queries and subject == "food":
         queries.extend([
             f"{city.name_local} 必吃 特色美食 传统小吃",
@@ -1076,7 +1136,9 @@ def answer_travel_chat(
         else []
     )
     locked_candidate = pending_work[0] if len(pending_work) == 1 else None
-    food_discovery = intent.subject == "food"
+    food_discovery = intent.subject in {"food", "food_snack"}
+    snack_discovery = intent.subject == "food_snack"
+    food_place_label = "간식 판매점" if snack_discovery else "식당"
     brand_targets = _brand_targets(resolved_message)
     travel_profile = build_user_travel_profile(db, user_id=user_id, city_id=city_id)
     existing_target_places: dict[str, Marker] = {}
@@ -1312,7 +1374,7 @@ def answer_travel_chat(
         return fetched
 
     food_bootstrap_pages: list[dict[str, Any]] = []
-    if food_discovery and write_intent:
+    if food_discovery and not snack_discovery and write_intent:
         for url in CITY_FOOD_DETAIL_SOURCES.get(city.slug, ()):
             if len(food_geo_candidates) >= 2:
                 break
@@ -1397,12 +1459,9 @@ def answer_travel_chat(
         if pending_work:
             seed_queries = [_candidate_seed_query(city, item) for item in pending_work[:6]]
         elif food_discovery:
-            seed_queries = [
-                f"{city.name_local} 必吃 特色美食 传统小吃",
-                f"{city.name_local} 老字号 特色餐厅 推荐",
-            ]
+            seed_queries = _research_seed_queries(city, resolved_message, subject=intent.subject)
         else:
-            seed_queries = _research_seed_queries(city, resolved_message)
+            seed_queries = _research_seed_queries(city, resolved_message, subject=intent.subject)
         for seed_query in seed_queries:
             seed_args = {"query": seed_query, "max_results": 8}
             seed_result = run_tool(db, "web_search", seed_args, city_id=city_id)
@@ -1429,9 +1488,17 @@ def answer_travel_chat(
             messages.append({
                 "role": "system",
                 "content": (
-                    "이번 요청은 음식 발견 작업이다. 1) 선양을 대표하는 음식 유형을 먼저 2~4개로 좁히고, "
-                    "2) 각 유형을 실제로 파는 구체적인 식당/지점을 찾고, 3) 페이지 근거와 지오코딩 좌표를 "
-                    "검증한 뒤, 저장 요청이면 서로 다른 식당을 최소 2건 propose_place로 승인 대기에 저장하라. "
+                    f"이번 요청은 {'한 끼 식사가 아닌 간식 발견' if snack_discovery else '음식 발견'} 작업이다. "
+                    + (
+                        "일반 식당과 완전한 식사 메뉴는 제외한다. 포장하거나 걸으며 조금씩 먹기 좋은 현지 小吃·"
+                        "糕点·甜品·烘焙·零食의 구체적인 판매점/지점을 찾는다. 카테고리는 실제 업종에 따라 "
+                        "restaurant·drink·shopping 중 고르고 travel_role=food로 저장한다. "
+                        if snack_discovery else
+                        "1) 선양을 대표하는 음식 유형을 먼저 2~4개로 좁히고, 2) 각 유형을 실제로 파는 "
+                        "구체적인 식당/지점을 찾는다. "
+                    )
+                    + "페이지 근거와 지오코딩 좌표를 검증한 뒤, 저장 요청이면 서로 다른 "
+                    f"{food_place_label}을 최소 2건 propose_place로 승인 대기에 저장하라. "
                     "검색 결과 제목만으로 주소나 지점을 만들어내지 말고, 검증이 안 된 후보는 저장하지 마라. "
                     "다음은 이 도시의 로컬 지식 소스에서 방금 다시 읽어 좌표까지 검증한 상세 페이지다. "
                     "현재 지도 DB에 없는 후보만 우선 저장하고 동적 검색으로 보완하라:\n"
@@ -1606,20 +1673,28 @@ def answer_travel_chat(
             and write_intent
             and len(food_geo_candidates) > len(set(proposal_ids))
         ):
-            # Keep every permitted schema available because Groq can carry a
-            # research call over from accumulated context. The required choice and
-            # phase prompt still demand an action, while drift no longer becomes a 400.
+            # Keep every permitted schema available because the model can
+            # legitimately decide that a coordinate-bearing page still lacks a
+            # concrete branch identity. Requiring *a* tool preserves forward
+            # progress without the provider-level 400 caused by forcing
+            # propose_place while the model requests another search/fetch.
             round_tools = set(allowed)
-            round_choice = {"type": "function", "function": {"name": "propose_place"}}
+            round_choice = "required"
             pending_geo = food_geo_candidates[len(set(proposal_ids)):]
             messages.append({
                 "role": "system",
                 "content": (
-                    "검증 가능한 식당 좌표가 준비됐다. 이제 검색을 더 하지 말고 propose_place로 관리자 승인 대기에 "
-                    "실제 저장하라. title은 '중국어 원명 (한국어 음역·지점명)' 형식으로 쓰고 中街는 중제라고 "
+                    f"검증 가능한 {food_place_label} 좌표 후보가 준비됐다. 구체적인 상호·지점과 근거가 충분하면 "
+                    "propose_place로 관리자 승인 대기에 실제 저장하라. 아직 페이지가 음식 종류만 설명하거나 "
+                    "지점 정체성이 불명확하면 필요한 검색·페이지 열람을 한 번 더 하고, 다음 단계에서 저장하라. "
+                    "title은 '중국어 원명 (한국어 음역·지점명)' 형식으로 쓰고 中街는 중제라고 "
                     "표기한다. 总店은 본점, 熏肉大饼은 훈제고기 전병처럼 자연스럽게 번역하고 기계식 한자음을 "
                     "쓰지 않는다. 역사 연도와 수식어는 상세 페이지 본문에 명시된 경우에만 출처를 밝혀 쓴다. "
-                    "category=restaurant, travel_role=food로 쓰고, 자동으로 "
+                    + (
+                        "완전한 식사 식당은 제안하지 말고 실제 업종에 따라 category=restaurant|drink|shopping, "
+                        if snack_discovery else "category=restaurant, "
+                    )
+                    + "travel_role=food로 쓰고, 자동으로 "
                     "읽은 페이지의 실제 URL을 source_urls와 최소 2개 insights에 넣어라. 아직 저장하지 않은 후보만 "
                     f"처리한다. 좌표 후보: {json.dumps(pending_geo[-2:], ensure_ascii=False, default=str)[:9000]}"
                 ),
@@ -1634,9 +1709,10 @@ def answer_travel_chat(
                 messages.append({
                     "role": "system",
                     "content": (
-                        "넓은 음식 종류 검색만 반복하지 마라. 지금까지 읽은 페이지에서 구체적인 식당명을 하나 골라 "
+                        f"넓은 {'간식 종류' if snack_discovery else '음식 종류'} 검색만 반복하지 마라. 지금까지 읽은 "
+                        f"페이지에서 구체적인 {food_place_label} 상호를 하나 골라 "
                         "정확한 지점명·주소를 검색/fetch_page로 확인하고 geocode_place를 실행하라. 이미 한 후보를 "
-                        "저장했다면 서로 다른 두 번째 식당을 같은 순서로 처리하라. web_search 인자는 query와 "
+                        f"저장했다면 서로 다른 두 번째 {food_place_label}을 같은 순서로 처리하라. web_search 인자는 query와 "
                         "max_results만 사용한다."
                     ),
                 })
@@ -2000,7 +2076,7 @@ def answer_travel_chat(
                 ),
             })
             fallback = (
-                "선양의 대표 음식과 식당 후보를 조사했지만 확인된 결과를 안전하게 요약하지 못했습니다."
+                f"선양의 {food_place_label} 후보를 조사했지만 확인된 결과를 안전하게 요약하지 못했습니다."
                 if food_discovery
                 else "현재 지도와 확인된 자료만으로 답을 특정하지 못했습니다."
             )
@@ -2060,6 +2136,7 @@ def answer_travel_chat(
         tool_results,
         message=resolved_message,
         locked_candidate=locked_candidate,
+        subject=intent.subject,
     )
     # A grounded recommendation is useful conversation state even before a write
     # request. Resolve its exact position once on the server so the next short
@@ -2087,6 +2164,7 @@ def answer_travel_chat(
                 tool_results,
                 message=resolved_message,
                 locked_candidate=locked_candidate,
+                subject=intent.subject,
             )
     if proposal_ids:
         for index, candidate in enumerate(turn_candidates):
@@ -2139,7 +2217,9 @@ def answer_travel_chat(
             if failed:
                 parts.append(f"{', '.join(failed)}은 근거가 있었지만 저장 도구가 성공하지 않아 DB 제안이 생성되지 않았습니다.")
             if food_discovery and proposal_ids:
-                parts.append(f"식당 후보 {len(set(proposal_ids))}건은 승인 대기 제안으로 실제 저장했습니다.")
+                parts.append(
+                    f"{food_place_label} 후보 {len(set(proposal_ids))}건은 승인 대기 제안으로 실제 저장했습니다."
+                )
             elif locked_candidate and turn_candidates:
                 retained = turn_candidates[0]
                 parts.append(
@@ -2153,7 +2233,16 @@ def answer_travel_chat(
             elif not brand_targets:
                 parts.append("성공한 저장 도구가 없어 DB 변경은 발생하지 않았습니다.")
             if food_discovery:
-                parts.append("음식 유형 → 실제 식당 → 지점 근거·좌표 순으로 검증했지만 최소 2개 식당 저장 기준을 충족하지 못했습니다.")
+                if snack_discovery:
+                    parts.append(
+                        "식사 메뉴를 제외하고 간식 유형 → 실제 판매점 → 지점 근거·좌표 순으로 검증했지만 "
+                        "최소 2개 간식 판매점 저장 기준을 충족하지 못했습니다."
+                    )
+                else:
+                    parts.append(
+                        "음식 유형 → 실제 식당 → 지점 근거·좌표 순으로 검증했지만 최소 2개 식당 저장 기준을 "
+                        "충족하지 못했습니다."
+                    )
             parts.append("미완료 대상과 다음 행동은 작업 원장에 보존했으며, 다음 ‘계속’ 요청에서 이어갑니다.")
             final_text = " ".join(parts)
 

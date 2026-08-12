@@ -344,6 +344,31 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertEqual(queries, ["沈阳 必吃 特色美食 传统小吃", "沈阳 老字号 特色餐厅 推荐"])
         self.assertTrue(all("등록해줬으면" not in query for query in queries))
 
+    def test_snack_request_has_distinct_semantic_queries_and_exclusions(self) -> None:
+        city = City(name_local="沈阳")
+        intent = ChatIntent(
+            action="research_and_write",
+            subject="food_snack",
+            goal="find portable snacks",
+            wants_research=True,
+            wants_write=True,
+            starts_new_work=True,
+            constraints=["takeaway", "walk_and_eat"],
+            exclusions=["full_meal", "sit_down_restaurant"],
+        ).normalized()
+
+        queries = _research_seed_queries(
+            city,
+            "완전한 식사 말고 간식을 찾아서 추가해줘",
+            subject=intent.subject,
+        )
+
+        self.assertEqual(intent.subject, "food_snack")
+        self.assertIn("full_meal", intent.exclusions)
+        self.assertTrue(any("外带" in query for query in queries))
+        self.assertTrue(any("糕点" in query for query in queries))
+        self.assertTrue(all("特色餐厅" not in query for query in queries))
+
     def test_answer_validation_requires_each_brand_and_removes_fake_urls(self) -> None:
         self.assertEqual(
             _missing_brand_targets("모어요거트와 헤이티", "喜茶 지점만 확인했습니다."),
@@ -449,6 +474,53 @@ class _FailingCompletions:
         raise RuntimeError("Tool choice is none, but model called a tool")
 
 
+class _SnackResearchThenWriteCompletions:
+    """Reproduces Groq asking for more research after a coordinate appears."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    @staticmethod
+    def proposal_call(call_id: str, title: str, url: str, lat: float, lng: float):
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(
+                name="propose_place",
+                arguments=json.dumps({
+                    "title": title,
+                    "category": "restaurant",
+                    "travel_role": "food",
+                    "lat": lat,
+                    "lng": lng,
+                    "evidence": "간식 판매점 상세 페이지에서 상호, 지점과 위치를 확인했습니다.",
+                    "source_urls": [url],
+                    "insights": [
+                        {"kind": "location", "title": "위치", "content": "상세 페이지 위치", "source_url": url},
+                        {"kind": "tip", "title": "간식", "content": "포장 가능한 소량 간식", "source_url": url},
+                    ],
+                    "confidence": 0.9,
+                }, ensure_ascii=False),
+            ),
+        )
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if len(self.requests) == 1:
+            call = SimpleNamespace(
+                id="research-more",
+                function=SimpleNamespace(
+                    name="web_search",
+                    arguments=json.dumps({"query": "沈阳 中街 冰点 外带 地址", "max_results": 5}, ensure_ascii=False),
+                ),
+            )
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[call]))])
+        calls = [
+            self.proposal_call("snack-1", "中街冰点 (중제 빙과점)", "https://example.com/ice", 41.801, 123.451),
+            self.proposal_call("snack-2", "老字号糕点铺 (노포 제과점)", "https://example.com/pastry", 41.802, 123.452),
+        ]
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=calls))])
+
+
 class TravelChatLoopTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite:///:memory:")
@@ -532,6 +604,77 @@ class TravelChatLoopTests(unittest.TestCase):
         self.assertEqual(tool.call_args_list[0].args[1], "web_search")
         self.assertIn("沈阳", tool.call_args_list[0].args[2]["query"])
         self.assertNotIn("tools", completions.requests[-1])
+
+    def test_snack_write_allows_more_research_instead_of_forced_tool_400(self) -> None:
+        completions = _SnackResearchThenWriteCompletions()
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+        places = {
+            "ice": ("中街冰点", 41.801, 123.451),
+            "pastry": ("老字号糕点铺", 41.802, 123.452),
+            "candy": ("不老林糖果", 41.803, 123.453),
+        }
+        proposal_number = 40
+
+        def fake_tool(_db, name, args, *, city_id):
+            nonlocal proposal_number
+            self.assertEqual(city_id, 1)
+            if name == "web_search":
+                query = str(args.get("query") or "")
+                key = "pastry" if "糕点" in query else "candy" if "甜品" in query else "ice"
+                title, _lat, _lng = places[key]
+                return {"results": [{
+                    "href": f"https://example.com/{key}",
+                    "title": title,
+                    "body": f"沈阳 {title} 外带 간식 판매점",
+                }]}
+            if name == "fetch_page":
+                key = str(args["url"]).rsplit("/", 1)[-1]
+                title, lat, lng = places[key]
+                return {
+                    "url": args["url"],
+                    "title": title,
+                    "text": f"{title} 포장 간식 판매점 상세 정보",
+                    "coordinate_candidates": [{
+                        "display_name": title,
+                        "lat": lat,
+                        "lng": lng,
+                        "confidence": 0.9,
+                        "storage_allowed": True,
+                    }],
+                }
+            if name == "propose_place":
+                proposal_number += 1
+                return {"ok": True, "proposal_created": True, "proposal_id": proposal_number}
+            return {"results": []}
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="research_and_write", scope="all", subject="food_snack",
+                goal="식사가 아닌 간식 판매점을 찾아 지도에 추가", wants_research=True,
+                wants_write=True, starts_new_work=True, requested_count=2,
+                constraints=["takeaway", "walk_and_eat"], exclusions=["full_meal"],
+            )),
+            patch("app.travel_chat.run_tool", side_effect=fake_tool) as tool,
+        ):
+            result = answer_travel_chat(
+                self.db,
+                user_id=1,
+                city_id=1,
+                message="완전 식사 말고 간식도 찾아서 추가해줘.",
+            )
+
+        self.assertEqual(completions.requests[0]["tool_choice"], "required")
+        self.assertIn(
+            "web_search",
+            {item["function"]["name"] for item in completions.requests[0]["tools"]},
+        )
+        self.assertTrue(any(call.args[1] == "web_search" for call in tool.call_args_list))
+        self.assertEqual(sum(call.args[1] == "propose_place" for call in tool.call_args_list), 2)
+        self.assertIn("승인 대기 제안", result["row"].content)
 
     def test_simple_question_uses_one_tool_free_completion(self) -> None:
         completions = _FakeCompletions(tool_rounds=0)
