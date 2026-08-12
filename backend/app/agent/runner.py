@@ -763,7 +763,11 @@ def _sync_quality_tasks(
             db.add(row)
             db.flush()
         target_changed = row.detail != detail
-        if target_changed:
+        # Keep the dimension-level attempt count while a task is still open.
+        # Otherwise every small target-list change (for example one new photo)
+        # resets the image task to priority 100 and starves drafts/info again.
+        # A genuinely completed dimension that later gains a new gap starts fresh.
+        if target_changed and row.status == "completed":
             row.attempts = 0
         was_false_completion = row.status == "completed" and not target_changed
         if row.status != "pending":

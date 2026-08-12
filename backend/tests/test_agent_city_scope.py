@@ -214,9 +214,11 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(duplicate["error"], "quality_gap_already_tracked")
         self.assertEqual(duplicate["task_id"], image_task.id)
         image_task.attempts = 1
+        place.description = "x" * 61
         self.db.commit()
         _sync_quality_tasks(self.db, city_id=2, run_id=21)
         self.db.refresh(image_task)
+        self.assertEqual(image_task.attempts, 1)
         self.assertLess(image_task.priority, 96)
 
         self.db.add(PlaceImage(place_id=place.id, s3_key="places/test.jpg"))
