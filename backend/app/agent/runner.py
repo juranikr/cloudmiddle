@@ -719,9 +719,10 @@ def _sync_quality_tasks(
         row.title = spec["title"]
         row.detail = detail
         row.success_metric = spec["metric"]
-        # Two unchanged failed cycles trigger a cooldown so another quality
-        # dimension can progress instead of retrying an impossible source forever.
-        cooldown = 36 if row.attempts >= 2 or was_false_completion else 0
+        # One unchanged attempted cycle is enough to cool this dimension down.
+        # Exact local-business photos are often absent from free-media sources;
+        # the next run must progress drafts/info instead of retrying forever.
+        cooldown = 36 if row.attempts >= 1 or was_false_completion else 0
         row.priority = max(50, int(spec["priority"]) - cooldown)
         row.status = "pending"
         row.completed_at = None
@@ -1007,6 +1008,7 @@ def run_agent(
     evidence_keys: set[str] = set()
     material_changes: list[dict[str, Any]] = []
     repeated_calls = 0
+    image_searches_by_place: dict[int, int] = {}
     work_nudges = 0
     progress_nudges = 0
     material_nudges = 0
@@ -1128,7 +1130,26 @@ def run_agent(
                 tool_counts[name] = tool_counts.get(name, 0) + 1
                 signature = _tool_signature(name, args)
                 repeated = name in EXPENSIVE_RESEARCH_TOOLS and signature in seen_expensive_calls
-                if repeated:
+                image_place_id = None
+                if name == "search_place_images" and args.get("place_id") is not None:
+                    try:
+                        image_place_id = int(args["place_id"])
+                    except (TypeError, ValueError):
+                        image_place_id = None
+                image_budget_exhausted = bool(
+                    image_place_id is not None
+                    and image_searches_by_place.get(image_place_id, 0) >= 3
+                )
+                if image_budget_exhausted:
+                    result = {
+                        "error": "place_image_search_budget_exhausted",
+                        "detail": (
+                            f"장소 #{image_place_id}는 이번 실행에서 이미 이미지 검색 3회를 사용했습니다. "
+                            "관련 없는 인근 사진을 붙이지 말고 실패 근거를 과제 result에 남긴 뒤 다음 장소나 "
+                            "다른 품질 과제로 이동하세요."
+                        ),
+                    }
+                elif repeated:
                     repeated_calls += 1
                     result = {
                         "error": "duplicate_tool_call",
@@ -1137,6 +1158,10 @@ def run_agent(
                 else:
                     if name in EXPENSIVE_RESEARCH_TOOLS:
                         seen_expensive_calls.add(signature)
+                    if image_place_id is not None:
+                        image_searches_by_place[image_place_id] = (
+                            image_searches_by_place.get(image_place_id, 0) + 1
+                        )
                     result = run_tool(db, name, args, city_id=city_id)
                 error = isinstance(result, dict) and bool(result.get("error"))
                 if not error:
@@ -1208,7 +1233,7 @@ def run_agent(
                         "content": json.dumps(result, ensure_ascii=False)[:12000],
                     }
                 )
-            if no_material_actions >= 24 and no_material_actions < 40 and material_nudges < 2:
+            if no_material_actions >= 12 and no_material_actions < 32 and material_nudges < 2:
                 material_nudges += 1
                 messages.append({
                     "role": "user",
@@ -1219,7 +1244,7 @@ def run_agent(
                         "측정 가능한 upsert_agent_task로 남긴 뒤 다른 목표로 이동하세요."
                     ),
                 })
-            if no_material_actions >= 40:
+            if no_material_actions >= 32:
                 final_text = (
                     f"연속 {no_material_actions}개 행동이 실제 DB 변화로 이어지지 않아 안전 종료했습니다. "
                     "확보한 근거와 남은 공백은 다음 실행의 측정 가능한 백로그로 넘깁니다."
@@ -1262,6 +1287,7 @@ def run_agent(
                         "successful_tool_counts": successful_tool_counts,
                         "material_changes": material_changes,
                         "repeated_calls_blocked": repeated_calls,
+                        "image_searches_by_place": image_searches_by_place,
                         "evidence_count": len(evidence_keys),
                     },
                     ensure_ascii=False,
@@ -1341,6 +1367,7 @@ def run_agent(
                 "material_change_count": len(material_changes),
                 "evidence_count": len(evidence_keys),
                 "repeated_calls_blocked": repeated_calls,
+                "image_searches_by_place": image_searches_by_place,
                 "remaining_gaps": gaps,
                 "gap_task_ids": gap_task_ids,
                 "quality_task_ids_before": quality_task_ids_before,
