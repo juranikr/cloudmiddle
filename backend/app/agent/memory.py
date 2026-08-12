@@ -63,6 +63,12 @@ def _dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+def _db_text(value: Any, limit: int) -> str:
+    """Normalize untrusted web text before storing it in PostgreSQL text."""
+
+    return str(value or "").replace("\x00", "")[:limit]
+
+
 def _tokens(*values: Any) -> set[str]:
     text = " ".join(str(value or "") for value in values).casefold()
     return {
@@ -469,15 +475,20 @@ def _result_urls(tool: str, args: dict[str, Any], result: Any) -> Iterable[dict[
             url = str(item.get("href") or item.get("url") or item.get("image_url") or "")
             if url:
                 output.append({
-                    "url": url,
-                    "title": str(item.get("title") or ""),
-                    "excerpt": str(item.get("body") or item.get("text") or item.get("snippet") or "")[:3000],
+                    "url": _db_text(url, 1000),
+                    "title": _db_text(item.get("title"), 300),
+                    "excerpt": _db_text(item.get("body") or item.get("text") or item.get("snippet"), 3000),
                     "source_status": "seen" if item.get("seen") else "discovered",
                 })
         return output
     if tool == "fetch_page":
-        url = str(result.get("url") or args.get("url") or "")
-        return [{"url": url, "title": str(result.get("title") or ""), "excerpt": str(result.get("text") or "")[:5000], "source_status": "validated"}] if url else []
+        url = _db_text(result.get("url") or args.get("url"), 1000)
+        return [{
+            "url": url,
+            "title": _db_text(result.get("title"), 300),
+            "excerpt": _db_text(result.get("text"), 5000),
+            "source_status": "validated",
+        }] if url else []
     return []
 
 

@@ -227,6 +227,46 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.assertEqual(seen_continuity["next_action"]["tool"], "choose_alternative_source")
 
+    def test_checkpoint_strips_nul_from_untrusted_web_evidence(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_verification",
+            title="verify web text",
+            detail=f"targets:\n- #{place.id} {place.title}",
+            success_metric="validated source",
+            priority=78,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        run = AgentRun(city_id=2, mission_id=mission.id, work_item_id=item.id, status="running")
+        self.db.add(run)
+        self.db.commit()
+
+        checkpoint_after_tool(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=1,
+            tool="fetch_page",
+            args={"url": "https://example.test/hotel"},
+            result={
+                "url": "https://example.test/hotel",
+                "title": "hotel\x00 title",
+                "text": "usable\x00 hotel evidence",
+            },
+            outcome="ok",
+            new_evidence_count=1,
+            material_change=False,
+        )
+        self.db.commit()
+
+        evidence = self.db.query(AgentEvidence).one()
+        self.assertEqual(evidence.title, "hotel title")
+        self.assertEqual(evidence.excerpt, "usable hotel evidence")
+
     def test_material_progress_resets_consecutive_failure_rotation_count(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
         task = AgentTask(
