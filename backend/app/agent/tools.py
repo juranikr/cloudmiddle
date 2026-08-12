@@ -122,6 +122,9 @@ _PAGE_CHALLENGE_MARKERS = (
     "登录后查看",
     "captcha",
     "access denied",
+    "odm products",
+    "mini projector",
+    "android tv box",
 )
 
 _SHENYANG_DISTRICTS = {
@@ -194,6 +197,15 @@ def _district_tokens(value: str) -> set[str]:
         district
         for district, aliases in _SHENYANG_DISTRICTS.items()
         if any(alias.casefold() in folded for alias in aliases)
+    }
+
+
+def _insight_fact_tokens(value: str) -> set[str]:
+    """Stable factual identifiers used to collapse title-only duplicate insights."""
+    folded = str(value or "").casefold()
+    return {
+        re.sub(r"\s+", "", token)
+        for token in re.findall(r"(?:\+?\d[\d\s-]{6,}\d)", folded)
     }
 
 
@@ -2272,6 +2284,22 @@ def run_tool(
                 PlaceInsight.title == title_s,
             ).first()
             if row is None:
+                incoming_facts = _insight_fact_tokens(content_s)
+                same_source_rows = db.query(PlaceInsight).filter(
+                    PlaceInsight.place_id == pid,
+                    PlaceInsight.kind == kind,
+                    PlaceInsight.source_url == source_url,
+                ).all()
+                row = next(
+                    (
+                        existing
+                        for existing in same_source_rows
+                        if incoming_facts
+                        and incoming_facts == _insight_fact_tokens(existing.content)
+                    ),
+                    None,
+                )
+            if row is None:
                 row = PlaceInsight(place_id=pid, kind=kind, title=title_s)
                 db.add(row)
             row.content = content_s
@@ -2674,6 +2702,7 @@ def run_tool(
                 row = AgentTask(city_id=city_id, title=title)
                 db.add(row)
                 created = True
+        managed_existing = bool(row.kind.startswith("quality_"))
         before = (
             row.kind,
             row.detail,
@@ -2682,12 +2711,21 @@ def run_tool(
             row.status,
             row.result,
         )
-        row.kind = str(args.get("kind") or row.kind or "research")[:30]
-        row.detail = str(args.get("detail") or row.detail or "")[:8000]
-        row.success_metric = str(args.get("success_metric") or row.success_metric or "")[:2000]
-        row.priority = max(1, min(int(args.get("priority") or row.priority or 50), 100))
+        if managed_existing:
+            # Exact quality tasks are derived from the DB.  The model may record a
+            # blocker/result, but must not rename or reclassify them and cause the
+            # synchronizer to create a duplicate replacement task.
+            blocker = str(args.get("result") or args.get("detail") or "").strip()
+            if blocker:
+                row.result = blocker[:8000]
+        else:
+            row.kind = str(args.get("kind") or row.kind or "research")[:30]
+            row.detail = str(args.get("detail") or row.detail or "")[:8000]
+            row.success_metric = str(args.get("success_metric") or row.success_metric or "")[:2000]
+            row.priority = max(1, min(int(args.get("priority") or row.priority or 50), 100))
         row.status = status_value if status_value in {"pending", "completed", "blocked"} else "pending"
-        row.result = str(args.get("result") or row.result or "")[:8000]
+        if not managed_existing:
+            row.result = str(args.get("result") or row.result or "")[:8000]
         if row.status == "completed":
             row.completed_at = datetime.now(timezone.utc)
         after = (

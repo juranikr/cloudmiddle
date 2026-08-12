@@ -385,6 +385,59 @@ class AgentCityScopeTests(unittest.TestCase):
             city_id=2,
         )
         self.assertEqual(accepted["changed"], 1)
+        duplicate_fact = dict(insight)
+        duplicate_fact.update({
+            "title": "연락처",
+            "content": "문의 024-96833, 주차 024-89398383",
+        })
+        first_phone_fact = dict(insight)
+        first_phone_fact.update({
+            "title": "전화번호",
+            "content": "주차 024-89398383, 문의 024-96833",
+        })
+        run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                "place_id": place.id,
+                "insights": [first_phone_fact, duplicate_fact],
+                "_validated_source_urls": ["https://example.test/place-guide"],
+            },
+            city_id=2,
+        )
+        phone_rows = self.db.query(PlaceInsight).filter(
+            PlaceInsight.place_id == place.id,
+            PlaceInsight.source_url == "https://example.test/place-guide",
+            PlaceInsight.content.like("%024-%"),
+        ).all()
+        self.assertEqual(len(phone_rows), 1)
+
+    def test_managed_quality_task_cannot_be_reclassified_by_agent(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task_id = _sync_quality_tasks(self.db, city_id=2)[0]
+        task = self.db.get(AgentTask, task_id)
+        original = (task.kind, task.title, task.detail, task.success_metric, task.priority)
+        result = run_tool(
+            self.db,
+            "upsert_agent_task",
+            {
+                "task_id": task.id,
+                "kind": "research",
+                "title": "renamed",
+                "detail": f"장소 #{place.id}의 출처가 막혀 다음 실행에서 재검증 필요",
+                "success_metric": "changed metric",
+                "priority": 1,
+                "status": "pending",
+            },
+            city_id=2,
+        )
+        self.db.refresh(task)
+        self.assertTrue(result["changed"])
+        self.assertEqual(
+            (task.kind, task.title, task.detail, task.success_metric, task.priority),
+            original,
+        )
+        self.assertIn("다음 실행", task.result)
 
     def test_admin_agent_history_can_be_scoped_to_city(self) -> None:
         for city_id in (1, 2):
