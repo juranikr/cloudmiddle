@@ -1258,6 +1258,19 @@ def _title_subjects(title: str) -> list[str]:
     return [candidate for candidate in candidates if len(candidate) >= 4]
 
 
+def _source_mentions_place(marker: Marker, *values: Any) -> bool:
+    """Require exact-place evidence for branch facts and attached images."""
+
+    aliases = _title_subjects(marker.title)
+    branch = _compact_subject(marker.branch_name or "")
+    if len(branch) >= 4:
+        aliases.append(branch)
+    haystack = _compact_subject(
+        " ".join(urllib.parse.unquote(str(value or "")) for value in values)
+    )
+    return bool(haystack and any(alias in haystack for alias in aliases))
+
+
 def _has_cjk(s: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in s)
 
@@ -2262,6 +2275,26 @@ def run_tool(
         raw_items = args.get("insights") or []
         if not isinstance(raw_items, list):
             return {"error": "bad_insights"}
+        if m.branch_name:
+            for raw in raw_items:
+                if not isinstance(raw, dict):
+                    continue
+                kind = str(raw.get("kind") or "").strip().lower()
+                if kind not in {"location", "visit", "tip"}:
+                    continue
+                if not _source_mentions_place(
+                    m,
+                    raw.get("source_title"),
+                    raw.get("source_url"),
+                ):
+                    return {
+                        "error": "insight_branch_source_mismatch",
+                        "detail": (
+                            f"{m.title}의 지점별 위치·방문 정보에는 지점명 '{m.branch_name}'이 "
+                            "확인되는 출처가 필요합니다. 브랜드 일반 페이지의 내용을 특정 지점의 "
+                            "주소·영업시간·방문 팁으로 저장할 수 없습니다."
+                        ),
+                    }
         validated_urls = {
             normalized
             for raw in (args.get("_validated_source_urls") or [])
@@ -3189,8 +3222,6 @@ def run_tool(
         source = str(args.get("source") or "")[:500]
         if not requested_url.lower().startswith("https://"):
             return {"error": "bad_url"}
-        if not storage.s3_enabled():
-            return {"error": "s3_disabled"}
         m = (
             db.query(Marker)
             .options(joinedload(Marker.images))
@@ -3203,6 +3234,16 @@ def run_tool(
         )
         if not m:
             return {"error": "not_found"}
+        if not _source_mentions_place(m, source, requested_url):
+            return {
+                "error": "image_source_subject_mismatch",
+                "detail": (
+                    f"이미지 출처 제목/URL에서 대상 장소 '{m.title}'을 확인할 수 없습니다. "
+                    "단순 인근 사진은 첨부하지 말고 장소명이 직접 일치하는 사진만 사용하세요."
+                ),
+            }
+        if not storage.s3_enabled():
+            return {"error": "s3_disabled"}
         if len(m.images) >= 8:
             return {"error": "too_many_images"}
         commons = _commons_image_from_source(source)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -674,6 +675,45 @@ class AgentCityScopeTests(unittest.TestCase):
             PlaceInsight.content.like("%024-%"),
         ).all()
         self.assertEqual(len(phone_rows), 1)
+
+    def test_branch_insight_rejects_brand_general_source(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.branch_name = "沈阳大悦城店"
+        self.db.commit()
+        source_url = "https://baike.example.test/item/brand"
+        result = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                "place_id": place.id,
+                "insights": [{
+                    "kind": "tip",
+                    "title": "영업시간",
+                    "content": "매일 24시간 영업한다고 안내되어 있습니다.",
+                    "source_url": source_url,
+                    "source_title": "브랜드 일반 소개",
+                    "confidence": 0.8,
+                }],
+                "_validated_source_urls": [source_url],
+            },
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "insight_branch_source_mismatch")
+
+    def test_image_attachment_rejects_nearby_subject(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        with patch("app.agent.tools.storage.s3_enabled", return_value=True):
+            result = run_tool(
+                self.db,
+                "attach_image_from_url",
+                {
+                    "place_id": place.id,
+                    "image_url": "https://upload.wikimedia.org/nearby-building.jpg",
+                    "source": "Wikimedia Commons - nearby parking garage",
+                },
+                city_id=2,
+            )
+        self.assertEqual(result["error"], "image_source_subject_mismatch")
 
     def test_managed_quality_task_cannot_be_reclassified_by_agent(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
