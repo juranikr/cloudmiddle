@@ -9,7 +9,12 @@ from sqlalchemy.orm import sessionmaker
 from app.agent.runner import (
     _ensure_gap_tasks,
     _is_material_change,
+    _performance_delta,
+    _performance_score,
+    _performance_snapshot,
     _new_evidence_keys,
+    _research_gaps,
+    _sync_quality_tasks,
     _step_detail_json,
     _tool_signature,
     count_unread,
@@ -30,6 +35,7 @@ from app.models import (
     PlaceEvent,
     PlaceEventAction,
     PlaceInsight,
+    PlaceImage,
     PlaceChain,
 )
 
@@ -107,6 +113,12 @@ class AgentCityScopeTests(unittest.TestCase):
         keys = _new_evidence_keys("web_search", result, set())
         self.assertEqual(keys, {"url:https://example.test/place"})
         self.assertEqual(_new_evidence_keys("web_search", result, keys), set())
+        image_keys = _new_evidence_keys(
+            "search_place_images",
+            {"results": [{"image_url": "https://images.example.test/place.jpg"}]},
+            set(),
+        )
+        self.assertEqual(image_keys, {"image:https://images.example.test/place.jpg"})
 
         self.assertEqual(
             _tool_signature("web_search", {"limit": 5, "query": "沈阳"}),
@@ -122,6 +134,45 @@ class AgentCityScopeTests(unittest.TestCase):
         parsed = json.loads(detail)
         self.assertTrue(parsed["truncated"])
         self.assertLessEqual(len(detail), 3000)
+
+    def test_quality_snapshot_and_backlog_measure_real_points(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.is_agent_suggested = True
+        zone = Marker(
+            city_id=2,
+            category=MarkerCategory.tourist,
+            shape=MarkerShape.polygon,
+            title="중제권",
+            description="구역 폴리곤은 사진 결손 장소로 계산하면 안 됩니다.",
+            lat=41.8,
+            lng=123.45,
+            polygon="[]",
+        )
+        self.db.add(zone)
+        self.db.commit()
+
+        before = _performance_snapshot(self.db, 2)
+        self.assertEqual(before["active_places"], 1)
+        self.assertEqual(before["imageless_places"], 1)
+        self.assertEqual(before["suggested_drafts"], 1)
+        task_ids = _sync_quality_tasks(self.db, city_id=2, run_id=21)
+        self.assertGreaterEqual(len(task_ids), 4)
+        image_task = self.db.query(AgentTask).filter(AgentTask.kind == "quality_images").one()
+        self.assertIn(f"#{place.id}", image_task.detail)
+        self.assertNotIn(f"#{zone.id}", image_task.detail)
+
+        self.db.add(PlaceImage(place_id=place.id, s3_key="places/test.jpg"))
+        self.db.commit()
+        after = _performance_snapshot(self.db, 2)
+        delta = _performance_delta(before, after)
+        self.assertEqual(delta["imageless_places"], -1)
+        self.assertGreaterEqual(_performance_score(delta, {}), 8)
+        gaps = _research_gaps(delta, {"list_agent_tasks": 1, "list_zones": 1}, after)
+        self.assertFalse(any(gap.startswith("사진 없는 실제 장소") for gap in gaps))
+
+        _sync_quality_tasks(self.db, city_id=2, run_id=22)
+        self.db.refresh(image_task)
+        self.assertEqual(image_task.status, "completed")
 
     def test_batch_gap_tasks_are_measurable_and_deduplicated(self) -> None:
         first = _ensure_gap_tasks(

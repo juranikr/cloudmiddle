@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
@@ -241,9 +241,48 @@ def _queue_brief(queue: dict[str, Any]) -> str:
     )[:6000]
 
 
+def _marker_quality_gaps(marker: Marker) -> list[str]:
+    """Return measurable missing pieces for a real place, never for a zone polygon."""
+    if marker.shape != MarkerShape.point or marker.merged_into_id is not None:
+        return []
+    gaps: list[str] = []
+    if not marker.images:
+        gaps.append("image")
+    if marker.zone_id is None:
+        gaps.append("zone")
+    if marker.last_verified_at is None:
+        gaps.append("verification")
+    if len((marker.description or "").strip()) < 60:
+        gaps.append("description")
+    if len(marker.insights or []) < 2:
+        gaps.append("insights")
+    return gaps
+
+
 def _performance_snapshot(db: Session, city_id: int) -> dict[str, int]:
+    points = (
+        db.query(Marker)
+        .options(joinedload(Marker.images), joinedload(Marker.insights))
+        .filter(
+            Marker.city_id == city_id,
+            Marker.shape == MarkerShape.point,
+            Marker.merged_into_id.is_(None),
+        )
+        .all()
+    )
+    quality = {marker.id: _marker_quality_gaps(marker) for marker in points}
     snapshot = {
         "unread": count_unread(db, city_id),
+        "active_places": len(points),
+        "imageless_places": sum("image" in gaps for gaps in quality.values()),
+        "unzoned_places": sum("zone" in gaps for gaps in quality.values()),
+        "unverified_places": sum("verification" in gaps for gaps in quality.values()),
+        "thin_info_places": sum(
+            bool({"description", "insights"} & set(gaps)) for gaps in quality.values()
+        ),
+        "suggested_drafts": sum(
+            marker.is_agent_suggested and bool(quality[marker.id]) for marker in points
+        ),
         "proposals": db.query(AgentProposal).filter(AgentProposal.city_id == city_id).count(),
         "insights": (
             db.query(PlaceInsight)
@@ -257,16 +296,8 @@ def _performance_snapshot(db: Session, city_id: int) -> dict[str, int]:
             .filter(Marker.city_id == city_id, Marker.merged_into_id.is_(None))
             .count()
         ),
-        "zoned_places": db.query(Marker).filter(
-            Marker.city_id == city_id,
-            Marker.zone_id.is_not(None),
-            Marker.merged_into_id.is_(None),
-        ).count(),
-        "chained_places": db.query(Marker).filter(
-            Marker.city_id == city_id,
-            Marker.chain_id.is_not(None),
-            Marker.merged_into_id.is_(None),
-        ).count(),
+        "zoned_places": sum(marker.zone_id is not None for marker in points),
+        "chained_places": sum(marker.chain_id is not None for marker in points),
         "completed_tasks": db.query(AgentTask).filter(
             AgentTask.city_id == city_id, AgentTask.status == "completed"
         ).count(),
@@ -315,7 +346,14 @@ def _performance_score(delta: dict[str, int], tool_counts: dict[str, int]) -> fl
         + role_gain * 10
         + max(0, delta.get("role_diversity", 0)) * 15
         + delta.get("insights", 0) * 3
-        + delta.get("images", 0) * 2
+        # Reward filling coverage holes, not stacking more photos on a place
+        # that already had one. Negative deltas mean a measured deficit shrank.
+        + max(0, -delta.get("imageless_places", 0)) * 8
+        + max(0, -delta.get("suggested_drafts", 0)) * 6
+        + max(0, -delta.get("thin_info_places", 0)) * 4
+        + max(0, -delta.get("unverified_places", 0)) * 3
+        + max(0, -delta.get("unzoned_places", 0)) * 3
+        + max(0, delta.get("images", 0)) * 0.5
         + delta.get("zoned_places", 0) * 2
         + delta.get("chained_places", 0) * 2
         + delta.get("completed_tasks", 0) * 4
@@ -333,8 +371,17 @@ def _research_gaps(
         gaps.append("이전 조사 백로그 확인")
     if tool_counts.get("list_zones", 0) == 0:
         gaps.append("구역 현황 확인")
-    if tool_counts.get("fetch_page", 0) < 4:
-        gaps.append(f"근거 페이지 4개 이상 정독(현재 {tool_counts.get('fetch_page', 0)})")
+    active = snapshot.get("active_places", 0)
+    if snapshot.get("imageless_places", 0):
+        gaps.append(f"사진 없는 실제 장소 {snapshot['imageless_places']}/{active}")
+    if snapshot.get("suggested_drafts", 0):
+        gaps.append(f"에이전트 초안 품질 미달 {snapshot['suggested_drafts']}곳")
+    if snapshot.get("thin_info_places", 0):
+        gaps.append(f"구조화 정보 부족 {snapshot['thin_info_places']}곳")
+    if snapshot.get("unzoned_places", 0):
+        gaps.append(f"구역 미배정 실제 장소 {snapshot['unzoned_places']}곳")
+    if snapshot.get("unverified_places", 0):
+        gaps.append(f"운영·존재 미검증 {snapshot['unverified_places']}곳")
     targets = {
         "history": 2, "food": 3, "market_night": 2, "neighborhood": 2,
         "nature": 2, "shopping": 1, "rest": 1, "practical": 1,
@@ -434,8 +481,11 @@ def _new_evidence_keys(name: str, result: Any, seen: set[str]) -> set[str]:
                 candidates.add(f"geo:{round(float(item['lat']), 5)}:{round(float(item['lng']), 5)}")
     elif name == "search_place_images":
         for item in result.get("results") or []:
-            if isinstance(item, dict) and item.get("url"):
-                candidates.add(f"image:{item['url']}")
+            if not isinstance(item, dict):
+                continue
+            image_url = item.get("image_url") or item.get("url")
+            if image_url:
+                candidates.add(f"image:{image_url}")
     return candidates - seen
 
 
@@ -510,8 +560,188 @@ def _step_detail_json(
     return json.dumps({"progress": progress, "truncated": True}, ensure_ascii=False, default=str)
 
 
+QUALITY_TASK_KINDS = {
+    "quality_images",
+    "quality_drafts",
+    "quality_information",
+    "quality_zones",
+    "quality_verification",
+}
+
+
+def _quality_target_line(marker: Marker, gaps: list[str]) -> str:
+    labels = {
+        "image": "사진 없음",
+        "zone": "구역 미배정",
+        "verification": "미검증",
+        "description": "짧은 소개",
+        "insights": "구조화 정보 부족",
+    }
+    return f"- #{marker.id} {marker.title} (현재: {', '.join(labels[item] for item in gaps)})"
+
+
+def _sync_quality_tasks(
+    db: Session,
+    *,
+    city_id: int,
+    run_id: int | None = None,
+) -> list[int]:
+    """Materialize current DB quality holes as small, self-validating work batches.
+
+    The model used to mention follow-up work only in prose. These tasks are
+    derived from live rows and reopened when the model claims completion without
+    satisfying the metric, so later scheduled runs cannot silently forget them.
+    """
+    points = (
+        db.query(Marker)
+        .options(joinedload(Marker.images), joinedload(Marker.insights))
+        .filter(
+            Marker.city_id == city_id,
+            Marker.shape == MarkerShape.point,
+            Marker.merged_into_id.is_(None),
+        )
+        .all()
+    )
+    gaps_by_id = {marker.id: _marker_quality_gaps(marker) for marker in points}
+
+    def ranked(markers: list[Marker], limit: int) -> list[Marker]:
+        return sorted(
+            markers,
+            key=lambda marker: (
+                not marker.is_agent_suggested,
+                -len(gaps_by_id[marker.id]),
+                marker.id,
+            ),
+        )[:limit]
+
+    specs: dict[str, dict[str, Any]] = {
+        "quality_images": {
+            "title": "자동 품질 보강: 사진 없는 실제 장소",
+            "priority": 100,
+            "targets": ranked([m for m in points if "image" in gaps_by_id[m.id]], 6),
+            "instructions": (
+                "각 ID마다 search_place_images(query, place_id) 결과 중 제목이 장소와 일치하는 자유 라이선스 "
+                "실사진만 attach_image_from_url로 첨부하세요. 단순 인근 사진·로고·지도는 금지합니다. "
+                "후보 3개가 모두 실패하면 오류와 시도한 출처를 result에 남기고 다음 ID로 이동하세요."
+            ),
+            "metric": "아래 모든 대상의 image_count가 1 이상",
+        },
+        "quality_drafts": {
+            "title": "자동 품질 보강: 에이전트 초안 완성",
+            "priority": 96,
+            "targets": ranked(
+                [m for m in points if m.is_agent_suggested and gaps_by_id[m.id]], 4
+            ),
+            "instructions": (
+                "각 초안의 현재 결손만 채우세요. 출처가 있는 위치·역사·방문정보는 upsert_place_insights, "
+                "실제 운영 여부는 verify_place, 구역은 assign_place_zone, 짧거나 부정확한 한국어 소개는 "
+                "update_place_fields로 정제합니다. 사진 결손도 같은 방식으로 보강하되 근거 없는 내용을 만들지 마세요."
+            ),
+            "metric": "아래 대상에서 사진·구역·검증·소개·구조화 정보 결손이 모두 제거됨",
+        },
+        "quality_information": {
+            "title": "자동 품질 보강: 장소 정보 구조화",
+            "priority": 86,
+            "targets": ranked(
+                [
+                    m
+                    for m in points
+                    if {"description", "insights"} & set(gaps_by_id[m.id])
+                ],
+                5,
+            ),
+            "instructions": (
+                "쓰레기통식 설명 누적은 금지합니다. 짧은 소개는 한국어로 정제하고, 위치 의미와 역사 또는 "
+                "방문정보를 서로 분리한 인사이트 최소 2개로 저장하며 각각 실제 URL과 confidence를 기록하세요."
+            ),
+            "metric": "아래 대상의 한국어 소개가 60자 이상이고 구조화 인사이트가 2개 이상",
+        },
+        "quality_zones": {
+            "title": "자동 품질 보강: 구역 미배정 장소",
+            "priority": 82,
+            "targets": ranked([m for m in points if "zone" in gaps_by_id[m.id]], 8),
+            "instructions": (
+                "list_zones와 실제 좌표를 확인해 포함되는 기존 구역에 assign_place_zone으로 배정하세요. "
+                "기존 어느 구역에도 속하지 않으면 억지로 배정하지 말고 result에 사유를 남기세요."
+            ),
+            "metric": "아래 대상에 타당한 zone_id가 있거나 구역 밖이라는 검증 결과가 기록됨",
+        },
+        "quality_verification": {
+            "title": "자동 품질 보강: 운영·존재 검증",
+            "priority": 78,
+            "targets": ranked([m for m in points if "verification" in gaps_by_id[m.id]], 6),
+            "instructions": (
+                "공식·지도·신뢰 가능한 여행 출처에서 현재 운영/존재 여부를 확인하고 verify_place를 호출하세요. "
+                "불확실하면 uncertain으로 정직하게 기록하고 같은 검색을 반복하지 마세요."
+            ),
+            "metric": "아래 모든 대상의 last_verified_at이 기록됨",
+        },
+    }
+
+    task_ids: list[int] = []
+    now = datetime.now(timezone.utc)
+    for kind, spec in specs.items():
+        row = (
+            db.query(AgentTask)
+            .filter(AgentTask.city_id == city_id, AgentTask.kind == kind)
+            .order_by(AgentTask.id.desc())
+            .first()
+        )
+        targets: list[Marker] = spec["targets"]
+        if not targets:
+            if row is not None and row.status != "completed":
+                row.status = "completed"
+                row.completed_at = now
+                row.result = (
+                    f"실행 #{run_id}: 운영 DB 재측정 결과 해당 품질 결손이 없습니다."
+                    if run_id
+                    else "운영 DB 재측정 결과 해당 품질 결손이 없습니다."
+                )
+            continue
+
+        detail = spec["instructions"] + "\n대상:\n" + "\n".join(
+            _quality_target_line(marker, gaps_by_id[marker.id]) for marker in targets
+        )
+        if row is None:
+            row = AgentTask(city_id=city_id, kind=kind, title=spec["title"])
+            db.add(row)
+            db.flush()
+        target_changed = row.detail != detail
+        if target_changed:
+            row.attempts = 0
+        was_false_completion = row.status == "completed" and not target_changed
+        if row.status != "pending":
+            previous = (row.result or "")[-2500:]
+            row.result = (
+                f"실행 #{run_id}: 완료 주장 후 운영 DB 재측정에서 결손이 남아 자동 재개했습니다."
+                + (f" 이전 결과: {previous}" if previous else "")
+            )[:8000]
+        row.title = spec["title"]
+        row.detail = detail
+        row.success_metric = spec["metric"]
+        # Two unchanged failed cycles trigger a cooldown so another quality
+        # dimension can progress instead of retrying an impossible source forever.
+        cooldown = 36 if row.attempts >= 2 or was_false_completion else 0
+        row.priority = max(50, int(spec["priority"]) - cooldown)
+        row.status = "pending"
+        row.completed_at = None
+        task_ids.append(row.id)
+    db.commit()
+    return task_ids
+
+
 def _ensure_gap_tasks(db: Session, *, city_id: int, run_id: int, gaps: list[str]) -> list[int]:
     """Persist measurable follow-up work so the next cycle has a concrete objective."""
+    # Row-level quality gaps have stable, exact-ID tasks managed above. Persisting
+    # their changing counts here would create a new vague task after every image.
+    quality_prefixes = (
+        "사진 없는 실제 장소",
+        "에이전트 초안 품질 미달",
+        "구조화 정보 부족",
+        "구역 미배정 실제 장소",
+        "운영·존재 미검증",
+    )
+    gaps = [gap for gap in gaps if not gap.startswith(quality_prefixes)]
     gap_set = set(gaps)
     existing_gap_tasks = db.query(AgentTask).filter(
         AgentTask.city_id == city_id,
@@ -601,6 +831,9 @@ def run_agent(
     kb = knowledge_brief(db, limit=12, city_id=city_id)
     kb_hint = json.dumps(kb, ensure_ascii=False)[:4000] if kb else "[]"
     personalization_hint = city_personalization_brief(db, city_id=city_id)[:7000]
+    quality_task_ids_before = (
+        _sync_quality_tasks(db, city_id=city_id) if allow_research else []
+    )
     primary_task = None
     if allow_research:
         primary_task = (
@@ -837,6 +1070,8 @@ def run_agent(
                         }
                     )
                     continue
+                if allow_research:
+                    _sync_quality_tasks(db, city_id=city_id, run_id=agent_run.id)
                 current_snapshot = _performance_snapshot(db, city_id)
                 current_delta = _performance_delta(performance_before, current_snapshot)
                 gaps = _research_gaps(current_delta, successful_tool_counts, current_snapshot) if allow_research else []
@@ -849,7 +1084,8 @@ def run_agent(
                             "content": (
                                 f"성과 게이트가 아직 충족되지 않았습니다(현재 점수 {current_score}). "
                                 f"남은 결과: {', '.join(gaps)}. 스텝 수가 아니라 실제 결과를 만들고 다시 측정하세요. "
-                                "같은 검색을 반복하지 말고 구역별 정보 공백·기존 백로그를 활용하세요. "
+                                "같은 검색을 반복하지 말고 list_agent_tasks를 다시 읽어 운영 DB가 생성한 "
+                                "정확한 장소 ID 단위 품질 백로그를 이어서 처리하세요. "
                                 "신규 장소 후보는 geocode_place 직후 propose_place로 승인 대기에 저장하세요. "
                                 "그 후보를 upsert_agent_task에 승인 제안으로 적는 것은 금지됩니다. "
                                 "실패한 후속 조사만 지식 본문이 아니라 upsert_agent_task에 구체적으로 남기세요."
@@ -1044,6 +1280,11 @@ def run_agent(
         }
 
     unread_after = count_unread(db, city_id)
+    quality_task_ids_after = (
+        _sync_quality_tasks(db, city_id=city_id, run_id=agent_run.id)
+        if allow_research
+        else []
+    )
     performance_after = _performance_snapshot(db, city_id)
     performance_delta = _performance_delta(performance_before, performance_after)
     current_score = _performance_score(performance_delta, successful_tool_counts)
@@ -1069,6 +1310,16 @@ def run_agent(
             for item in material_changes[:20]
         )
         summary = f"{summary}\n[실제 변경 {len(material_changes)}건] {changed}"
+    if allow_research:
+        summary = (
+            f"{summary}\n[품질 변화] 사진 없음 "
+            f"{performance_before.get('imageless_places', 0)}→{performance_after.get('imageless_places', 0)}, "
+            f"초안 미완성 {performance_before.get('suggested_drafts', 0)}→"
+            f"{performance_after.get('suggested_drafts', 0)}, 정보 부족 "
+            f"{performance_before.get('thin_info_places', 0)}→{performance_after.get('thin_info_places', 0)}, "
+            f"미검증 {performance_before.get('unverified_places', 0)}→"
+            f"{performance_after.get('unverified_places', 0)}"
+        )
     run_row = db.get(AgentRun, agent_run.id)
     if run_row is not None:
         finished_at = datetime.now(timezone.utc)
@@ -1092,6 +1343,9 @@ def run_agent(
                 "repeated_calls_blocked": repeated_calls,
                 "remaining_gaps": gaps,
                 "gap_task_ids": gap_task_ids,
+                "quality_task_ids_before": quality_task_ids_before,
+                "quality_task_ids_after": quality_task_ids_after,
+                "primary_task_id": primary_task.id if primary_task is not None else None,
                 "no_progress_actions": no_progress_actions,
                 "no_material_actions": no_material_actions,
                 "duration_seconds": round((finished_at - started_at).total_seconds(), 1),

@@ -762,8 +762,9 @@ TOOLS: list[dict[str, Any]] = [
             "name": "attach_image_from_url",
             "description": (
                 "이미지 URL을 다운로드해 해당 장소의 사진으로 업로드한다(S3). "
-                "search_place_images 결과의 image_url만 사용할 것(자유 라이선스 보장). "
-                "source에는 출처 페이지와 라이선스를 기록한다. 장소당 1~2장이면 충분."
+                "search_place_images 결과의 image_url을 수정·축약하지 말고 그대로 사용할 것. "
+                "source에는 결과의 page_url과 라이선스를 정확히 기록한다. 서버가 Wikimedia page_url에서 "
+                "실제 다운로드 URL을 다시 해석한다. 장소당 1~2장이면 충분."
             ),
             "parameters": {
                 "type": "object",
@@ -963,6 +964,18 @@ def _containing_zone(db: Session, *, city_id: int, lat: float, lng: float) -> Op
 
 
 def _place_brief(m: Marker) -> dict[str, Any]:
+    quality_gaps: list[str] = []
+    if m.shape == MarkerShape.point and m.merged_into_id is None:
+        if not m.images:
+            quality_gaps.append("image")
+        if m.zone_id is None:
+            quality_gaps.append("zone")
+        if m.last_verified_at is None:
+            quality_gaps.append("verification")
+        if len((m.description or "").strip()) < 60:
+            quality_gaps.append("description")
+        if len(m.insights or []) < 2:
+            quality_gaps.append("insights")
     return {
         "id": m.id,
         "city_id": m.city_id,
@@ -978,6 +991,8 @@ def _place_brief(m: Marker) -> dict[str, Any]:
         "is_agent_suggested": m.is_agent_suggested,
         "image_count": len(m.images or []),
         "insight_count": len(m.insights or []),
+        "last_verified_at": m.last_verified_at.isoformat() if m.last_verified_at else None,
+        "quality_gaps": quality_gaps,
         "coordinate_source": m.coordinate_source or "manual",
         "coordinate_confidence": m.coordinate_confidence,
         "coordinate_crs": m.coordinate_crs or "WGS84",
@@ -1284,6 +1299,52 @@ _WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 _IMAGE_UA = "CloudmiddleTravelMap/0.2 (shared travel map; image enrichment)"
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 _IMAGE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _commons_image_from_source(source: str) -> Optional[dict[str, str]]:
+    """Resolve a Commons file page to an exact API-provided download URL.
+
+    Models sometimes shortened a Wikimedia thumbnail URL, removing its required
+    size suffix and causing HTTP 400/404. The source page is stable, so resolve
+    it server-side instead of trusting a copied CDN URL.
+    """
+    match = re.search(r"https://commons\.wikimedia\.org/[^\s]+", source or "")
+    if not match:
+        return None
+    page_url = match.group(0).rstrip(".,;)]}")
+    parsed = urllib.parse.urlsplit(page_url)
+    params: dict[str, Any] = {
+        "action": "query",
+        "format": "json",
+        "prop": "imageinfo",
+        "iiprop": "url|mime",
+        "iiurlwidth": 1280,
+    }
+    if parsed.path.startswith("/wiki/File:"):
+        params["titles"] = urllib.parse.unquote(parsed.path.removeprefix("/wiki/"))
+    else:
+        page_ids = urllib.parse.parse_qs(parsed.query).get("curid") or []
+        if not page_ids:
+            return None
+        params["pageids"] = page_ids[0]
+    req = urllib.request.Request(
+        f"{_WIKIMEDIA_API}?{urllib.parse.urlencode(params)}",
+        headers={"User-Agent": _IMAGE_UA},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=18) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for page in (data.get("query", {}).get("pages") or {}).values():
+            infos = page.get("imageinfo") or []
+            if not infos:
+                continue
+            info = infos[0]
+            image_url = str(info.get("thumburl") or info.get("url") or "")
+            if image_url.startswith("https://"):
+                return {"image_url": image_url, "page_url": page_url}
+    except Exception:  # noqa: BLE001 - caller still has the supplied URL fallback
+        return None
+    return None
 
 
 def _wikimedia_image_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -2872,9 +2933,9 @@ def run_tool(
 
     if name == "attach_image_from_url":
         pid = int(args["place_id"])
-        url = str(args.get("image_url") or "").strip()
+        requested_url = str(args.get("image_url") or "").strip()
         source = str(args.get("source") or "")[:500]
-        if not url.lower().startswith("https://"):
+        if not requested_url.lower().startswith("https://"):
             return {"error": "bad_url"}
         if not storage.s3_enabled():
             return {"error": "s3_disabled"}
@@ -2892,10 +2953,13 @@ def run_tool(
             return {"error": "not_found"}
         if len(m.images) >= 8:
             return {"error": "too_many_images"}
+        commons = _commons_image_from_source(source)
+        url = commons["image_url"] if commons else requested_url
+        duplicate_key = commons["page_url"] if commons else requested_url
         duplicate = db.query(PlaceEvent.id).filter(
             PlaceEvent.place_id == pid,
             PlaceEvent.action == PlaceEventAction.image_add,
-            PlaceEvent.payload.contains(url),
+            PlaceEvent.payload.contains(duplicate_key),
         ).first()
         if duplicate:
             return {"error": "duplicate_image_source"}
@@ -2937,6 +3001,8 @@ def run_tool(
                 "image_id": img.id,
                 "s3_key": key,
                 "source_url": url[:500],
+                "requested_url": requested_url[:500],
+                "source_page_url": commons["page_url"][:500] if commons else "",
                 "source": source,
                 "changes": [{"field": "image_id", "before": None, "after": img.id}],
                 "fields": ["image_id"],
@@ -2944,7 +3010,12 @@ def run_tool(
             actor="agent",
         )
         db.commit()
-        return {"ok": True, "image_id": img.id, "url": storage.public_url(key)}
+        return {
+            "ok": True,
+            "image_id": img.id,
+            "url": storage.public_url(key),
+            "source_resolved": bool(commons),
+        }
 
     if name == "list_stale_places":
         days = max(7, int(args.get("days") or 30))
