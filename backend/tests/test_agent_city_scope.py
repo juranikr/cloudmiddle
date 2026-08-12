@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.agent.runner import (
+    _compact_react_messages,
     _ensure_gap_tasks,
     _is_material_change,
     _performance_delta,
@@ -134,6 +135,46 @@ class AgentCityScopeTests(unittest.TestCase):
         parsed = json.loads(detail)
         self.assertTrue(parsed["truncated"])
         self.assertLessEqual(len(detail), 3000)
+
+    def test_long_react_context_is_compacted_by_complete_tool_round(self) -> None:
+        messages: list[dict] = [
+            {"role": "system", "content": "stable system prompt"},
+            {"role": "user", "content": "stable batch objective"},
+        ]
+        for index in range(8):
+            call_id = f"call-{index}"
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "web_search", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": "x" * 4000},
+            ])
+        compacted, changed = _compact_react_messages(
+            messages,
+            tool_counts={"web_search": 8},
+            material_changes=[{"tool": "update_place"}],
+            current_score=4.0,
+            max_chars=18_000,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(compacted[0]["content"], "stable system prompt")
+        self.assertEqual(compacted[1]["content"], "stable batch objective")
+        self.assertIn("자동 압축", compacted[2]["content"])
+        assistant_ids = {
+            message["tool_calls"][0]["id"]
+            for message in compacted
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        }
+        tool_ids = {
+            message["tool_call_id"]
+            for message in compacted
+            if message.get("role") == "tool"
+        }
+        self.assertEqual(assistant_ids, tool_ids)
+        self.assertIn("call-7", tool_ids)
+        self.assertLessEqual(len(json.dumps(compacted, ensure_ascii=False)), 18_000)
 
     def test_quality_snapshot_and_backlog_measure_real_points(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
@@ -511,6 +552,34 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertIsNotNone(place.chain_id)
         self.assertIsNone(place.merged_into_id)
         self.assertEqual(self.db.query(PlaceChain).count(), 1)
+
+    def test_zone_assignment_rejects_a_polygon_that_does_not_contain_place(self) -> None:
+        wrong_zone = Marker(
+            city_id=2,
+            category=MarkerCategory.tourist,
+            shape=MarkerShape.polygon,
+            title="훈난권",
+            description="멀리 떨어진 구역",
+            lat=41.65,
+            lng=123.45,
+            polygon=json.dumps([
+                {"lat": 41.63, "lng": 123.40},
+                {"lat": 41.63, "lng": 123.50},
+                {"lat": 41.70, "lng": 123.50},
+                {"lat": 41.70, "lng": 123.40},
+            ]),
+        )
+        self.db.add(wrong_zone)
+        self.db.commit()
+        place = self.db.query(Marker).filter(Marker.city_id == 2).first()
+        result = run_tool(
+            self.db,
+            "assign_place_zone",
+            {"place_id": place.id, "zone_id": wrong_zone.id, "reason": "잘못 기억한 ID"},
+            city_id=2,
+        )
+        self.assertEqual(result["error"], "place_outside_zone_polygon")
+        self.assertIsNone(place.zone_id)
 
     def test_approved_place_without_zone_is_inferred_from_polygon(self) -> None:
         zone = Marker(

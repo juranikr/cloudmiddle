@@ -932,6 +932,25 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _zone_contains(zone: Marker, *, lat: float, lng: float) -> bool:
+    try:
+        points = json.loads(zone.polygon or "[]")
+        vertices = [(float(item["lat"]), float(item["lng"])) for item in points]
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return False
+    if len(vertices) < 3:
+        return False
+    inside = False
+    j = len(vertices) - 1
+    for i, (yi, xi) in enumerate(vertices):
+        yj, xj = vertices[j]
+        crosses = (yi > lat) != (yj > lat)
+        if crosses and lng < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
 def _containing_zone(db: Session, *, city_id: int, lat: float, lng: float) -> Optional[Marker]:
     """Return the smallest active polygon zone containing a WGS84 point."""
     matches: list[tuple[float, Marker]] = []
@@ -941,22 +960,9 @@ def _containing_zone(db: Session, *, city_id: int, lat: float, lng: float) -> Op
         Marker.merged_into_id.is_(None),
     ).all()
     for zone in zones:
-        try:
+        if _zone_contains(zone, lat=lat, lng=lng):
             points = json.loads(zone.polygon or "[]")
             vertices = [(float(item["lat"]), float(item["lng"])) for item in points]
-        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
-            continue
-        if len(vertices) < 3:
-            continue
-        inside = False
-        j = len(vertices) - 1
-        for i, (yi, xi) in enumerate(vertices):
-            yj, xj = vertices[j]
-            crosses = (yi > lat) != (yj > lat)
-            if crosses and lng < (xj - xi) * (lat - yi) / (yj - yi) + xi:
-                inside = not inside
-            j = i
-        if inside:
             lats = [item[0] for item in vertices]
             lngs = [item[1] for item in vertices]
             matches.append(((max(lats) - min(lats)) * (max(lngs) - min(lngs)), zone))
@@ -2414,6 +2420,21 @@ def run_tool(
             ).first()
             if zone is None:
                 return {"error": "zone_not_found"}
+            if not _zone_contains(zone, lat=place.lat, lng=place.lng):
+                inferred = _containing_zone(
+                    db, city_id=city_id, lat=place.lat, lng=place.lng
+                )
+                return {
+                    "error": "place_outside_zone_polygon",
+                    "requested_zone_id": zone_id,
+                    "requested_zone_title": zone.title,
+                    "suggested_zone_id": inferred.id if inferred else None,
+                    "suggested_zone_title": inferred.title if inferred else "",
+                    "detail": (
+                        "장소 좌표가 요청한 구역 폴리곤 밖에 있어 잘못된 ID 배정을 차단했습니다. "
+                        "list_zones의 ID와 제목을 다시 대조하세요."
+                    ),
+                }
         if place.zone_id == zone_id:
             return {"ok": True, "changed": False, "zone_id": zone_id}
         before = marker_field_snapshot(place)

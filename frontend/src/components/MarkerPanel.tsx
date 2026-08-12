@@ -591,6 +591,9 @@ export default function MarkerPanel({
               )}
             </div>
           ) : null}
+          <p className="panel__place-id" title="대화와 관리 화면에서 이 번호로 장소를 찾을 수 있습니다">
+            장소 #{marker.id}
+          </p>
           {error ? <p className="panel__error">{error}</p> : null}
         </div>
       ) : (

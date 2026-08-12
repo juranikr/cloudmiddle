@@ -819,6 +819,18 @@ textarea {
   flex: 0 0 auto;
 }
 
+.panel__place-id {
+  width: fit-content;
+  margin: 18px 0 2px auto;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: rgba(20, 33, 43, 0.05);
+  color: var(--muted);
+  font: 700 0.68rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: 0.025em;
+  user-select: all;
+}
+
 .panel__header-fav {
   display: grid;
   place-items: center;
@@ -1840,6 +1852,62 @@ textarea {
   display: grid;
   gap: 2px;
 }
+
+.map-floating-filters,
+.map-floating-mode {
+  position: absolute;
+  z-index: 640;
+  pointer-events: auto;
+}
+.map-floating-filters {
+  top: 16px;
+  left: 16px;
+  max-width: min(720px, calc(100% - 32px));
+}
+.map-floating-filters__toggle {
+  display: none;
+}
+.map-floating-filters__body {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px;
+  border: 1px solid rgba(255,255,255,.76);
+  border-radius: 16px;
+  background: rgba(255,253,248,.94);
+  box-shadow: 0 9px 28px rgba(28,39,33,.15);
+  backdrop-filter: blur(14px);
+}
+.map-zone-filter {
+  flex: 0 0 min(250px, 34vw);
+  display: block;
+  margin: 0;
+}
+.map-zone-filter > span { display: none; }
+.map-zone-filter select { padding: 8px 10px; border-radius: 10px; font-size: .75rem; }
+.map-filter-chips {
+  display: flex;
+  gap: 7px;
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.map-filter-chips::-webkit-scrollbar { display: none; }
+.map-filter-chips .chip { flex: 0 0 auto; }
+.map-floating-mode {
+  right: 18px;
+  bottom: 22px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px;
+  border: 1px solid rgba(255,255,255,.76);
+  border-radius: 17px;
+  background: rgba(255,253,248,.95);
+  box-shadow: 0 10px 30px rgba(28,39,33,.18);
+  backdrop-filter: blur(14px);
+}
+.map-floating-mode .mode-toggle { flex-wrap: nowrap; }
 .result-list__title-row {
   display: flex !important;
   align-items: center;
@@ -2163,6 +2231,35 @@ textarea {
 
 @media (max-width: 859px) {
   .map-side__scroll { display: none; }
+  .map-floating-filters {
+    top: max(76px, calc(env(safe-area-inset-top) + 72px));
+    left: 12px;
+    right: 12px;
+    max-width: none;
+  }
+  .map-floating-filters__toggle {
+    display: block;
+    margin-left: auto;
+    border: 1px solid rgba(255,255,255,.75);
+    border-radius: 14px;
+    padding: 9px 13px;
+    background: rgba(255,253,248,.95);
+    box-shadow: 0 8px 24px rgba(28,39,33,.17);
+    color: var(--wonrae-jade, #35675c);
+    font-size: .75rem;
+    font-weight: 850;
+  }
+  .map-floating-filters__body { display: none; margin-top: 8px; }
+  .map-floating-filters.is-open .map-floating-filters__body { display: grid; gap: 9px; }
+  .map-zone-filter { width: 100%; max-width: none; }
+  .map-floating-mode {
+    right: 12px;
+    bottom: 86px;
+    gap: 6px;
+    padding: 6px;
+  }
+  .map-floating-mode .seg button,
+  .map-floating-mode .locate-btn { padding: 8px 10px; font-size: .72rem; }
   .confirm-bar {
     left: 12px !important;
     right: 12px !important;
@@ -2317,8 +2414,10 @@ textarea {
   .wonrae-app .map-side:not(.map-side--open) .map-side__top > :not(.map-side__brand) { display: none !important; }
   .wonrae-app .map-side--open { padding: 0 10px 13px; overflow-y: auto; border: 1px solid rgba(255,255,255,.72); border-radius: 18px; background: rgba(255,253,248,.97); box-shadow: 0 18px 50px rgba(27,39,33,.2); pointer-events: auto; }
   .wonrae-app .map-side--open .map-side__brand { margin: 0 -10px 8px; box-shadow: none; border-width: 0 0 1px; border-radius: 18px 18px 0 0; }
-  .wonrae-app .map-side--open .city-select, .wonrae-app .map-side--open .zone-select { margin-top: 8px; }
-  .wonrae-app .map-side--open .map-side__hint { margin-top: 7px; }
+  .wonrae-app .map-side--open .zone-select { margin-top: 14px; }
+  .wonrae-app .map-side--open .search { margin-top: 14px; }
+  .wonrae-app .map-side--open .side-tools { margin-top: 14px; }
+  .wonrae-app .map-side--open .map-side__hint { margin-top: 12px; }
   .wonrae-app .mobile-sheets { position: fixed; bottom: 80px; }
   .wonrae-app .mobile-sheets .panel { max-height: min(68dvh, 650px); border-radius: 22px 22px 0 0; }
   .wonrae-app:not(.map-app--map) > .map-side, .wonrae-app:not(.map-app--map) > .map-shell, .wonrae-app:not(.map-app--map) > .mobile-sheets { display: none !important; }

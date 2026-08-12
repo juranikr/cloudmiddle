@@ -565,6 +565,57 @@ def _step_detail_json(
     return json.dumps({"progress": progress, "truncated": True}, ensure_ascii=False, default=str)
 
 
+def _compact_react_messages(
+    messages: list[dict[str, Any]],
+    *,
+    tool_counts: dict[str, int],
+    material_changes: list[dict[str, Any]],
+    current_score: float,
+    max_chars: int = 120_000,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Keep long autonomous runs inside provider context limits.
+
+    Preserve the stable system/objective prompts and the most recent complete
+    assistant→tool rounds. Older raw pages are already persisted in run steps;
+    feeding all of them back to the model only makes a successful long run fail
+    at final synthesis.
+    """
+    if len(json.dumps(messages, ensure_ascii=False, default=str)) <= max_chars:
+        return messages, False
+    prefix = messages[:2]
+    rounds: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for message in messages[2:]:
+        if message.get("role") in {"assistant", "user"} and current:
+            rounds.append(current)
+            current = []
+        current.append(message)
+    if current:
+        rounds.append(current)
+    recent_rounds = rounds[-6:]
+    compact_note = {
+        "role": "user",
+        "content": (
+            "【이전 ReAct 문맥 자동 압축】 오래된 원문·도구 응답은 AgentRunStep에 보존되어 있습니다. "
+            f"현재 성과 점수 {current_score}, 실제 변경 {len(material_changes)}건. "
+            f"도구 누계: {json.dumps(tool_counts, ensure_ascii=False)}. "
+            "최근 관찰만 사용해 현재 1차 목표를 이어가세요. 필요한 현재 상태는 list_agent_tasks와 "
+            "list_places/get_place로 다시 확인하되, 이미 끝낸 장소를 반복 조사하지 마세요."
+        ),
+    }
+    def assemble() -> list[dict[str, Any]]:
+        recent = [item for round_messages in recent_rounds for item in round_messages]
+        return [*prefix, compact_note, *recent]
+
+    compacted = assemble()
+    # Drop complete rounds so an assistant tool call is never separated from
+    # its matching tool results. One final large round is kept intact.
+    while len(recent_rounds) > 1 and len(json.dumps(compacted, ensure_ascii=False, default=str)) > max_chars:
+        recent_rounds = recent_rounds[1:]
+        compacted = assemble()
+    return compacted, True
+
+
 QUALITY_TASK_KINDS = {
     "quality_images",
     "quality_drafts",
@@ -1022,9 +1073,18 @@ def run_agent(
     no_material_actions = 0
     action_sequence = 0
     current_score = 0.0
+    context_compactions = 0
     try:
         for _ in range(steps_limit):
             steps += 1
+            messages, compacted = _compact_react_messages(
+                messages,
+                tool_counts=tool_counts,
+                material_changes=material_changes,
+                current_score=current_score,
+            )
+            if compacted:
+                context_compactions += 1
             try:
                 extra: dict[str, Any] = {}
                 if "gpt-oss" in model:
@@ -1293,6 +1353,7 @@ def run_agent(
                         "material_changes": material_changes,
                         "repeated_calls_blocked": repeated_calls,
                         "image_searches_by_place": image_searches_by_place,
+                        "context_compactions": context_compactions,
                         "evidence_count": len(evidence_keys),
                     },
                     ensure_ascii=False,
@@ -1373,6 +1434,7 @@ def run_agent(
                 "evidence_count": len(evidence_keys),
                 "repeated_calls_blocked": repeated_calls,
                 "image_searches_by_place": image_searches_by_place,
+                "context_compactions": context_compactions,
                 "remaining_gaps": gaps,
                 "gap_task_ids": gap_task_ids,
                 "quality_task_ids_before": quality_task_ids_before,

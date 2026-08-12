@@ -162,6 +162,7 @@ export default function MapPage() {
   const [sideCollapsed, setSideCollapsed] = useState(false);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("map");
   const [controlsOpen, setControlsOpen] = useState(false);
+  const [mapFiltersOpen, setMapFiltersOpen] = useState(false);
   const [plannerPlace, setPlannerPlace] = useState<MarkerItem | null>(null);
   const [isDesktop, setIsDesktop] = useState(() =>
     typeof window !== "undefined" ? window.matchMedia("(min-width: 860px)").matches : true,
@@ -206,6 +207,7 @@ export default function MapPage() {
     setPanelMode(null);
     setWorkspaceView("map");
     setControlsOpen(false);
+    setMapFiltersOpen(false);
   }, [selectedCityId]);
 
   useEffect(() => {
@@ -382,6 +384,21 @@ export default function MapPage() {
     clearDraft();
   }
 
+  async function handlePlaceIdSearch(placeId: number): Promise<boolean> {
+    if (!token) return false;
+    try {
+      const marker = await api.fetchMarker(token, placeId);
+      if (marker.city_id !== selectedCityId) return false;
+      clearSearch();
+      openView(marker);
+      setFlyTarget({ lat: marker.lat, lng: marker.lng });
+      setControlsOpen(false);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function handleShareImported(result: ShareImportResult) {
     const hint = result.category_hint as MarkerCategory;
     const category = CATEGORY_LIST.includes(hint)
@@ -513,7 +530,6 @@ export default function MapPage() {
 
   const modeToggle = (
     <div className="mode-toggle" role="group" aria-label="지도 모드">
-      <span className="mode-toggle__label">모드</span>
       <div className="seg seg--tools">
         <button type="button" className={toolMode === "pin" ? "is-active" : ""} onClick={() => switchTool("pin")}>
           핀
@@ -522,19 +538,11 @@ export default function MapPage() {
           구역
         </button>
       </div>
-      <button
-        type="button"
-        className={`locate-btn locate-btn--compact ${locateOn ? "is-active" : ""}`}
-        onClick={() => void toggleLocate()}
-        disabled={locateBusy}
-      >
-        {locateBusy ? "…" : locateOn ? "위치ON" : "내 위치"}
-      </button>
     </div>
   );
 
   const filterChips = (
-    <div className="chips" role="list">
+    <div className="chips map-filter-chips" role="list" aria-label="지도 장소 필터">
       <button
         type="button"
         className={`chip ${categoryFilter === null && !favoritesOnly && !agentSuggestedOnly ? "is-active" : ""}`}
@@ -583,6 +591,21 @@ export default function MapPage() {
       ))}
     </div>
   );
+
+  const activeFilterCount = (categoryFilter ? 1 : 0) + (favoritesOnly ? 1 : 0) + (agentSuggestedOnly ? 1 : 0);
+  const zoneFilterControl = zones.length ? (
+    <label className="zone-select map-zone-filter">
+      <span>구역</span>
+      <select value={zoneFilter ?? ""} onChange={(e) => setZoneFilter(e.target.value ? Number(e.target.value) : null)}>
+        <option value="">도시 전체</option>
+        {zones.map((zone) => (
+          <option key={zone.id} value={zone.id}>
+            {zone.title} · {markers.filter((item) => item.zone_id === zone.id).length}곳
+          </option>
+        ))}
+      </select>
+    </label>
+  ) : null;
 
   const toolsBlock = (
     <div className="side-tools">
@@ -767,6 +790,7 @@ export default function MapPage() {
           setMoreOpen(false);
           setWorkspaceView(view);
           setControlsOpen(false);
+          setMapFiltersOpen(false);
         }}
       />
       <aside className={`map-side ${controlsOpen ? "map-side--open" : ""}`}>
@@ -783,7 +807,7 @@ export default function MapPage() {
           <div className="map-side__brand">
             <BrandMark compact />
             <button type="button" className="map-controls-toggle mobile-only" onClick={() => setControlsOpen((value) => !value)} aria-expanded={controlsOpen}>
-              {controlsOpen ? "닫기" : "검색·필터"}
+              {controlsOpen ? "검색 닫기" : "검색"}
             </button>
             <div className="map-side__brand-actions desktop-only">
               {user?.is_admin ? (
@@ -802,34 +826,14 @@ export default function MapPage() {
               </button>
             </div>
           </div>
-          <label className="city-select">
-            <span>여행 도시</span>
-            <select value={selectedCityId} onChange={(e) => setSelectedCityId(Number(e.target.value))}>
-              {cities.map((city) => (
-                <option key={city.id} value={city.id}>
-                  {city.name_ko} {city.name_local} · 장소 {city.place_count} · 구역 {city.zone_count ?? 0}
-                </option>
-              ))}
-            </select>
-          </label>
-          {zones.length ? (
-            <label className="zone-select">
-              <span>관광 구역</span>
-              <select value={zoneFilter ?? ""} onChange={(e) => setZoneFilter(e.target.value ? Number(e.target.value) : null)}>
-                <option value="">도시 전체 보기</option>
-                {zones.map((zone) => (
-                  <option key={zone.id} value={zone.id}>
-                    {zone.title} · {markers.filter((item) => item.zone_id === zone.id).length}곳
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
           {token && selectedCity ? (
-            <AddressSearch token={token} cityId={selectedCity.id} onResults={handleSearchResults} />
+            <AddressSearch
+              token={token}
+              cityId={selectedCity.id}
+              onResults={handleSearchResults}
+              onPlaceIdSearch={handlePlaceIdSearch}
+            />
           ) : null}
-          {filterChips}
-          {modeToggle}
           <div className="desktop-only">{toolsBlock}</div>
           <p className="map-side__hint">
             {awaitingImportPick
@@ -954,6 +958,31 @@ export default function MapPage() {
             />
           ) : null}
         </MapContainer>
+        <div className={`map-floating-filters${mapFiltersOpen ? " is-open" : ""}`}>
+          <button
+            type="button"
+            className="map-floating-filters__toggle"
+            onClick={() => setMapFiltersOpen((value) => !value)}
+            aria-expanded={mapFiltersOpen}
+          >
+            필터{activeFilterCount ? ` ${activeFilterCount}` : ""}
+          </button>
+          <div className="map-floating-filters__body">
+            {zoneFilterControl}
+            {filterChips}
+          </div>
+        </div>
+        <div className="map-floating-mode">
+          {modeToggle}
+          <button
+            type="button"
+            className={`locate-btn locate-btn--compact ${locateOn ? "is-active" : ""}`}
+            onClick={() => void toggleLocate()}
+            disabled={locateBusy}
+          >
+            {locateBusy ? "…" : locateOn ? "위치 ON" : "내 위치"}
+          </button>
+        </div>
       </div>
 
       {workspaceView !== "map" ? (
