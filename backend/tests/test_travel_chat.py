@@ -20,6 +20,7 @@ from app.travel_chat import (
     _brand_source_urls,
     _chat_capabilities,
     _classify_snack_fit,
+    _coordinate_record_matches_proposal,
     _food_business_name,
     _food_detail_recovery_query,
     _extract_grounded_candidates,
@@ -40,6 +41,23 @@ from app.travel_chat import (
 
 
 class TravelChatRoutingTests(unittest.TestCase):
+    def test_coordinate_match_rejects_another_shop_in_the_same_building(self) -> None:
+        proposal = {
+            "title": "小猫爸爸台湾香鸡排专卖店",
+            "description": "中街路115号兴隆大家庭东门",
+            "coordinate_query": "中街路115号兴隆大家庭",
+        }
+        wrong_shop = {
+            "query": "小猫爸爸台湾香鸡排专卖店 中街路115号",
+            "display_name": "耐克nike(兴隆大家庭店), 沈阳市沈河区中街路115号",
+        }
+        exact_shop = {
+            "display_name": "小猫爸爸台湾香鸡排专卖店, 沈阳市沈河区中街路115号",
+        }
+
+        self.assertFalse(_coordinate_record_matches_proposal(proposal, wrong_shop))
+        self.assertTrue(_coordinate_record_matches_proposal(proposal, exact_shop))
+
     def test_search_filter_keeps_relevant_local_source_and_drops_spam(self) -> None:
         query = "沈阳 中街 按摩店"
         safe = {

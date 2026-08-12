@@ -1454,6 +1454,24 @@ def _extract_embedded_coordinates(html_text: str, url: str) -> list[dict[str, An
     }]
 
 
+def _ctrip_food_coordinate_url(url: str) -> str:
+    """Return Ctrip's coordinate-bearing mobile companion for a POI page."""
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    if host not in {"you.ctrip.com", "www.ctrip.com"}:
+        return ""
+    match = re.fullmatch(
+        r"/food/(?:[a-z-]*?(\d+)|(\d+))/(\d+)(?:-dianping\d+)?\.html",
+        parsed.path,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    city_code = match.group(1) or match.group(2)
+    poi_id = match.group(3)
+    return f"https://gs.ctrip.com/html5/you/foods/fooddetail/{city_code}/{poi_id}.html"
+
+
 def _extract_page_text(url: str) -> dict[str, Any]:
     parsed = urllib.parse.urlsplit(url)
     safe_url = urllib.parse.urlunsplit(
@@ -3240,6 +3258,34 @@ def run_tool(
             return {"error": f"fetch_failed: {exc}"[:300]}
         if "error" in page:
             return page
+        coordinate_companion_url = ""
+        if not page.get("coordinate_candidates"):
+            coordinate_companion_url = _ctrip_food_coordinate_url(url)
+            if coordinate_companion_url:
+                try:
+                    companion_page = _extract_page_text(coordinate_companion_url)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info(
+                        "Ctrip coordinate companion failed url=%s error=%s",
+                        coordinate_companion_url,
+                        str(exc)[:180],
+                    )
+                else:
+                    companion_title = str(companion_page.get("title") or "").strip()
+                    companion_coordinates = []
+                    for raw_coordinate in companion_page.get("coordinate_candidates") or []:
+                        if not isinstance(raw_coordinate, dict):
+                            continue
+                        coordinate = dict(raw_coordinate)
+                        coordinate["display_name"] = str(
+                            coordinate.get("display_name") or companion_title
+                        )[:500]
+                        companion_coordinates.append(coordinate)
+                    if companion_coordinates:
+                        page["coordinate_candidates"] = companion_coordinates
+                        page["coordinate_companion_url"] = coordinate_companion_url
+                        if not page.get("title") and companion_title:
+                            page["title"] = companion_title
         page_text = f"{page.get('title') or ''} {page.get('text') or ''}"
         if _UNSAFE_SEARCH_TEXT_RE.search(page_text):
             return {"error": "unsafe_source_content", "detail": "여행 정보에 부적합한 출처를 제외했습니다."}
@@ -3259,6 +3305,7 @@ def run_tool(
             "title": page.get("title") or "",
             "text": page.get("text") or "",
             "coordinate_candidates": page.get("coordinate_candidates") or [],
+            "coordinate_companion_url": page.get("coordinate_companion_url") or "",
             "already_visited": already_visited,
             "last_visited_at": (
                 prior.last_visited_at.isoformat()

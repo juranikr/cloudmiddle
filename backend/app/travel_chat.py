@@ -656,6 +656,19 @@ def _entity_text_matches(left: str, right: str) -> bool:
     return False
 
 
+def _coordinate_record_matches_proposal(
+    proposal: dict[str, Any],
+    coordinate: dict[str, Any],
+) -> bool:
+    """Match the POI identity, never merely a shared mall/street address."""
+    proposed_entity = " ".join(filter(None, [
+        str(proposal.get("title") or ""),
+        str(proposal.get("branch_name") or ""),
+    ]))
+    coordinate_entity = str(coordinate.get("display_name") or "")
+    return _entity_text_matches(proposed_entity, coordinate_entity)
+
+
 def _candidate_title_from_page(value: str) -> str:
     title = re.sub(r"\s+", " ", value or "").strip()
     bracket = re.match(r"^[【\[]([^】\]]{3,120})[】\]]", title)
@@ -1969,17 +1982,9 @@ def answer_travel_chat(
                         for target in proposed_targets
                         for url in supplied_urls
                     )
-                    target_text = " ".join(filter(None, [
-                        str(args.get("title") or ""),
-                        str(args.get("description") or ""),
-                        str(args.get("coordinate_query") or ""),
-                    ]))
                     relevant_coordinates = [
                         item for item in verified_coordinate_records
-                        if _entity_text_matches(
-                            target_text,
-                            f"{item.get('query', '')} {item.get('display_name', '')}",
-                        )
+                        if _coordinate_record_matches_proposal(args, item)
                     ]
                     if not relevant_coordinates:
                         coordinate_target_unmatched = True

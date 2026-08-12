@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from app.agent.tools import _extract_embedded_coordinates
+from app.agent.tools import _ctrip_food_coordinate_url, _extract_embedded_coordinates
 from app.gcj02 import gcj02_to_wgs84
 from app.geocode import _local_hits, _meaningful_entity_match, _merge_hits, parse_viewbox
 
@@ -62,6 +62,26 @@ class GeocodeMergeTests(unittest.TestCase):
         self.assertEqual(rows[0]["source_crs"], "GCJ-02")
         self.assertEqual(rows[0]["storage_crs"], "WGS84")
         self.assertTrue(rows[0]["storage_allowed"])
+
+    def test_ctrip_poi_page_has_coordinate_bearing_companion(self) -> None:
+        self.assertEqual(
+            _ctrip_food_coordinate_url(
+                "https://you.ctrip.com/food/shenyang155/15729804-dianping153077651.html"
+            ),
+            "https://gs.ctrip.com/html5/you/foods/fooddetail/155/15729804.html",
+        )
+        self.assertEqual(
+            _ctrip_food_coordinate_url(
+                "https://you.ctrip.com/food/shenyang155/22551502.html"
+            ),
+            "https://gs.ctrip.com/html5/you/foods/fooddetail/155/22551502.html",
+        )
+        self.assertEqual(
+            _ctrip_food_coordinate_url(
+                "https://you.ctrip.com/food/shenyang155/364207-food.html"
+            ),
+            "",
+        )
 
     def test_embedded_coordinate_ignores_unsupported_pages(self) -> None:
         html = '<script>{"GDCoord":{"Lat":41.7890215,"Lng":123.4169422}}</script>'
