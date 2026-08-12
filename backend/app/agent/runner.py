@@ -12,6 +12,7 @@ from app.agent.tools import TOOLS, is_useful_fetched_page, run_tool
 from app.config import settings
 from app.agent.memory import (
     checkpoint_after_tool,
+    active_work_item_for_mission,
     ensure_mission_for_task,
     evaluate_knowledge_uses,
     finalize_mission,
@@ -1508,6 +1509,10 @@ def run_agent(
                 )
                 if active_work_item is not None:
                     agent_run.work_item_id = active_work_item.id
+                canonical_active = active_work_item_for_mission(db, active_mission)
+                if canonical_active is not None:
+                    active_work_item = canonical_active
+                    agent_run.work_item_id = canonical_active.id
                 if material_change:
                     active_work_item = reconcile_work_items(db, mission=active_mission) or active_work_item
                     if active_work_item is not None:

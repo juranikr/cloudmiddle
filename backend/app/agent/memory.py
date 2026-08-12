@@ -523,8 +523,11 @@ def _resolve_work_item(db: Session, mission: AgentMission, current: AgentWorkIte
             target = db.get(AgentWorkItem, evidence.work_item_id)
     if target is None or target.id == current.id:
         return current
+    # The orchestrator, not a drifting model call, owns target transitions.
+    # A ready/blocked sibling may receive evidence, but cannot steal the active
+    # cursor until the current item is completed or explicitly rotated.
     if current.status == "active":
-        current.status = "ready"
+        return current
     target.status = "active"
     target.blocked_reason = ""
     return target
@@ -856,6 +859,15 @@ def rotate_blocked_work_item(
         })
     db.commit()
     return next_item
+
+
+def active_work_item_for_mission(db: Session, mission: Optional[AgentMission]) -> Optional[AgentWorkItem]:
+    if mission is None:
+        return None
+    return db.query(AgentWorkItem).filter(
+        AgentWorkItem.mission_id == mission.id,
+        AgentWorkItem.status == "active",
+    ).order_by(AgentWorkItem.updated_at.desc(), AgentWorkItem.id.asc()).first()
 
 
 def finalize_mission(

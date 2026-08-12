@@ -33,6 +33,7 @@ from app.agent.memory import (
     retrieve_contextual_knowledge,
     rotate_blocked_work_item,
     observe_lesson,
+    active_work_item_for_mission,
 )
 from app.rollback import list_agent_actions
 from app.models import (
@@ -284,6 +285,37 @@ class AgentCityScopeTests(unittest.TestCase):
         self.db.commit()
         self.assertEqual(lesson.observation_count, 1)
         self.assertGreater(lesson.confidence, 0.5)
+
+    def test_model_call_cannot_move_active_cursor_back_to_ready_sibling(self) -> None:
+        places = self.db.query(Marker).filter(Marker.city_id == 2).all()
+        second = Marker(
+            city_id=2, category=MarkerCategory.restaurant, shape=MarkerShape.point,
+            title="두 번째 활성 대상", description="한국어 설명", lat=41.83, lng=123.43,
+        )
+        self.db.add(second)
+        self.db.flush()
+        task = AgentTask(
+            city_id=2, kind="quality_images", title="이미지",
+            detail=f"대상:\n- #{places[0].id} {places[0].title}\n- #{second.id} {second.title}",
+            success_metric="사진", priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, first = ensure_mission_for_task(self.db, task)
+        second_item = rotate_blocked_work_item(
+            self.db, mission=mission, current=first, run_id=2, reason="첫 대상 차단",
+        )
+        self.assertEqual(active_work_item_for_mission(self.db, mission).id, second_item.id)
+        run = AgentRun(city_id=2, mission_id=mission.id, work_item_id=second_item.id, status="running")
+        self.db.add(run)
+        self.db.commit()
+        updated, _ = checkpoint_after_tool(
+            self.db, mission=mission, work_item=second_item, run_id=run.id, sequence=1,
+            tool="get_place", args={"place_id": first.place_id}, result={"id": first.place_id},
+            outcome="ok", new_evidence_count=0, material_change=False,
+        )
+        self.assertEqual(updated.id, second_item.id)
+        self.assertEqual(active_work_item_for_mission(self.db, mission).id, second_item.id)
 
     def test_batch_progress_ignores_noop_mutations_and_repeated_evidence(self) -> None:
         self.assertFalse(_is_material_change("upsert_agent_task", {"ok": True, "changed": False}))
