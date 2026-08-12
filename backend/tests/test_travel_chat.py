@@ -58,6 +58,26 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertEqual([item["href"] for item in kept], [safe["href"]])
         self.assertEqual(discarded, 2)
 
+    def test_trusted_host_does_not_bypass_exact_business_relevance(self) -> None:
+        query = "高德地图 诚意小厨 皇姑店"
+        unrelated_trusted = {
+            "title": "上海美食指南",
+            "href": "https://ru.trip.com/guide/food/food-in-shanghai.html",
+            "body": "",
+        }
+        relevant_trusted = {
+            "title": "诚意小厨 (皇姑店) 电话 地址",
+            "href": "https://m.dianping.com/shop/1129127029",
+            "body": "诚意小厨皇姑店地址与营业信息",
+        }
+
+        kept, discarded = _filter_search_results(
+            query, [unrelated_trusted, relevant_trusted], limit=8
+        )
+
+        self.assertEqual([item["href"] for item in kept], [relevant_trusted["href"]])
+        self.assertEqual(discarded, 1)
+
     def test_grounded_candidate_is_extracted_from_answer_and_tool_evidence(self) -> None:
         answer = (
             "중제 근처에서는 绿波廊SPA会馆（中街店）을 확인했습니다.\n"

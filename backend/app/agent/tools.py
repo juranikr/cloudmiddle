@@ -263,7 +263,12 @@ def _search_result_quality(query: str, item: dict[str, Any]) -> float:
         return 0.0
     if len(relevance_groups) >= 2 and matched_groups < 2:
         return 0.0
-    if not relevance_groups and token_matches == 0 and not trusted:
+    # A reputable host is not enough when an exact business query has no
+    # semantic group (city/food/hotel/etc.).  For example, Trip.com's unrelated
+    # Shanghai guide once survived a search for a named Shenyang restaurant
+    # solely because trip.com is trusted.  Exact queries must still share at
+    # least one meaningful token with the result.
+    if not relevance_groups and token_matches == 0:
         return 0.0
     return round(min(score, 1.0), 3)
 
