@@ -1805,6 +1805,7 @@ def run_tool(
     city_id: int,
     approved: bool = False,
     server_pure_read: bool = False,
+    server_defer_commit: bool = False,
 ) -> Any:
     if name == "list_unread_events":
         limit = int(args.get("limit") or 30)
@@ -3144,7 +3145,40 @@ def run_tool(
         status_value = str(args.get("status") or "pending")
         task_id = int(args["task_id"]) if args.get("task_id") is not None else None
         row = db.query(AgentTask).filter(AgentTask.id == task_id, AgentTask.city_id == city_id).first() if task_id else None
+        if row is not None and row.kind == "data_integrity":
+            # A scheduled worker, a manual run, and a legacy endpoint can reach
+            # the same durable audit from different processes.  Serialize the
+            # terminal decision in PostgreSQL, then discard any identity-map
+            # snapshot loaded before the lock so a completed verdict can never
+            # be overwritten by a stale pending row.
+            transaction_lock(db, f"data-integrity-task:{city_id}:{task_id}")
+            db.expire(row)
+            row = (
+                db.query(AgentTask)
+                .filter(AgentTask.id == task_id, AgentTask.city_id == city_id)
+                .with_for_update()
+                .first()
+            )
         created = False
+        if (
+            row is not None
+            and row.kind == "data_integrity"
+            and row.status == "completed"
+        ):
+            # Terminal audit results are immutable. This also provides an
+            # idempotent recovery boundary for legacy runs that committed the
+            # task before finalizing their mission cursor.
+            return {
+                "ok": True,
+                "task_id": row.id,
+                "status": "completed",
+                "changed": False,
+                "created": False,
+                "already_completed": True,
+                "immutable": True,
+                "result": row.result,
+                "attempts": row.attempts,
+            }
         if row is None:
             title = str(args.get("title") or "").strip()[:240]
             task_text = " ".join(
@@ -3185,7 +3219,10 @@ def run_tool(
                     if blocker:
                         changed = managed.result != blocker[:8000]
                         managed.result = blocker[:8000]
-                        db.commit()
+                        if server_defer_commit:
+                            db.flush()
+                        else:
+                            db.commit()
                         return {
                             "ok": True,
                             "task_id": managed.id,
@@ -3277,7 +3314,10 @@ def run_tool(
             row.status,
             row.result,
         )
-        db.commit()
+        if server_defer_commit:
+            db.flush()
+        else:
+            db.commit()
         return {
             "ok": True,
             "task_id": row.id,

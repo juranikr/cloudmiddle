@@ -37,6 +37,24 @@ _STOPWORDS = {
     "현재", "장소", "자동", "품질", "보강", "실행", "대상", "정보", "작업", "agent",
     "place", "quality", "research", "검증", "사진", "운영", "존재", "있는", "없는",
 }
+CORRECTIVE_POLICY_GUARD_ERRORS = frozenset({
+    "duplicate_data_integrity_place_read",
+    "data_integrity_task_list_budget_exhausted",
+    "active_agent_task_mismatch",
+    "invalid_data_integrity_task_status",
+    "invalid_data_integrity_task_result",
+    "structured_integrity_verdict_required",
+    "tool_not_allowed_for_data_integrity",
+    "material_decision_required",
+    "recent_duplicate_search",
+    "duplicate_tool_call",
+})
+POLICY_GUARD_DECIDE_ERRORS = frozenset({
+    "duplicate_data_integrity_place_read",
+    "data_integrity_task_list_budget_exhausted",
+    "material_decision_required",
+    "structured_integrity_verdict_required",
+})
 
 
 def _json_value(raw: str, fallback: Any) -> Any:
@@ -643,11 +661,16 @@ def record_model_recovery_attempt(
         dict(item) for item in mission_strategy.get("recovery_history", [])
         if isinstance(item, dict)
     ]
+    failure_summary = (
+        f"model_output:{failure_kind}: attempt={attempt}; "
+        f"mode={strategy.get('mode', 'focused_retry')}; error={error[:240]}"
+    )
     entry = {
         "evidence_ref": evidence_ref,
         "failure_kind": failure_kind,
         "attempt": attempt,
         "strategy": strategy,
+        "failure_summary": failure_summary,
         "outcome": "retrying",
         "started_at": now.isoformat(),
     }
@@ -656,14 +679,17 @@ def record_model_recovery_attempt(
     mission_strategy["last_recovery"] = entry
     mission.strategy = _dump(mission_strategy)
 
-    failures = _json_list(work_item.failed_approaches)
-    failure_summary = (
-        f"model_output:{failure_kind}: attempt={attempt}; "
-        f"mode={strategy.get('mode', 'focused_retry')}; error={error[:240]}"
-    )
-    if failure_summary not in failures:
-        failures.append(failure_summary)
+    failures = [
+        failure for failure in _json_list(work_item.failed_approaches)
+        if not failure.startswith("model_output:")
+    ]
     work_item.failed_approaches = _dump(failures[-12:])
+    checkpoint_failures = [*failures]
+    if failure_summary not in checkpoint_failures:
+        checkpoint_failures.append(failure_summary)
+    # Provider/schema failures belong to mission recovery history, not the
+    # investigation-path budget that rotates a place after three failed source
+    # strategies. The recovery checkpoint still preserves the incident.
     work_item.state_summary = (
         f"Run #{run_id} model output failed ({failure_kind}); retry {attempt} changed "
         f"strategy to {strategy.get('mode', 'focused_retry')}."
@@ -681,7 +707,7 @@ def record_model_recovery_attempt(
         decision=f"Retry model output with changed strategy: {strategy.get('mode', 'focused_retry')}",
         new_facts="[]",
         rejected_claims=_dump([error[:1000]]),
-        failed_approaches=_dump(failures[-6:]),
+        failed_approaches=_dump(checkpoint_failures[-6:]),
         next_action=_dump(next_action),
         outcome="recovery_retry",
     ))
@@ -732,6 +758,14 @@ def finish_model_recovery_attempt(
         mission.progress = _dump(progress)
         mission.updated_at = now
     if work_item is not None:
+        # Model/provider failures are mission recovery history, never source
+        # investigation paths. Also clean legacy entries written by older runs,
+        # regardless of whether this particular recovery succeeded.
+        failures = [
+            failure for failure in _json_list(work_item.failed_approaches)
+            if not failure.startswith("model_output:")
+        ]
+        work_item.failed_approaches = _dump(failures[-12:])
         work_item.state_summary = (
             f"Run #{run_id} model-output recovery "
             f"{'succeeded' if successful else 'failed'} for {failure_kind} using "
@@ -785,6 +819,23 @@ def checkpoint_after_tool(
     now = datetime.now(timezone.utc)
     error = str(result.get("error") or "") if isinstance(result, dict) else ""
     detail = str(result.get("detail") or "") if isinstance(result, dict) else ""
+    is_policy_guard = bool(
+        isinstance(result, dict)
+        and mission.kind == "data_integrity"
+        and (
+            result.get("error_class") == "policy_guard"
+            or error in CORRECTIVE_POLICY_GUARD_ERRORS
+        )
+    )
+    guard_disposition = (
+        str(result.get("guard_disposition") or "")
+        if isinstance(result, dict)
+        else ""
+    )
+    if guard_disposition not in {"decide", "retry"}:
+        guard_disposition = (
+            "decide" if error in POLICY_GUARD_DECIDE_ERRORS else "retry"
+        )
     facts: list[str] = []
     rejected: list[str] = []
     failures = _json_list(item.failed_approaches)
@@ -845,6 +896,55 @@ def checkpoint_after_tool(
         facts.append("출처 본문을 읽어 저장 판단이 가능함")
         item.stage = "decide"
         next_action = {"tool": "decide", "source_url": evidence_rows[0].url, "purpose": "주장-대상 일치 확인 후 안전한 저장 또는 기각"}
+    elif is_policy_guard and guard_disposition == "decide":
+        # Policy guards describe an invalid action choice, not a failed source
+        # or investigation path. Keep the actual failure budget untouched and
+        # direct the model to close its own integrity task honestly.
+        item.stage = "decide"
+        # These guards are locally resolved orchestration corrections rather
+        # than external blockers. Close the audit as an honest unresolved
+        # verdict so an active mission is not resumed in the next batch.
+        terminal_status = "completed"
+        next_action = {
+            "tool": "upsert_agent_task",
+            "args": {
+                "task_id": mission.task_id,
+                "status": terminal_status,
+                "result": (
+                    f"verdict=unresolved; policy_guard={error}; "
+                    f"guard_disposition={guard_disposition}; marker_changes=0; "
+                    "observed_facts=체크포인트에 저장된 관찰만 사용; "
+                    "sources=검증 완료 출처가 없으면 none; 미해결 사유를 사실대로 기록"
+                ),
+            },
+            "purpose": (
+                f"정책 가드({guard_disposition})를 조사 실패로 반복하지 말고 현재 감사 "
+                "과제에 검증 가능한 unresolved completed 결과를 기록"
+            ),
+        }
+        next_action["purpose"] = (
+            "Record the evidence-backed terminal verdict for this audit's own "
+            "task without mutating marker data."
+        )
+        next_action["args"]["result"] = (
+            f"verdict=unresolved; policy_guard={error}; "
+            "guard_disposition=decide; marker_changes=0; "
+            "observed_facts=<checkpoint facts>; "
+            "sources=<validated sources or none>"
+        )
+    elif is_policy_guard:
+        # Retry guards correct an action choice without consuming the failed
+        # investigation-path budget or prematurely closing an unobserved task.
+        item.stage = "research"
+        next_action = {
+            "tool": "continue",
+            "args": {"task_id": mission.task_id},
+            "purpose": (
+                f"Correct policy guard {error}, reuse existing observations, and "
+                "continue with an allowed non-repeated action. Do not close the "
+                "task until an auditable observation supports the verdict."
+            ),
+        }
     elif error == "active_work_item_mismatch":
         # Model drift is not evidence that the active place is blocked.  Keep
         # the cursor and definition of done intact without poisoning the
@@ -886,7 +986,17 @@ def checkpoint_after_tool(
         run_id=run_id,
         sequence=sequence,
         state_summary=item.state_summary,
-        decision=("DB 변경 후 성공조건 확인" if material_change else "근거를 더 확인" if next_action.get("tool") == "fetch_page" else "대체 행동 선택" if error else "현재 전략 유지"),
+        decision=(
+            "DB 변경 후 성공조건 확인"
+            if material_change
+            else "정책 가드 후 현재 과제 결과 기록"
+            if is_policy_guard
+            else "근거를 더 확인"
+            if next_action.get("tool") == "fetch_page"
+            else "대체 행동 선택"
+            if error
+            else "현재 전략 유지"
+        ),
         new_facts=_dump(facts),
         rejected_claims=_dump(rejected),
         failed_approaches=_dump(failures[-6:]),
