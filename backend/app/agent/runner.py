@@ -912,6 +912,80 @@ def _quality_target_line(marker: Marker, gaps: list[str]) -> str:
     return f"- #{marker.id} {marker.title} (현재: {', '.join(labels[item] for item in gaps)})"
 
 
+def _canonical_quality_task(
+    db: Session,
+    *,
+    city_id: int,
+    kind: str,
+    now: datetime,
+) -> AgentTask | None:
+    """Keep one DB-derived quality task and one active mission per dimension.
+
+    Older agents could mark the parent task complete while its durable mission
+    still had an active place, then create a duplicate task in the same run.
+    Prefer the task already owned by the newest unfinished active mission; only
+    fall back to the latest task when there is no durable cursor to preserve.
+    """
+
+    rows = (
+        db.query(AgentTask)
+        .filter(AgentTask.city_id == city_id, AgentTask.kind == kind)
+        .order_by(AgentTask.id.desc())
+        .all()
+    )
+    if not rows:
+        return None
+    row_by_id = {row.id: row for row in rows}
+    active_missions = (
+        db.query(AgentMission)
+        .join(AgentWorkItem, AgentWorkItem.mission_id == AgentMission.id)
+        .filter(
+            AgentMission.city_id == city_id,
+            AgentMission.kind == kind,
+            AgentMission.status == "active",
+            AgentMission.task_id.in_(row_by_id),
+            AgentWorkItem.status.in_(("active", "ready")),
+        )
+        .order_by(AgentMission.updated_at.desc(), AgentMission.id.desc())
+        .all()
+    )
+    canonical_mission = active_missions[0] if active_missions else None
+    canonical = row_by_id.get(canonical_mission.task_id) if canonical_mission else rows[0]
+    if canonical is None:
+        canonical = rows[0]
+
+    seen_missions: set[int] = set()
+    for mission in active_missions:
+        if mission.id in seen_missions:
+            continue
+        seen_missions.add(mission.id)
+        if canonical_mission is None or mission.id == canonical_mission.id:
+            continue
+        try:
+            parsed_progress = json.loads(mission.progress or "{}")
+            progress = parsed_progress if isinstance(parsed_progress, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            progress = {}
+        progress.update({
+            "pause_reason": "duplicate managed quality mission consolidated",
+            "superseded_by_mission_id": canonical_mission.id,
+        })
+        mission.progress = json.dumps(progress, ensure_ascii=False)
+        mission.status = "paused"
+        mission.updated_at = now
+
+    for duplicate in rows:
+        if duplicate.id == canonical.id or duplicate.status != "pending":
+            continue
+        duplicate.status = "completed"
+        duplicate.completed_at = now
+        duplicate.result = (
+            f"동일 품질 차원의 지속 과제 #{canonical.id}에 통합됨; "
+            "체크포인트와 실행 이력은 기존 미션에 보존됩니다."
+        )[:8000]
+    return canonical
+
+
 def _sync_quality_tasks(
     db: Session,
     *,
@@ -1013,12 +1087,7 @@ def _sync_quality_tasks(
     task_ids: list[int] = []
     now = datetime.now(timezone.utc)
     for kind, spec in specs.items():
-        row = (
-            db.query(AgentTask)
-            .filter(AgentTask.city_id == city_id, AgentTask.kind == kind)
-            .order_by(AgentTask.id.desc())
-            .first()
-        )
+        row = _canonical_quality_task(db, city_id=city_id, kind=kind, now=now)
         targets: list[Marker] = spec["targets"]
         if not targets:
             if row is not None and row.status != "completed":
@@ -1179,12 +1248,10 @@ def run_agent(
     if allow_research:
         resumable_mission = (
             db.query(AgentMission)
-            .join(AgentTask, AgentTask.id == AgentMission.task_id)
             .join(AgentWorkItem, AgentWorkItem.mission_id == AgentMission.id)
             .filter(
                 AgentMission.city_id == city_id,
                 AgentMission.status == "active",
-                AgentTask.status == "pending",
                 AgentWorkItem.status.in_(("active", "ready")),
             )
             .order_by(AgentMission.updated_at.desc(), AgentMission.id.desc())
@@ -1495,6 +1562,17 @@ def run_agent(
                 active_recovery_strategy = (
                     pending_model_recovery.get("strategy") if pending_model_recovery else {}
                 )
+                mission_tool_names = active_recovery_strategy.get("tool_names")
+                if (
+                    not mission_tool_names
+                    and research_only
+                    and active_mission is not None
+                    and active_mission.kind in RECOVERY_TOOLS_BY_TASK
+                ):
+                    # During autonomous quality work, make the current mission's
+                    # affordances explicit. User-event runs retain the full tool
+                    # set so queue processing can still resolve every event type.
+                    mission_tool_names = sorted(RECOVERY_TOOLS_BY_TASK[active_mission.kind])
                 if "gpt-oss" in model:
                     # 병합 판단 등 미묘한 결정의 품질을 위해 추론 강도 상향.
                     # extra_body 경유: 구버전 groq SDK도 통과시킨다.
@@ -1504,7 +1582,7 @@ def run_agent(
                 resp = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=_filtered_tools(active_recovery_strategy.get("tool_names")),
+                    tools=_filtered_tools(mission_tool_names),
                     tool_choice="auto",
                     temperature=0.2,
                     **extra,
@@ -1918,6 +1996,8 @@ def run_agent(
                     )
                     if active_work_item is not None:
                         agent_run.work_item_id = active_work_item.id
+                        research_actions_since_material = 0
+                        no_progress_actions = 0
                         continuity["rotation"] = {
                             "from": previous_target,
                             "to": active_work_item.target_key,
@@ -1937,6 +2017,8 @@ def run_agent(
                     )
                     if active_work_item is not None:
                         agent_run.work_item_id = active_work_item.id
+                        research_actions_since_material = 0
+                        no_progress_actions = 0
                         continuity["rotation"] = {
                             "from": previous_target,
                             "to": active_work_item.target_key,

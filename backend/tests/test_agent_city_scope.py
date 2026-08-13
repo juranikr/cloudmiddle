@@ -23,6 +23,7 @@ from app.agent.runner import (
     _model_recovery_plan,
     _research_gaps,
     _run_outcome_status,
+    _canonical_quality_task,
     _sync_quality_tasks,
     _should_rotate_exhausted_image_target,
     _step_detail_json,
@@ -764,8 +765,9 @@ class AgentCityScopeTests(unittest.TestCase):
             },
             city_id=2,
         )
-        self.assertEqual(duplicate["error"], "quality_gap_already_tracked")
+        self.assertTrue(duplicate["ok"])
         self.assertEqual(duplicate["task_id"], image_task.id)
+        self.assertIn("자유 라이선스", image_task.result)
         image_task.attempts = 1
         place.description = "x" * 61
         self.db.commit()
@@ -1029,6 +1031,68 @@ class AgentCityScopeTests(unittest.TestCase):
             original,
         )
         self.assertIn("다음 실행", task.result)
+
+    def test_managed_quality_completion_cannot_sever_or_duplicate_active_mission(self) -> None:
+        image_task_id = next(
+            task_id
+            for task_id in _sync_quality_tasks(self.db, city_id=2)
+            if self.db.get(AgentTask, task_id).kind == "quality_images"
+        )
+        image_task = self.db.get(AgentTask, image_task_id)
+        mission, item = ensure_mission_for_task(self.db, image_task)
+
+        completion = run_tool(
+            self.db,
+            "upsert_agent_task",
+            {
+                "task_id": image_task.id,
+                "title": image_task.title,
+                "status": "completed",
+                "result": "사진을 찾지 못했으므로 완료",
+            },
+            city_id=2,
+        )
+        self.db.refresh(image_task)
+        self.assertEqual(image_task.status, "pending")
+        self.assertTrue(completion["requested_status_ignored"])
+
+        # Reproduce the historical bad state and prove synchronization chooses
+        # the task that owns the durable cursor instead of the newer duplicate.
+        image_task.status = "completed"
+        self.db.commit()
+        deduplicated = run_tool(
+            self.db,
+            "upsert_agent_task",
+            {
+                "kind": "quality_images",
+                "title": "another image task",
+                "status": "pending",
+            },
+            city_id=2,
+        )
+        self.assertEqual(deduplicated["error"], "quality_gap_already_tracked")
+        self.assertEqual(deduplicated["task_id"], image_task.id)
+
+        duplicate = AgentTask(
+            city_id=2,
+            kind="quality_images",
+            title="duplicate image task",
+            status="pending",
+        )
+        self.db.add(duplicate)
+        self.db.commit()
+        canonical = _canonical_quality_task(
+            self.db,
+            city_id=2,
+            kind="quality_images",
+            now=datetime.now(timezone.utc),
+        )
+        self.db.commit()
+
+        self.assertEqual(canonical.id, image_task.id)
+        self.assertEqual(duplicate.status, "completed")
+        self.assertEqual(mission.status, "active")
+        self.assertEqual(item.status, "active")
 
     def test_admin_agent_history_can_be_scoped_to_city(self) -> None:
         for city_id in (1, 2):

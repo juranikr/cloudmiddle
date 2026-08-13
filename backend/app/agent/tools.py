@@ -2870,7 +2870,15 @@ def run_tool(
                     str(args.get("success_metric") or ""),
                 ]
             ).lower()
-            managed_quality_kind = None
+            requested_kind = str(args.get("kind") or "").strip()
+            managed_kinds = {
+                "quality_images",
+                "quality_drafts",
+                "quality_information",
+                "quality_zones",
+                "quality_verification",
+            }
+            managed_quality_kind = requested_kind if requested_kind in managed_kinds else None
             quality_keywords = {
                 "quality_images": ("이미지", "사진", "image"),
                 "quality_drafts": ("초안", "draft"),
@@ -2886,9 +2894,26 @@ def run_tool(
                 managed = db.query(AgentTask).filter(
                     AgentTask.city_id == city_id,
                     AgentTask.kind == managed_quality_kind,
-                    AgentTask.status == "pending",
-                ).first()
+                ).order_by(AgentTask.id.desc()).first()
                 if managed is not None:
+                    blocker = str(args.get("result") or args.get("detail") or "").strip()
+                    if blocker:
+                        changed = managed.result != blocker[:8000]
+                        managed.result = blocker[:8000]
+                        db.commit()
+                        return {
+                            "ok": True,
+                            "task_id": managed.id,
+                            "status": managed.status,
+                            "changed": changed,
+                            "created": False,
+                            "status_controlled_by_orchestrator": True,
+                            "requested_status_ignored": str(args.get("status") or "pending") != managed.status,
+                            "detail": (
+                                "차단 근거를 기존 품질 과제에 기록했습니다. 실제 결손 재측정 전에는 "
+                                "상위 과제를 완료하지 않으며, 오케스트레이터가 다음 장소로 이동합니다."
+                            ),
+                        }
                     return {
                         "error": "quality_gap_already_tracked",
                         "task_id": managed.id,
@@ -2949,7 +2974,12 @@ def run_tool(
             row.detail = str(args.get("detail") or row.detail or "")[:8000]
             row.success_metric = str(args.get("success_metric") or row.success_metric or "")[:2000]
             row.priority = max(1, min(int(args.get("priority") or row.priority or 50), 100))
-        row.status = status_value if status_value in {"pending", "completed", "blocked"} else "pending"
+        requested_status = status_value if status_value in {"pending", "completed", "blocked"} else "pending"
+        # DB-derived quality work is completed only after the synchronizer
+        # re-measures the actual gap. A model-level completion claim must not
+        # sever an active mission from its durable cursor.
+        if not managed_existing:
+            row.status = requested_status
         if not managed_existing:
             row.result = str(args.get("result") or row.result or "")[:8000]
         if row.status == "completed":
@@ -2970,6 +3000,8 @@ def run_tool(
             "created": created,
             "changed": created or before != after,
             "attempts": row.attempts,
+            "status_controlled_by_orchestrator": managed_existing,
+            "requested_status_ignored": managed_existing and requested_status != row.status,
         }
 
     if name == "list_knowledge":
