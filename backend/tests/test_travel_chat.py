@@ -35,13 +35,62 @@ from app.travel_chat import (
     _research_seed_queries,
     _research_seed_query,
     _resolve_context_message,
+    _resolve_shared_place_candidate,
+    _share_text_for_turn,
     _strip_unsupported_urls,
     _supporting_sources,
     answer_travel_chat,
 )
+from app.share_import import ShareImportResult
 
 
 class TravelChatRoutingTests(unittest.TestCase):
+    def test_short_continuation_reuses_recent_user_share_link(self) -> None:
+        rows = [
+            SimpleNamespace(role="user", content="https://surl.amap.com/cFUgvfMS3ee 여기를 추가해줘"),
+            SimpleNamespace(role="assistant", content="위치를 더 확인해야 합니다."),
+        ]
+
+        selected = _share_text_for_turn("다시 추가해줘", rows, continuation=True)
+
+        self.assertIn("cFUgvfMS3ee", selected)
+
+    def test_new_task_does_not_revive_an_old_share_link(self) -> None:
+        rows = [SimpleNamespace(role="user", content="https://surl.amap.com/old")]
+
+        self.assertEqual(_share_text_for_turn("새 간식집 찾아줘", rows, continuation=False), "")
+
+    @patch("app.travel_chat.import_share_text")
+    def test_amap_share_becomes_exact_write_candidate_before_model_tools(self, importer) -> None:
+        importer.return_value = ShareImportResult(
+            source="amap",
+            title="\u6c88\u9633\u4e2d\u8857\u6545\u5bab\u6f2b\u5fc3\u9152\u5e97",
+            description="Beizhongjie Road No.118",
+            address="Beizhongjie Road No.118",
+            source_url="https://surl.amap.com/cFUgvfMS3ee",
+            lat=41.8011621,
+            lng=123.4504561,
+            category_hint="lodging",
+            needs_map_pick=False,
+            note="resolved",
+        )
+        city = SimpleNamespace(
+            name_local="\u6c88\u9633",
+            search_context="\u6c88\u9633\u5e02 \u4e2d\u56fd",
+            search_viewbox="122.85,42.15,123.85,41.45",
+        )
+
+        candidate, trace = _resolve_shared_place_candidate(
+            "https://surl.amap.com/cFUgvfMS3ee",
+            city,
+        )
+
+        self.assertTrue(trace["ok"])
+        self.assertEqual(candidate["category"], "lodging")
+        self.assertEqual(candidate["travel_role"], "rest")
+        self.assertEqual(candidate["lat"], 41.8011621)
+        self.assertEqual(candidate["coordinate_source"], "amap_share")
+
     def test_shenyang_snack_bootstrap_is_separate_from_meal_sources(self) -> None:
         snack_sources = CITY_SNACK_DETAIL_SOURCES["shenyang"]
         self.assertEqual(len(snack_sources), 3)

@@ -21,6 +21,7 @@ from app.models import (
     TravelPlanItem,
 )
 from app.personalization import build_user_travel_profile, profile_prompt_context
+from app.share_import import import_share_text, looks_like_share_text
 
 
 RESEARCH_TOOLS = {"web_search", "fetch_page", "geocode_place"}
@@ -533,7 +534,7 @@ def _latest_chat_candidates(
         "food_snack": {"restaurant", "drink", "shopping", "other"},
         "drink": {"restaurant", "shopping", "other"},
         "spa": {"other"},
-        "lodging": {"hotel"},
+        "lodging": {"lodging"},
         "tourism": {"attraction"},
         "transport": {"transport"},
         "shopping": {"shopping"},
@@ -643,6 +644,84 @@ def _candidate_seed_query(city: City, candidate: dict[str, Any]) -> str:
 
 def _compact_candidate_text(value: str) -> str:
     return re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", (value or "").casefold())
+
+
+def _resolve_shared_place_candidate(
+    message: str,
+    city: City,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Turn an explicit Amap/Dianping share into durable, exact candidate state.
+
+    Share links are structured location evidence, not prose for the model to
+    rediscover.  Resolving them before tool planning prevents the last search
+    round from finding a POI without leaving a round to save it.
+    """
+    if not looks_like_share_text(message):
+        return None, None
+    try:
+        result = import_share_text(
+            message,
+            city_name=city.name_local,
+            city_context=city.search_context,
+            viewbox=city.search_viewbox,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return None, {"ok": False, "error": str(exc)[:500]}
+
+    trace = {
+        "ok": result.lat is not None and result.lng is not None and not result.needs_map_pick,
+        "source": result.source,
+        "title": result.title,
+        "address": result.address,
+        "source_url": result.source_url,
+        "lat": result.lat,
+        "lng": result.lng,
+        "needs_map_pick": result.needs_map_pick,
+    }
+    if result.lat is None or result.lng is None or result.needs_map_pick:
+        trace["error"] = "share_coordinate_not_resolved"
+        return None, trace
+
+    key = hashlib.sha256(
+        f"{_compact_candidate_text(result.title)}|{_compact_candidate_text(result.address)}".encode("utf-8")
+    ).hexdigest()[:16]
+    candidate = {
+        "key": key,
+        "title": result.title,
+        "address": result.address,
+        "description": result.description,
+        "category": result.category_hint,
+        "travel_role": "rest" if result.category_hint == "lodging" else "general",
+        "source_urls": [result.source_url] if result.source_url else [],
+        "lat": result.lat,
+        "lng": result.lng,
+        "confidence": 0.98,
+        "status": "located",
+        "coordinate_source": f"{result.source}_share",
+        "coordinate_source_url": result.source_url,
+        "coordinate_query": result.title,
+    }
+    return candidate, trace
+
+
+def _share_text_for_turn(
+    message: str,
+    rows: list[TravelChatMessage],
+    *,
+    continuation: bool,
+) -> str:
+    """Carry a recently supplied map share into a short continuation turn."""
+    if looks_like_share_text(message):
+        return message
+    if not continuation:
+        return ""
+    for row in reversed(rows[-8:]):
+        if getattr(row, "role", "") != "user":
+            continue
+        content = str(getattr(row, "content", "") or "")
+        if looks_like_share_text(content):
+            return content
+    return ""
 
 
 def _entity_text_matches(left: str, right: str) -> bool:
@@ -1220,6 +1299,29 @@ def answer_travel_chat(
         if intent.continuation or intent.wants_write
         else []
     )
+    shared_candidate: dict[str, Any] | None = None
+    share_resolution: dict[str, Any] | None = None
+    if write_intent:
+        share_text = _share_text_for_turn(
+            message,
+            prior,
+            continuation=intent.continuation,
+        )
+        shared_candidate, share_resolution = _resolve_shared_place_candidate(share_text, city)
+        if shared_candidate is not None:
+            _merge_work_candidates(
+                active_work,
+                [shared_candidate],
+                phase="write",
+                next_action="write",
+            )
+            db.commit()
+            if active_work is not None:
+                db.refresh(active_work)
+                pending_work = _pending_work_candidates(
+                    active_work,
+                    target_keys=intent.target_keys,
+                )
     locked_candidate = pending_work[0] if len(pending_work) == 1 else None
     food_discovery = intent.subject in {"food", "food_snack"}
     snack_discovery = intent.subject == "food_snack"
@@ -1302,6 +1404,8 @@ def answer_travel_chat(
         })
     messages.append({"role": "user", "content": message})
     sources: set[str] = set()
+    if shared_candidate is not None:
+        sources.update(str(url) for url in shared_candidate.get("source_urls") or [] if str(url))
     final_text = ""
     seen_tool_calls: set[str] = set()
     tool_results: list[dict[str, Any]] = [{
@@ -1313,6 +1417,12 @@ def answer_travel_chat(
             "work_id": active_work.id if active_work else None,
         },
     }]
+    if share_resolution is not None:
+        tool_results.append({
+            "name": "resolve_share_link",
+            "args": {"url": str(share_resolution.get("source_url") or "")},
+            "result": share_resolution,
+        })
     proposal_ids: list[int] = []
     proposal_titles: list[str] = []
     successful_write_candidates: list[dict[str, Any]] = []
@@ -1333,7 +1443,9 @@ def answer_travel_chat(
     verified_coordinate_records: list[dict[str, Any]] = []
     target_business_sources: dict[str, list[str]] = {}
     fetched_food_urls: set[str] = set()
-    fetched_source_urls: set[str] = set()
+    fetched_source_urls: set[str] = set(
+        str(url) for url in (shared_candidate or {}).get("source_urls") or [] if str(url)
+    )
     food_detail_queries: set[str] = set()
     food_business_names: list[str] = []
     food_geo_candidates: list[dict[str, Any]] = []

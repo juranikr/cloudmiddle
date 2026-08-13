@@ -153,16 +153,26 @@ def _follow_redirects(url: str, max_hops: int = 8, total_budget_s: float = 12.0)
             headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"},
             method="GET",
         )
-        try:
-            with urllib.request.urlopen(req, context=ctx, timeout=min(6.0, remaining)) as resp:
-                return resp.geturl()
-        except urllib.error.HTTPError as exc:
-            loc = exc.headers.get("Location")
-            if not loc:
-                return cur
-            cur = urljoin(cur, loc)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RuntimeError("공유 링크에 연결하지 못했습니다") from exc
+        last_error: BaseException | None = None
+        for attempt in range(3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=min(6.0, remaining)) as resp:
+                    return resp.geturl()
+            except urllib.error.HTTPError as exc:
+                loc = exc.headers.get("Location")
+                if not loc:
+                    return cur
+                cur = urljoin(cur, loc)
+                break
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(min(0.5 * (2**attempt), max(0.0, deadline - time.monotonic())))
+        if last_error is not None and cur == url:
+            raise RuntimeError("Amap share link could not be reached") from last_error
     return cur
 
 
@@ -212,6 +222,8 @@ def _parse_share_body_lines(text: str, url: str) -> tuple[str, str, str, str]:
 
 def _category_from_text(*parts: str) -> str:
     blob = " ".join(p for p in parts if p)
+    if "hotel" in blob.casefold():
+        return "lodging"
     if any(k in blob for k in ("酒店", "宾馆", "民宿", "旅馆")):
         return "lodging"
     if FOOD_HINT_RE.search(blob) or "鲁菜" in blob or "人" in blob or "사람" in blob:
@@ -284,7 +296,7 @@ def _import_amap_text_fallback(
     city_context: str,
     viewbox: str,
 ) -> ShareImportResult:
-    """링크 추적 실패 시: 공유 본문의 제목·주소로 초안 구성, 가능하면 지오코딩."""
+    """링크 추적 실패 시 공유 본문만으로 초안을 만들고 지도 선택을 요구한다."""
     title, address, price_label, meta = _parse_share_body_lines(original, url)
     if not title:
         raise RuntimeError(
@@ -299,26 +311,9 @@ def _import_amap_text_fallback(
         "고덕 링크 연결이 안 돼 본문 텍스트로 초안을 만들었습니다. "
         "지도에서 위치를 탭해 핀을 놓고 저장하세요."
     )
-    for q in filter(None, [f"{title} {city_name}", address and f"{address} {city_name}", address]):
-        try:
-            hits = search_address(
-                q,
-                limit=3,
-                viewbox=viewbox,
-                city_name=city_name,
-                city_context=city_context,
-            )
-        except RuntimeError:
-            hits = []
-        if hits:
-            lat = hits[0]["lat"]
-            lng = hits[0]["lng"]
-            needs_pick = False
-            note = (
-                "고덕 링크 연결이 안 돼 본문 텍스트와 지오코딩으로 초안을 만들었습니다. "
-                "핀 위치가 맞는지 확인한 뒤 저장하세요."
-            )
-            break
+    # Never silently replace an unresolved Amap POI with the first generic
+    # address-geocoder hit. China-local businesses are commonly missing from
+    # global indexes, and a broad hit can be kilometres away.
 
     desc_lines: list[str] = []
     if price_label:
@@ -345,6 +340,13 @@ def _import_amap_text_fallback(
 
 def _parse_amap_final(final_url: str) -> Optional[tuple[float, float, str, str]]:
     qs = parse_qs(urlparse(final_url).query)
+
+    # Current Amap short links redirect to ``https://wb.amap.com/?p=...``.
+    # Older parsing only inspected p nested inside android/mo/ios parameters,
+    # so a valid current share URL fell through to unsafe generic geocoding.
+    hit = _parse_amap_p(unquote(qs.get("p", [""])[0]))
+    if hit:
+        return hit
 
     android = unquote(qs.get("android", [""])[0])
     if android:
