@@ -5,7 +5,11 @@ import os
 import unittest
 from unittest.mock import Mock, patch
 
-from app.agent.__main__ import is_retryable_network_block, report_step_function_result
+from app.agent.__main__ import (
+    is_retryable_model_output_failure,
+    is_retryable_network_block,
+    report_step_function_result,
+)
 
 
 class AgentEntrypointTests(unittest.TestCase):
@@ -24,6 +28,17 @@ class AgentEntrypointTests(unittest.TestCase):
                 {"status": "partial", "message": "Access denied. Please check your network settings."}
             )
         )
+
+    def test_classifies_model_output_parse_failure_as_retryable(self) -> None:
+        result = {
+            "status": "failed",
+            "message": "Error code: 400 - code='output_parse_failed' Parsing failed",
+        }
+        self.assertTrue(is_retryable_model_output_failure(result))
+        self.assertFalse(is_retryable_model_output_failure({
+            "status": "partial",
+            "message": "output_parse_failed",
+        }))
 
     @patch("app.agent.__main__.boto3.client")
     def test_reports_retryable_failure_to_step_functions(self, boto_client: Mock) -> None:
@@ -57,6 +72,20 @@ class AgentEntrypointTests(unittest.TestCase):
         self.assertEqual(outcome, "success")
         self.assertEqual(client.send_task_success.call_args.kwargs["taskToken"], "secret-task-token")
         client.send_task_failure.assert_not_called()
+
+    @patch("app.agent.__main__.boto3.client")
+    def test_reports_exhausted_model_output_failure_for_fresh_task_retry(self, boto_client: Mock) -> None:
+        client = boto_client.return_value
+        results = [{
+            "city_id": 2,
+            "status": "failed",
+            "message": "output_parse_failed after three adaptive retries",
+        }]
+
+        outcome = report_step_function_result("secret-task-token", results)
+
+        self.assertEqual(outcome, "retryable_model_output")
+        self.assertEqual(client.send_task_failure.call_args.kwargs["error"], "RetryableModelOutput")
 
     @patch("app.agent.__main__.boto3.client")
     def test_reports_non_retryable_agent_failure(self, boto_client: Mock) -> None:

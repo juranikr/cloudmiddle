@@ -148,7 +148,7 @@ resource "aws_sfn_state_machine" "agent" {
               }
               Retry = [
                 {
-                  ErrorEquals     = ["RetryableNetworkBlock"]
+                  ErrorEquals     = ["RetryableNetworkBlock", "RetryableModelOutput"]
                   IntervalSeconds = 30
                   BackoffRate     = 3
                   MaxAttempts     = 2

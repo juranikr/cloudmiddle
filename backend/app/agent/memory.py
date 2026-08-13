@@ -242,6 +242,7 @@ def mission_context(mission: AgentMission, item: AgentWorkItem) -> dict[str, Any
         "objective": mission.objective,
         "success_metric": mission.success_metric,
         "progress": _json_dict(mission.progress),
+        "strategy": _json_dict(mission.strategy),
         "work_item_id": item.id,
         "target": {"type": item.target_type, "key": item.target_key, "place_id": item.place_id, "title": item.title},
         "stage": item.stage,
@@ -295,6 +296,7 @@ def retrieve_contextual_knowledge(
         mission.title if mission else "",
         mission.objective if mission else "",
         mission.success_metric if mission else "",
+        mission.strategy if mission else "",
         work_item.title if work_item else "",
         work_item.goal if work_item else "",
         work_item.stage if work_item else "",
@@ -310,6 +312,7 @@ def retrieve_contextual_knowledge(
             query,
             mission.kind if mission else "",
             mission.objective if mission else "",
+            mission.strategy if mission else "",
             work_item.stage if work_item else "",
             work_item.failed_approaches if work_item else "",
             work_item.blocked_reason if work_item else "",
@@ -593,17 +596,169 @@ def observe_lesson(
         lesson.observation_count = int(lesson.observation_count or 0) + 1
         if successful:
             lesson.success_count = int(lesson.success_count or 0) + 1
+        else:
+            lesson.failure_count = int(lesson.failure_count or 0) + 1
     if evidence_ref and evidence_ref not in refs:
         refs.append(evidence_ref[:500])
     lesson.evidence_refs = _dump(refs[-20:])
     observation_count = int(lesson.observation_count or 0)
     success_count = int(lesson.success_count or 0)
-    lesson.confidence = min(0.98, 0.45 + observation_count * 0.08 + success_count * 0.07)
+    failure_count = int(lesson.failure_count or 0)
+    lesson.confidence = max(
+        0.12,
+        min(0.98, 0.45 + observation_count * 0.05 + success_count * 0.12 - failure_count * 0.08),
+    )
     if success_count >= 2 and observation_count >= 3:
         lesson.status = "validated"
-    elif observation_count >= 2:
+    elif success_count >= 1 and observation_count >= 2:
         lesson.status = "testing"
+    elif failure_count >= 3 and success_count == 0:
+        lesson.status = "deprecated"
     lesson.updated_at = datetime.now(timezone.utc)
+    db.flush()
+    return lesson
+
+
+def record_model_recovery_attempt(
+    db: Session,
+    *,
+    mission: Optional[AgentMission],
+    work_item: Optional[AgentWorkItem],
+    run_id: int,
+    sequence: int,
+    failure_kind: str,
+    error: str,
+    attempt: int,
+    strategy: dict[str, Any],
+) -> str:
+    """Persist an auditable strategy change before retrying a model call."""
+
+    evidence_ref = f"run:{run_id}:model-recovery:{attempt}"
+    if mission is None or work_item is None:
+        return evidence_ref
+
+    now = datetime.now(timezone.utc)
+    mission_strategy = _json_dict(mission.strategy)
+    history = [
+        dict(item) for item in mission_strategy.get("recovery_history", [])
+        if isinstance(item, dict)
+    ]
+    entry = {
+        "evidence_ref": evidence_ref,
+        "failure_kind": failure_kind,
+        "attempt": attempt,
+        "strategy": strategy,
+        "outcome": "retrying",
+        "started_at": now.isoformat(),
+    }
+    history.append(entry)
+    mission_strategy["recovery_history"] = history[-8:]
+    mission_strategy["last_recovery"] = entry
+    mission.strategy = _dump(mission_strategy)
+
+    failures = _json_list(work_item.failed_approaches)
+    failure_summary = (
+        f"model_output:{failure_kind}: attempt={attempt}; "
+        f"mode={strategy.get('mode', 'focused_retry')}; error={error[:240]}"
+    )
+    if failure_summary not in failures:
+        failures.append(failure_summary)
+    work_item.failed_approaches = _dump(failures[-12:])
+    work_item.state_summary = (
+        f"Run #{run_id} model output failed ({failure_kind}); retry {attempt} changed "
+        f"strategy to {strategy.get('mode', 'focused_retry')}."
+    )[:3000]
+    work_item.last_run_id = run_id
+    work_item.updated_at = now
+
+    next_action = _json_dict(work_item.next_action)
+    db.add(AgentCheckpoint(
+        mission_id=mission.id,
+        work_item_id=work_item.id,
+        run_id=run_id,
+        sequence=sequence,
+        state_summary=work_item.state_summary,
+        decision=f"Retry model output with changed strategy: {strategy.get('mode', 'focused_retry')}",
+        new_facts="[]",
+        rejected_claims=_dump([error[:1000]]),
+        failed_approaches=_dump(failures[-6:]),
+        next_action=_dump(next_action),
+        outcome="recovery_retry",
+    ))
+    progress = _json_dict(mission.progress)
+    progress["last_recovery"] = entry
+    mission.progress = _dump(progress)
+    mission.updated_at = now
+    db.flush()
+    return evidence_ref
+
+
+def finish_model_recovery_attempt(
+    db: Session,
+    *,
+    mission: Optional[AgentMission],
+    work_item: Optional[AgentWorkItem],
+    run_id: int,
+    evidence_ref: str,
+    failure_kind: str,
+    strategy: dict[str, Any],
+    successful: bool,
+) -> Optional[AgentLesson]:
+    """Measure a recovery attempt and promote only outcome-backed lessons."""
+
+    now = datetime.now(timezone.utc)
+    if mission is not None:
+        mission_strategy = _json_dict(mission.strategy)
+        history = [
+            dict(item) for item in mission_strategy.get("recovery_history", [])
+            if isinstance(item, dict)
+        ]
+        for item in history:
+            if item.get("evidence_ref") == evidence_ref:
+                item["outcome"] = "recovered" if successful else "failed"
+                item["finished_at"] = now.isoformat()
+        mission_strategy["recovery_history"] = history[-8:]
+        if history:
+            mission_strategy["last_recovery"] = history[-1]
+        mission.strategy = _dump(mission_strategy)
+        progress = _json_dict(mission.progress)
+        progress["last_recovery"] = history[-1] if history else {
+            "evidence_ref": evidence_ref,
+            "failure_kind": failure_kind,
+            "strategy": strategy,
+            "outcome": "recovered" if successful else "failed",
+            "finished_at": now.isoformat(),
+        }
+        mission.progress = _dump(progress)
+        mission.updated_at = now
+    if work_item is not None:
+        work_item.state_summary = (
+            f"Run #{run_id} model-output recovery "
+            f"{'succeeded' if successful else 'failed'} for {failure_kind} using "
+            f"{strategy.get('mode', 'focused_retry')}."
+        )[:3000]
+        work_item.updated_at = now
+
+    lesson = observe_lesson(
+        db,
+        key=f"model_output_recovery:{failure_kind}:{strategy.get('mode', 'focused_retry')}",
+        city_id=None,
+        category="model_runtime",
+        trigger=f"Provider rejected model output as {failure_kind}",
+        action=(
+            f"Retry with mode={strategy.get('mode')}, reasoning={strategy.get('reasoning_effort')}, "
+            f"force_compaction={bool(strategy.get('force_compaction'))}, "
+            f"tool_count={len(strategy.get('tool_names') or [])}"
+        ),
+        expected_effect="Produce parseable tool output while preserving the same durable task and committed progress",
+        evidence_ref=evidence_ref,
+        applicability={
+            "task_kinds": [mission.kind] if mission is not None else [],
+            "failure_kinds": [failure_kind],
+            "models": [str(strategy.get("model") or "")],
+        },
+        successful=successful,
+    )
     db.flush()
     return lesson
 
@@ -951,6 +1106,28 @@ def learn_from_recent_runs(db: Session, *, city_id: int, limit: int = 12) -> int
     runs = db.query(AgentRun).filter(AgentRun.city_id == city_id).order_by(AgentRun.id.desc()).limit(limit).all()
     learned_ids: set[int] = set()
     for run in runs:
+        summary = str(run.summary or "").casefold()
+        model_failure_kind = (
+            "output_parse_failed" if "output_parse_failed" in summary or "parsing failed" in summary
+            else "tool_schema_failed" if "tool_use_failed" in summary or "tool call validation failed" in summary
+            else ""
+        )
+        if model_failure_kind:
+            learned_ids.add(observe_lesson(
+                db,
+                key=f"model_output_failure:{model_failure_kind}",
+                city_id=None,
+                category="model_runtime",
+                trigger=f"Autonomous run terminated on {model_failure_kind}",
+                action=(
+                    "Preserve the checkpoint, narrow tools to the active task, lower reasoning effort, "
+                    "compact context, and retry before failing the run"
+                ),
+                expected_effect="One malformed model output does not discard committed batch progress",
+                evidence_ref=f"run:{run.id}:summary",
+                applicability={"failure_kinds": [model_failure_kind]},
+                successful=False,
+            ).id)
         discovered_urls: set[str] = set()
         for step in run.steps:
             detail = _json_dict(step.detail)

@@ -28,6 +28,13 @@ RETRYABLE_NETWORK_MARKERS = (
     "status_code=403",
 )
 
+RETRYABLE_MODEL_OUTPUT_MARKERS = (
+    "output_parse_failed",
+    "tool_use_failed",
+    "failed to parse tool call",
+    "tool call validation failed",
+)
+
 
 def is_retryable_network_block(result: dict[str, Any]) -> bool:
     """Return true only for the provider/network 403 seen from Groq."""
@@ -42,6 +49,15 @@ def is_retryable_network_block(result: dict[str, Any]) -> bool:
         "network" in message or "access denied" in message or "cloudflare" in message
     )
     return exact_message or generic_network_403
+
+
+def is_retryable_model_output_failure(result: dict[str, Any]) -> bool:
+    """Recognize provider-side structured/tool output failures after local retries."""
+
+    if result.get("status") != "failed":
+        return False
+    message = str(result.get("message") or "").casefold()
+    return any(marker in message for marker in RETRYABLE_MODEL_OUTPUT_MARKERS)
 
 
 def _compact_result(results: list[dict[str, Any]]) -> str:
@@ -70,6 +86,9 @@ def report_step_function_result(task_token: str, results: list[dict[str, Any]]) 
     client = boto3.client("stepfunctions", region_name=os.getenv("AWS_REGION"))
     failed = [result for result in results if result.get("status") == "failed"]
     retryable = [result for result in failed if is_retryable_network_block(result)]
+    retryable_model_output = [
+        result for result in failed if is_retryable_model_output_failure(result)
+    ]
     payload = _compact_result(results)
 
     if retryable:
@@ -79,6 +98,13 @@ def report_step_function_result(task_token: str, results: list[dict[str, Any]]) 
             cause=payload[:32000],
         )
         return "retryable_network_block"
+    if retryable_model_output:
+        client.send_task_failure(
+            taskToken=task_token,
+            error="RetryableModelOutput",
+            cause=payload[:32000],
+        )
+        return "retryable_model_output"
     if failed or not results:
         client.send_task_failure(
             taskToken=task_token,

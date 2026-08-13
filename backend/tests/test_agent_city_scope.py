@@ -19,9 +19,12 @@ from app.agent.runner import (
     _normalize_research_query,
     _active_target_mismatch,
     _mission_has_no_executable_target,
+    _model_output_failure_kind,
+    _model_recovery_plan,
     _research_gaps,
     _run_outcome_status,
     _sync_quality_tasks,
+    _should_rotate_exhausted_image_target,
     _step_detail_json,
     _tool_signature,
     count_unread,
@@ -39,6 +42,8 @@ from app.agent.memory import (
     rotate_blocked_work_item,
     reconcile_work_items,
     observe_lesson,
+    finish_model_recovery_attempt,
+    record_model_recovery_attempt,
     active_work_item_for_mission,
 )
 from app.rollback import list_agent_actions
@@ -470,7 +475,112 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.db.commit()
         self.assertEqual(lesson.observation_count, 1)
-        self.assertGreater(lesson.confidence, 0.5)
+        self.assertEqual(lesson.failure_count, 1)
+        self.assertLess(lesson.confidence, 0.5)
+
+    def test_model_output_recovery_is_persisted_and_measured_as_a_lesson(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_images",
+            title="image recovery",
+            detail=f"targets\n- #{place.id} {place.title}",
+            success_metric="image_count >= 1",
+            priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        run = AgentRun(city_id=2, mission_id=mission.id, work_item_id=item.id, status="running")
+        self.db.add(run)
+        self.db.commit()
+        strategy = _model_recovery_plan(
+            failure_kind="output_parse_failed",
+            attempt=1,
+            model="openai/gpt-oss-120b",
+            mission=mission,
+            work_item=item,
+            prompt_chars=80_000,
+        )
+
+        ref = record_model_recovery_attempt(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=1,
+            failure_kind="output_parse_failed",
+            error="Parsing failed",
+            attempt=1,
+            strategy=strategy,
+        )
+        lesson = finish_model_recovery_attempt(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            evidence_ref=ref,
+            failure_kind="output_parse_failed",
+            strategy=strategy,
+            successful=True,
+        )
+        self.db.commit()
+
+        history = json.loads(mission.strategy)["recovery_history"]
+        self.assertEqual(history[-1]["outcome"], "recovered")
+        self.assertEqual(json.loads(mission.progress)["last_recovery"]["outcome"], "recovered")
+        self.assertEqual(lesson.success_count, 1)
+        self.assertEqual(lesson.failure_count, 0)
+        self.assertIn("output_parse_failed", item.state_summary)
+
+    def test_model_parse_recovery_restricts_tools_and_escalates_strategy(self) -> None:
+        self.assertEqual(
+            _model_output_failure_kind("code='output_parse_failed': Parsing failed"),
+            "output_parse_failed",
+        )
+        mission = type("Mission", (), {"kind": "quality_images", "strategy": "{}"})()
+        work = type("Work", (), {"next_action": json.dumps({"tool": "get_place"})})()
+        focused = _model_recovery_plan(
+            failure_kind="output_parse_failed", attempt=1, model="test", mission=mission,
+            work_item=work, prompt_chars=90_000,
+        )
+        minimal = _model_recovery_plan(
+            failure_kind="output_parse_failed", attempt=3, model="test", mission=mission,
+            work_item=work, prompt_chars=90_000,
+        )
+        self.assertEqual(focused["reasoning_effort"], "medium")
+        self.assertEqual(minimal["reasoning_effort"], "low")
+        self.assertTrue(minimal["force_compaction"])
+        self.assertLessEqual(len(minimal["tool_names"]), 4)
+        self.assertIn("get_place", minimal["tool_names"])
+
+        mission.strategy = json.dumps({"recovery_history": [{
+            "failure_kind": "output_parse_failed",
+            "strategy": {"mode": "focused_retry"},
+            "outcome": "failed",
+        }]})
+        learned = _model_recovery_plan(
+            failure_kind="output_parse_failed", attempt=1, model="test", mission=mission,
+            work_item=work, prompt_chars=90_000,
+        )
+        self.assertEqual(learned["mode"], "compact_retry")
+        self.assertTrue(learned["adapted_from_history"])
+
+    def test_exhausted_image_target_rotates_when_model_tries_next_target(self) -> None:
+        mission = type("Mission", (), {"kind": "quality_images"})()
+        work = type("Work", (), {"place_id": 103})()
+        self.assertTrue(_should_rotate_exhausted_image_target(
+            mission=mission,
+            work_item=work,
+            target_mismatch={"error": "active_work_item_mismatch"},
+            image_searches_by_place={103: 3},
+        ))
+        self.assertFalse(_should_rotate_exhausted_image_target(
+            mission=mission,
+            work_item=work,
+            target_mismatch={"error": "active_work_item_mismatch"},
+            image_searches_by_place={103: 2},
+        ))
 
     def test_model_call_cannot_move_active_cursor_back_to_ready_sibling(self) -> None:
         places = self.db.query(Marker).filter(Marker.city_id == 2).all()
@@ -597,6 +707,27 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(assistant_ids, tool_ids)
         self.assertIn("call-7", tool_ids)
         self.assertLessEqual(len(json.dumps(compacted, ensure_ascii=False)), 18_000)
+
+    def test_recovery_can_force_compaction_before_context_limit(self) -> None:
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "objective"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "latest state"},
+        ]
+        compacted, changed = _compact_react_messages(
+            messages,
+            tool_counts={},
+            material_changes=[],
+            current_score=0,
+            max_chars=50_000,
+            force=True,
+            recent_round_limit=1,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(compacted[0]["content"], "system")
+        self.assertEqual(compacted[1]["content"], "objective")
+        self.assertIn("latest state", [item.get("content") for item in compacted])
 
     def test_quality_snapshot_and_backlog_measure_real_points(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
@@ -1120,6 +1251,26 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.assertEqual(result["error"], "run_history_forbidden_in_knowledge")
         self.assertEqual(self.db.query(AgentKnowledge).count(), 0)
+
+    def test_failed_model_output_summary_becomes_a_deduplicated_diagnostic_lesson(self) -> None:
+        run = AgentRun(
+            city_id=2,
+            status="failed",
+            summary="Error code 400: output_parse_failed; Parsing failed",
+        )
+        self.db.add(run)
+        self.db.commit()
+
+        first = learn_from_recent_runs(self.db, city_id=2)
+        second = learn_from_recent_runs(self.db, city_id=2)
+
+        lesson = self.db.query(AgentLesson).filter(
+            AgentLesson.lesson_key == "model_output_failure:output_parse_failed"
+        ).one()
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 1)
+        self.assertEqual(lesson.observation_count, 1)
+        self.assertEqual(lesson.failure_count, 1)
 
     def test_same_topic_is_namespaced_per_city(self) -> None:
         first = upsert_knowledge(

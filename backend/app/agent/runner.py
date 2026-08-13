@@ -15,10 +15,12 @@ from app.agent.memory import (
     active_work_item_for_mission,
     ensure_mission_for_task,
     evaluate_knowledge_uses,
+    finish_model_recovery_attempt,
     finalize_mission,
     learn_from_recent_runs,
     mission_context,
     record_knowledge_uses,
+    record_model_recovery_attempt,
     reconcile_work_items,
     retrieve_contextual_knowledge,
     rotate_blocked_work_item,
@@ -417,6 +419,147 @@ def _research_gaps(
 
 
 EXPENSIVE_RESEARCH_TOOLS = {"web_search", "fetch_page", "geocode_place", "search_place_images"}
+
+MODEL_OUTPUT_FAILURE_MARKERS = {
+    "output_parse_failed": ("output_parse_failed", "parsing failed"),
+    "tool_schema_failed": ("tool_use_failed", "failed to parse tool call", "tool call validation failed"),
+}
+
+RECOVERY_TOOLS_BY_TASK = {
+    "quality_images": {"get_place", "search_place_images", "attach_image_from_url", "upsert_agent_task"},
+    "quality_verification": {"get_place", "web_search", "fetch_page", "verify_place", "upsert_agent_task"},
+    "quality_zones": {"get_place", "list_zones", "assign_place_zone", "upsert_agent_task"},
+    "quality_information": {"get_place", "web_search", "fetch_page", "upsert_place_insights", "upsert_agent_task"},
+    "quality_drafts": {
+        "get_place", "web_search", "fetch_page", "update_place_fields",
+        "upsert_place_insights", "verify_place", "list_zones", "assign_place_zone",
+        "search_place_images", "attach_image_from_url", "upsert_agent_task",
+    },
+}
+
+
+def _model_output_failure_kind(detail: str) -> str:
+    normalized = (detail or "").casefold()
+    for kind, markers in MODEL_OUTPUT_FAILURE_MARKERS.items():
+        if any(marker in normalized for marker in markers):
+            return kind
+    return ""
+
+
+def _filtered_tools(tool_names: list[str] | set[str] | None) -> list[dict[str, Any]]:
+    selected = set(tool_names or [])
+    if not selected:
+        return TOOLS
+    filtered = [tool for tool in TOOLS if tool["function"]["name"] in selected]
+    return filtered or TOOLS
+
+
+def _model_recovery_plan(
+    *,
+    failure_kind: str,
+    attempt: int,
+    model: str,
+    mission: AgentMission | None,
+    work_item: AgentWorkItem | None,
+    prompt_chars: int,
+) -> dict[str, Any]:
+    """Escalate from a focused retry to a compact minimal-tool retry."""
+
+    task_kind = mission.kind if mission is not None else ""
+    recovery_history: list[dict[str, Any]] = []
+    if mission is not None:
+        try:
+            mission_strategy = json.loads(getattr(mission, "strategy", "") or "{}")
+            recovery_history = [
+                dict(item) for item in mission_strategy.get("recovery_history", [])
+                if isinstance(item, dict) and item.get("failure_kind") == failure_kind
+            ] if isinstance(mission_strategy, dict) else []
+        except (TypeError, json.JSONDecodeError):
+            recovery_history = []
+    failed_modes = {
+        str(item.get("strategy", {}).get("mode") or item.get("mode") or "")
+        for item in recovery_history
+        if item.get("outcome") == "failed"
+    }
+    recovered_modes = [
+        str(item.get("strategy", {}).get("mode") or item.get("mode") or "")
+        for item in recovery_history
+        if item.get("outcome") == "recovered"
+    ]
+    tool_names = set(RECOVERY_TOOLS_BY_TASK.get(task_kind, set()))
+    next_action: dict[str, Any] = {}
+    if work_item is not None:
+        try:
+            parsed = json.loads(work_item.next_action or "{}")
+            next_action = parsed if isinstance(parsed, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            next_action = {}
+    next_tool = str(next_action.get("tool") or "")
+    if next_tool and any(tool["function"]["name"] == next_tool for tool in TOOLS):
+        tool_names.add(next_tool)
+    if not tool_names:
+        tool_names.update({"get_place", "list_agent_tasks", "upsert_agent_task"})
+
+    mode_order = ["focused_retry", "compact_retry", "minimal_retry"]
+    mode_index = min(max(attempt - 1, 0), len(mode_order) - 1)
+    if recovered_modes and recovered_modes[-1] in mode_order:
+        mode_index = max(mode_index, mode_order.index(recovered_modes[-1]))
+    while mode_index < len(mode_order) - 1 and mode_order[mode_index] in failed_modes:
+        mode_index += 1
+    mode = mode_order[mode_index]
+
+    if mode == "focused_retry":
+        reasoning_effort = "medium"
+        force_compaction = False
+        recent_round_limit = 4
+        max_chars = 60_000
+    elif mode == "compact_retry":
+        reasoning_effort = "low"
+        force_compaction = True
+        recent_round_limit = 3
+        max_chars = 42_000
+    else:
+        reasoning_effort = "low"
+        force_compaction = True
+        recent_round_limit = 2
+        max_chars = 28_000
+        minimal = {next_tool, "get_place", "upsert_agent_task"}
+        if task_kind == "quality_images":
+            minimal.update({"search_place_images", "attach_image_from_url"})
+        tool_names.intersection_update(name for name in minimal if name)
+
+    return {
+        "failure_kind": failure_kind,
+        "attempt": attempt,
+        "mode": mode,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "force_compaction": force_compaction,
+        "recent_round_limit": recent_round_limit,
+        "max_chars": max_chars,
+        "tool_names": sorted(tool_names),
+        "prompt_chars_before": prompt_chars,
+        "adapted_from_history": bool(recovery_history),
+        "historically_failed_modes": sorted(mode for mode in failed_modes if mode),
+        "historically_recovered_mode": recovered_modes[-1] if recovered_modes else "",
+    }
+
+
+def _should_rotate_exhausted_image_target(
+    *,
+    mission: AgentMission | None,
+    work_item: AgentWorkItem | None,
+    target_mismatch: dict[str, Any] | None,
+    image_searches_by_place: dict[int, int],
+) -> bool:
+    return bool(
+        target_mismatch
+        and mission is not None
+        and mission.kind == "quality_images"
+        and work_item is not None
+        and work_item.place_id is not None
+        and image_searches_by_place.get(int(work_item.place_id), 0) >= 3
+    )
 MUTATION_TOOLS = {
     "propose_place",
     "create_place",
@@ -703,6 +846,8 @@ def _compact_react_messages(
     material_changes: list[dict[str, Any]],
     current_score: float,
     max_chars: int = 120_000,
+    force: bool = False,
+    recent_round_limit: int = 6,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Keep long autonomous runs inside provider context limits.
 
@@ -711,7 +856,7 @@ def _compact_react_messages(
     feeding all of them back to the model only makes a successful long run fail
     at final synthesis.
     """
-    if len(json.dumps(messages, ensure_ascii=False, default=str)) <= max_chars:
+    if not force and len(json.dumps(messages, ensure_ascii=False, default=str)) <= max_chars:
         return messages, False
     prefix = messages[:2]
     rounds: list[list[dict[str, Any]]] = []
@@ -723,7 +868,7 @@ def _compact_react_messages(
         current.append(message)
     if current:
         rounds.append(current)
-    recent_rounds = rounds[-6:]
+    recent_rounds = rounds[-max(1, recent_round_limit):]
     compact_note = {
         "role": "user",
         "content": (
@@ -1320,6 +1465,12 @@ def run_agent(
     work_nudges = 0
     progress_nudges = 0
     material_nudges = 0
+    model_recovery_attempts = 0
+    model_recovery_history: list[dict[str, Any]] = []
+    pending_model_recovery: dict[str, Any] | None = None
+    terminal_model_failure_kind = ""
+    # Compatibility fallback for provider wording not recognized by the
+    # adaptive classifier.
     schema_retries = 0
     no_progress_actions = 0
     no_material_actions = 0
@@ -1341,14 +1492,19 @@ def run_agent(
                 context_compactions += 1
             try:
                 extra: dict[str, Any] = {}
+                active_recovery_strategy = (
+                    pending_model_recovery.get("strategy") if pending_model_recovery else {}
+                )
                 if "gpt-oss" in model:
                     # 병합 판단 등 미묘한 결정의 품질을 위해 추론 강도 상향.
                     # extra_body 경유: 구버전 groq SDK도 통과시킨다.
-                    extra["extra_body"] = {"reasoning_effort": "high"}
+                    extra["extra_body"] = {
+                        "reasoning_effort": str(active_recovery_strategy.get("reasoning_effort") or "high")
+                    }
                 resp = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=TOOLS,
+                    tools=_filtered_tools(active_recovery_strategy.get("tool_names")),
                     tool_choice="auto",
                     temperature=0.2,
                     **extra,
@@ -1356,7 +1512,97 @@ def run_agent(
             except Exception as exc:
                 # 모델이 스키마에 안 맞는 인자(null 등)를 생성한 경우: 사이클을 죽이지 않고 교정 재시도
                 detail = str(exc)
-                if "tool_use_failed" in detail and schema_retries < 3:
+                failure_kind = _model_output_failure_kind(detail)
+                if pending_model_recovery is not None:
+                    finish_model_recovery_attempt(
+                        db,
+                        mission=active_mission,
+                        work_item=active_work_item,
+                        run_id=agent_run.id,
+                        evidence_ref=str(pending_model_recovery["evidence_ref"]),
+                        failure_kind=str(pending_model_recovery["failure_kind"]),
+                        strategy=dict(pending_model_recovery["strategy"]),
+                        successful=False,
+                    )
+                    recovery_step = db.get(AgentRunStep, pending_model_recovery.get("step_id"))
+                    if recovery_step is not None:
+                        recovery_step.outcome = "failed"
+                    model_recovery_history.append({
+                        **dict(pending_model_recovery["strategy"]),
+                        "outcome": "failed",
+                    })
+                    pending_model_recovery = None
+                    db.commit()
+                if failure_kind and model_recovery_attempts < 3:
+                    model_recovery_attempts += 1
+                    strategy = _model_recovery_plan(
+                        failure_kind=failure_kind,
+                        attempt=model_recovery_attempts,
+                        model=model,
+                        mission=active_mission,
+                        work_item=active_work_item,
+                        prompt_chars=len(json.dumps(messages, ensure_ascii=False, default=str)),
+                    )
+                    messages, recovery_compacted = _compact_react_messages(
+                        messages,
+                        tool_counts=tool_counts,
+                        material_changes=material_changes,
+                        current_score=current_score,
+                        max_chars=int(strategy["max_chars"]),
+                        force=bool(strategy["force_compaction"]),
+                        recent_round_limit=int(strategy["recent_round_limit"]),
+                    )
+                    if recovery_compacted:
+                        context_compactions += 1
+                    action_sequence += 1
+                    recovery_step = AgentRunStep(
+                        run_id=agent_run.id,
+                        sequence=action_sequence,
+                        phase="recover",
+                        tool="model_output",
+                        outcome="retry",
+                        score_delta=0,
+                        detail=json.dumps({
+                            "failure_kind": failure_kind,
+                            "error": detail[:1200],
+                            "strategy": strategy,
+                        }, ensure_ascii=False, default=str),
+                    )
+                    db.add(recovery_step)
+                    db.flush()
+                    evidence_ref = record_model_recovery_attempt(
+                        db,
+                        mission=active_mission,
+                        work_item=active_work_item,
+                        run_id=agent_run.id,
+                        sequence=action_sequence,
+                        failure_kind=failure_kind,
+                        error=detail,
+                        attempt=model_recovery_attempts,
+                        strategy=strategy,
+                    )
+                    pending_model_recovery = {
+                        "evidence_ref": evidence_ref,
+                        "failure_kind": failure_kind,
+                        "strategy": strategy,
+                        "step_id": recovery_step.id,
+                    }
+                    db.commit()
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"The provider rejected the previous model output as {failure_kind}. "
+                            f"Recovery mode is {strategy['mode']}. Keep the durable target unchanged. "
+                            "Call exactly one allowed tool with valid JSON arguments; omit optional "
+                            "fields instead of emitting null, and do not narrate or switch targets. "
+                            f"Allowed tools: {', '.join(strategy['tool_names'])}. "
+                            f"Current target: {active_work_item.target_key if active_work_item else 'none'}."
+                        ),
+                    })
+                    continue
+                if failure_kind:
+                    terminal_model_failure_kind = failure_kind
+                if not failure_kind and "tool_use_failed" in detail and schema_retries < 3:
                     schema_retries += 1
                     messages.append(
                         {
@@ -1371,6 +1617,26 @@ def run_agent(
                     )
                     continue
                 raise
+            if pending_model_recovery is not None:
+                finish_model_recovery_attempt(
+                    db,
+                    mission=active_mission,
+                    work_item=active_work_item,
+                    run_id=agent_run.id,
+                    evidence_ref=str(pending_model_recovery["evidence_ref"]),
+                    failure_kind=str(pending_model_recovery["failure_kind"]),
+                    strategy=dict(pending_model_recovery["strategy"]),
+                    successful=True,
+                )
+                recovery_step = db.get(AgentRunStep, pending_model_recovery.get("step_id"))
+                if recovery_step is not None:
+                    recovery_step.outcome = "recovered"
+                model_recovery_history.append({
+                    **dict(pending_model_recovery["strategy"]),
+                    "outcome": "recovered",
+                })
+                pending_model_recovery = None
+                db.commit()
             msg = resp.choices[0].message
             tool_calls = msg.tool_calls or []
             if not tool_calls:
@@ -1633,6 +1899,30 @@ def run_agent(
                     if active_work_item is not None:
                         agent_run.work_item_id = active_work_item.id
                         continuity = mission_context(active_mission, active_work_item) if active_mission else continuity
+                elif _should_rotate_exhausted_image_target(
+                    mission=active_mission,
+                    work_item=active_work_item,
+                    target_mismatch=target_mismatch,
+                    image_searches_by_place=image_searches_by_place,
+                ):
+                    previous_target = active_work_item.target_key
+                    active_work_item = rotate_blocked_work_item(
+                        db,
+                        mission=active_mission,
+                        current=active_work_item,
+                        run_id=agent_run.id,
+                        reason=(
+                            "Three image searches produced no attachable exact-subject image; "
+                            "the model then attempted a different target. Rotate instead of repeating drift."
+                        ),
+                    )
+                    if active_work_item is not None:
+                        agent_run.work_item_id = active_work_item.id
+                        continuity["rotation"] = {
+                            "from": previous_target,
+                            "to": active_work_item.target_key,
+                            "reason": "image search exhausted and next-target intent observed",
+                        }
                 elif (
                     active_work_item is not None
                     and len(continuity.get("failed_approaches") or []) >= 3
@@ -1721,6 +2011,17 @@ def run_agent(
         except Exception:
             pass
         detail = str(exc)
+        recoverable_model_failure = bool(
+            terminal_model_failure_kind or _model_output_failure_kind(detail)
+        )
+        if recoverable_model_failure and model_recovery_attempts:
+            detail = (
+                f"{detail}\nAdaptive model-output recovery exhausted after "
+                f"{model_recovery_attempts} changed-strategy attempts."
+            )
+        failure_status = (
+            "partial" if recoverable_model_failure and bool(material_changes) else "failed"
+        )
         if "model_permission_blocked" in detail or "blocked at the project" in detail:
             detail = (
                 f"Groq model '{model}' blocked in project limits. "
@@ -1735,7 +2036,7 @@ def run_agent(
         try:
             failed_run = db.get(AgentRun, agent_run.id)
             if failed_run is not None:
-                failed_run.status = "failed"
+                failed_run.status = failure_status
                 failed_run.summary = detail[:4000]
                 failed_run.score = current_score
                 failed_run.finished_at = datetime.now(timezone.utc)
@@ -1749,10 +2050,23 @@ def run_agent(
                         "image_searches_by_place": image_searches_by_place,
                         "context_compactions": context_compactions,
                         "evidence_count": len(evidence_keys),
+                        "model_recovery_attempts": model_recovery_attempts,
+                        "model_recovery_history": model_recovery_history,
+                        "terminal_model_failure_kind": (
+                            terminal_model_failure_kind or _model_output_failure_kind(detail)
+                        ),
                     },
                     ensure_ascii=False,
                 )
                 db.commit()
+        except Exception:
+            db.rollback()
+        try:
+            evaluate_knowledge_uses(
+                db,
+                run_id=agent_run.id,
+                material_change_count=len(material_changes),
+            )
         except Exception:
             db.rollback()
         return {
@@ -1762,7 +2076,10 @@ def run_agent(
             "unread_before": unread_before,
             "unread_after": unread_after,
             "city_id": city_id,
-            "status": "failed",
+            "status": failure_status,
+            "run_id": agent_run.id,
+            "score": current_score,
+            "model_recovery_attempts": model_recovery_attempts,
         }
 
     unread_after = count_unread(db, city_id)
@@ -1834,6 +2151,8 @@ def run_agent(
                 "repeated_calls_blocked": repeated_calls,
                 "image_searches_by_place": image_searches_by_place,
                 "context_compactions": context_compactions,
+                "model_recovery_attempts": model_recovery_attempts,
+                "model_recovery_history": model_recovery_history,
                 "remaining_gaps": gaps,
                 "gap_task_ids": gap_task_ids,
                 "quality_task_ids_before": quality_task_ids_before,
@@ -1893,6 +2212,7 @@ def run_agent(
         "score": current_score,
         "performance": performance_delta,
         "remaining_gaps": gaps,
+        "model_recovery_attempts": model_recovery_attempts,
         "run_id": agent_run.id,
         "city_id": city_id,
     }
