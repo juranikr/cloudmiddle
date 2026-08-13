@@ -12,6 +12,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.agent.runner import (
+    DATA_INTEGRITY_TOOLS,
+    RECOVERY_TOOLS_BY_TASK,
     _compact_react_messages,
     _ensure_gap_tasks,
     _is_material_change,
@@ -626,6 +628,145 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.assertEqual(learned["mode"], "compact_retry")
         self.assertTrue(learned["adapted_from_history"])
+
+    def test_data_integrity_tool_scope_contains_no_place_mutations(self) -> None:
+        expected = {
+            "get_place",
+            "list_places",
+            "web_search",
+            "fetch_page",
+            "geocode_place",
+            "upsert_agent_task",
+        }
+        forbidden = {
+            "verify_place",
+            "update_place_fields",
+            "update_place_context",
+            "upsert_place_insights",
+            "create_place",
+            "propose_place",
+            "merge_places",
+            "assign_place_zone",
+            "assign_place_chain",
+        }
+
+        self.assertEqual(set(DATA_INTEGRITY_TOOLS), expected)
+        self.assertEqual(set(RECOVERY_TOOLS_BY_TASK["data_integrity"]), expected)
+        self.assertTrue(expected.isdisjoint(forbidden))
+
+        mission = type("Mission", (), {"kind": "data_integrity", "strategy": "{}"})()
+        work = type("Work", (), {"next_action": json.dumps({"tool": "get_place"})})()
+        recovery = _model_recovery_plan(
+            failure_kind="output_parse_failed",
+            attempt=1,
+            model="test",
+            mission=mission,
+            work_item=work,
+            prompt_chars=90_000,
+        )
+        self.assertTrue(set(recovery["tool_names"]).issubset(expected))
+        self.assertTrue(set(recovery["tool_names"]).isdisjoint(forbidden))
+
+    def test_data_integrity_runtime_rejects_hallucinated_write_tool(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        original_verified_at = place.last_verified_at
+        task = AgentTask(
+            city_id=2,
+            kind="data_integrity",
+            title=f"[integrity:test:#{place.id}] read-only audit",
+            detail=f"대상:\n- #{place.id} {place.title} (현재: 좌표 근거 확인 필요)",
+            success_metric="장소 원본 변경 없이 과제 result에 판정 기록",
+            priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+        requests = []
+
+        class Completions:
+            def create(inner_self, **kwargs):
+                requests.append(kwargs)
+                if len(requests) == 1:
+                    # Simulate a provider returning a tool that was not in the
+                    # advertised schema. The runner must still reject it.
+                    call = SimpleNamespace(
+                        id="forbidden-write",
+                        function=SimpleNamespace(
+                            name="verify_place",
+                            arguments=json.dumps({
+                                "place_id": place.id,
+                                "status": "uncertain",
+                                "note": "should never execute",
+                            }),
+                        ),
+                    )
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                        content="", tool_calls=[call],
+                    ))])
+                if len(requests) == 2:
+                    call = SimpleNamespace(
+                        id="record-audit",
+                        function=SimpleNamespace(
+                            name="upsert_agent_task",
+                            arguments=json.dumps({
+                                "task_id": task.id,
+                                "kind": "data_integrity",
+                                "title": task.title,
+                                "status": "completed",
+                                "result": "verdict=unresolved; marker_changes=0",
+                            }),
+                        ),
+                    )
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                        content="", tool_calls=[call],
+                    ))])
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="감사 결과를 과제에 기록했습니다.", tool_calls=[],
+                ))])
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=3,
+                autonomous_research=True,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.db.refresh(place)
+        self.db.refresh(task)
+        self.assertEqual(place.last_verified_at, original_verified_at)
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(task.result, "verdict=unresolved; marker_changes=0")
+        advertised = [
+            {tool["function"]["name"] for tool in request.get("tools", [])}
+            for request in requests
+            if request.get("tools")
+        ]
+        self.assertTrue(advertised)
+        self.assertTrue(all(tool_names == set(DATA_INTEGRITY_TOOLS) for tool_names in advertised))
+        forbidden_step = (
+            self.db.query(AgentRunStep)
+            .filter(AgentRunStep.tool == "verify_place")
+            .order_by(AgentRunStep.id.desc())
+            .first()
+        )
+        self.assertIsNotNone(forbidden_step)
+        self.assertEqual(forbidden_step.outcome, "error")
+        step_detail = json.loads(forbidden_step.detail)
+        self.assertEqual(
+            step_detail["result"]["error"],
+            "tool_not_allowed_for_data_integrity",
+        )
 
     def test_batch_malformed_tool_arguments_are_not_executed_as_empty_object(self) -> None:
         event = (

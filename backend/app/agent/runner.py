@@ -423,6 +423,19 @@ def _research_gaps(
 
 EXPENSIVE_RESEARCH_TOOLS = {"web_search", "fetch_page", "geocode_place", "search_place_images"}
 
+# A data-integrity mission may inspect operational records and persist only its
+# own audit result.  Keep this separate from ordinary verification: tools such
+# as ``verify_place`` update ``last_verified_at`` even for an uncertain result,
+# which would hide the very inconsistency the audit is meant to surface.
+DATA_INTEGRITY_TOOLS = frozenset({
+    "get_place",
+    "list_places",
+    "web_search",
+    "fetch_page",
+    "geocode_place",
+    "upsert_agent_task",
+})
+
 MODEL_OUTPUT_FAILURE_MARKERS = {
     "output_parse_failed": ("output_parse_failed", "parsing failed"),
     "tool_schema_failed": ("tool_use_failed", "failed to parse tool call", "tool call validation failed"),
@@ -441,6 +454,7 @@ RECOVERY_TOOLS_BY_TASK = {
         "upsert_place_insights", "verify_place", "list_zones", "assign_place_zone",
         "search_place_images", "attach_image_from_url", "upsert_agent_task",
     },
+    "data_integrity": DATA_INTEGRITY_TOOLS,
 }
 
 
@@ -1606,6 +1620,14 @@ def run_agent(
                 mission_tool_names = active_recovery_strategy.get("tool_names")
                 if not mission_tool_names and local_recovery_tool_names:
                     mission_tool_names = sorted(local_recovery_tool_names)
+                if active_mission is not None and active_mission.kind == "data_integrity":
+                    # This is a hard safety boundary, not merely a model hint.
+                    # Clamp even an adaptive-recovery tool list so an old or
+                    # malformed strategy can never re-introduce write tools.
+                    requested = set(mission_tool_names or DATA_INTEGRITY_TOOLS)
+                    mission_tool_names = sorted(
+                        (requested & DATA_INTEGRITY_TOOLS) or DATA_INTEGRITY_TOOLS
+                    )
                 if (
                     not mission_tool_names
                     and research_only
@@ -1877,8 +1899,24 @@ def run_agent(
                     and not is_new_evidence_followup
                 )
                 target_mismatch = _active_target_mismatch(name, args, active_work_item)
+                integrity_scope_violation = bool(
+                    active_mission is not None
+                    and active_mission.kind == "data_integrity"
+                    and name not in DATA_INTEGRITY_TOOLS
+                )
                 malformed_attempt = 0
-                if argument_error:
+                if integrity_scope_violation:
+                    # Providers normally call only advertised tools, but never
+                    # rely on that for a read-only operational-data boundary.
+                    result = {
+                        "error": "tool_not_allowed_for_data_integrity",
+                        "detail": (
+                            f"data_integrity 과제에서는 읽기 도구와 과제 결과 기록만 허용됩니다. "
+                            f"'{name}' 호출은 실행하지 않았습니다."
+                        ),
+                        "allowed_tools": sorted(DATA_INTEGRITY_TOOLS),
+                    }
+                elif argument_error:
                     malformed_attempt = malformed_tool_failures.get(name, 0) + 1
                     malformed_tool_failures[name] = malformed_attempt
                     plan = make_recovery_plan(
