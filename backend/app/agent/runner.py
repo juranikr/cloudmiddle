@@ -429,7 +429,10 @@ RECOVERY_TOOLS_BY_TASK = {
     "quality_images": {"get_place", "search_place_images", "attach_image_from_url", "upsert_agent_task"},
     "quality_verification": {"get_place", "web_search", "fetch_page", "verify_place", "upsert_agent_task"},
     "quality_zones": {"get_place", "list_zones", "assign_place_zone", "upsert_agent_task"},
-    "quality_information": {"get_place", "web_search", "fetch_page", "upsert_place_insights", "upsert_agent_task"},
+    "quality_information": {
+        "get_place", "web_search", "fetch_page", "update_place_fields",
+        "upsert_place_insights", "upsert_agent_task",
+    },
     "quality_drafts": {
         "get_place", "web_search", "fetch_page", "update_place_fields",
         "upsert_place_insights", "verify_place", "list_zones", "assign_place_zone",
