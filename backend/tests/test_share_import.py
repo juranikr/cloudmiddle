@@ -12,6 +12,39 @@ from app.share_import import (
 
 
 class ShareImportParsingTests(unittest.TestCase):
+    @patch(
+        "app.share_import._follow_redirects",
+        return_value=(
+            "https://wb.amap.com/?p=B0K6YA3YSO%2C41.80354530323765%2C"
+            "123.4565408527851%2C%2C"
+        ),
+    )
+    def test_hotel_name_containing_street_is_not_treated_as_address(self, _redirect) -> None:
+        result = import_share_text(
+            "Shenyang Middle Street Palace Museum Manxin Hotel\n"
+            "Beizhongjie Road No.118\n"
+            "https://surl.amap.com/cFUgvfMS3ee",
+            preferred_source="amap",
+            city_name="Shenyang",
+            city_context="Shenyang China",
+        )
+
+        self.assertEqual(result.title, "Shenyang Middle Street Palace Museum Manxin Hotel")
+        self.assertEqual(result.address, "Beizhongjie Road No.118")
+        self.assertEqual(result.category_hint, "lodging")
+        self.assertFalse(result.needs_map_pick)
+
+    def test_chinese_hotel_name_with_neighbourhood_word_is_a_title(self) -> None:
+        body = (
+            "\u6c88\u9633\u4e2d\u8857\u6545\u5bab\u6f2b\u5fc3\u9152\u5e97\n"
+            "\u8fbd\u5b81\u7701\u6c88\u9633\u5e02\u6c88\u6cb3\u533a\u5317\u4e2d\u8857\u8def118\u53f7\u4e00\u5c42"
+        )
+
+        title, address, _, _ = _parse_share_body_lines(body, "")
+
+        self.assertEqual(title, "\u6c88\u9633\u4e2d\u8857\u6545\u5bab\u6f2b\u5fc3\u9152\u5e97")
+        self.assertIn("118\u53f7", address)
+
     @patch("app.share_import.search_address")
     @patch("app.share_import._follow_redirects", side_effect=RuntimeError("offline"))
     def test_unresolved_amap_link_never_accepts_generic_geocoder_hit(

@@ -41,6 +41,16 @@ ADDRESS_HINT_RE = re.compile(
     r"(?:\d+\s*号|交叉口|路口|(?:省|市|区|县).*(?:路|街|巷)|(?:Street|Road|Avenue)\b|\bNo\.?\s*\d+)",
     re.I,
 )
+BUSINESS_NAME_HINT_RE = re.compile(
+    r"(?:\b(?:hotel|hostel|inn|restaurant|cafe|mall|museum)\b|"
+    r"\u9152\u5e97|\u5bbe\u9986|\u65c5\u9986|\u6c11\u5bbf|\u9910\u5385|\u5496\u5561|\u5546\u573a|\u535a\u7269\u9986)",
+    re.I,
+)
+STRONG_ADDRESS_RE = re.compile(
+    r"(?:\bNo\.?\s*\d+|\d+\s*(?:\u53f7|\u865f)\b|"
+    r"\b(?:Street|Road|Avenue)\s+(?:No\.?\s*)?\d+)",
+    re.I,
+)
 
 
 @dataclass
@@ -127,6 +137,8 @@ def _prefer_name(*candidates: str) -> str:
             )
         ):
             points += 20
+        if BUSINESS_NAME_HINT_RE.search(cleaned) and not STRONG_ADDRESS_RE.search(cleaned):
+            points += 30
         if ADDRESS_HINT_RE.search(cleaned):
             points -= 25
         return (points, min(len(cleaned), 80))
@@ -207,6 +219,18 @@ def _parse_share_body_lines(text: str, url: str) -> tuple[str, str, str, str]:
             continue
 
         if RATING_ONLY_RE.fullmatch(cleaned) or SHARE_BOILERPLATE_RE.search(cleaned):
+            continue
+
+        # Business names frequently contain a road/neighbourhood word, e.g.
+        # "Shenyang Middle Street ... Manxin Hotel" or "\u6c88\u9633\u4e2d\u8857...\u9152\u5e97".
+        # Treat such a line as a title unless it also has a strong street-number
+        # signal.  The next "... Road No.118" line remains the address.
+        if (
+            not title
+            and BUSINESS_NAME_HINT_RE.search(cleaned)
+            and not STRONG_ADDRESS_RE.search(cleaned)
+        ):
+            title = cleaned
             continue
 
         if ADDRESS_HINT_RE.search(cleaned):
