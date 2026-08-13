@@ -178,6 +178,43 @@ def _system_for_city(city: City) -> str:
     )
 
 
+def _data_integrity_system(
+    city: City,
+    mission: AgentMission,
+    work_item: AgentWorkItem,
+    *,
+    corrective_result_only: bool = False,
+) -> str:
+    """A narrow prompt with no queue or general research obligations."""
+
+    phase_contract = (
+        "The server has already validated a successful get_place checkpoint for "
+        "this exact active place and exposes it through server-owned evidence_refs. "
+        "Do not call get_place or any research tool again. In this terminal phase, "
+        "call only the advertised structured upsert_agent_task exactly once with "
+        "exactly these six fields: task_id, status, verdict, reason, marker_changes, "
+        "evidence_refs. The original task's requested output fields are superseded; "
+        "put every relevant audit fact in reason and send no additional fields."
+        if corrective_result_only
+        else (
+            "First read the active place with get_place. That exact target observation "
+            "is mandatory evidence. Then use only the advertised read tools as needed."
+        )
+    )
+    return (
+        "You are a read-only operational data-integrity auditor. "
+        f"Scope: city_id={city.id}, mission_id={mission.id}, task_id={mission.task_id}, "
+        f"active place_id={work_item.place_id} ({work_item.title}).\n"
+        "This specialized scope replaces every generic queue, personalization, "
+        "quality-backlog, and broad city-research instruction. Do not process or "
+        "mention unread events/appeals and do not switch places.\n"
+        f"{phase_contract} "
+        "list_places, list_agent_tasks, mutation tools, and foreign place IDs are out "
+        "of scope. Finish only the current task through the advertised structured "
+        "upsert_agent_task schema; never invent or copy a legacy result field."
+    )
+
+
 def _research_themes(city: City) -> str:
     if city.slug == "shenyang":
         return (
@@ -433,14 +470,11 @@ EXPENSIVE_RESEARCH_TOOLS = {"web_search", "fetch_page", "geocode_place", "search
 # which would hide the very inconsistency the audit is meant to surface.
 DATA_INTEGRITY_TOOLS = frozenset({
     "get_place",
-    "list_places",
-    "list_agent_tasks",
     "web_search",
     "fetch_page",
     "geocode_place",
     "upsert_agent_task",
 })
-DATA_INTEGRITY_LIST_TASKS_LIMIT = 2
 DATA_INTEGRITY_TASK_RESULT_STATUSES = frozenset({"completed", "blocked"})
 
 MODEL_OUTPUT_FAILURE_MARKERS = {
@@ -500,10 +534,7 @@ def _data_integrity_evidence_refs(
             AgentCheckpoint.work_item_id == work_item.id,
             AgentCheckpoint.outcome.in_(("ok", "changed", "no_new_evidence")),
             AgentRunStep.outcome.in_(("ok", "changed", "no_new_evidence")),
-            AgentRunStep.tool.in_((
-                "get_place", "list_places", "web_search", "fetch_page",
-                "geocode_place", "list_agent_tasks",
-            )),
+            AgentRunStep.tool == "get_place",
         )
         .order_by(AgentCheckpoint.id.desc())
         .limit(20)
@@ -514,8 +545,21 @@ def _data_integrity_evidence_refs(
             result = json.loads(step.detail or "{}").get("result")
         except (TypeError, json.JSONDecodeError):
             result = None
-        if isinstance(result, (dict, list)) and bool(result):
-            refs[f"checkpoint:{checkpoint.id}"] = "observed"
+        try:
+            detail = json.loads(step.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            detail = {}
+        step_args = detail.get("args") if isinstance(detail, dict) else None
+        if (
+            not refs
+            and
+            isinstance(result, dict)
+            and isinstance(step_args, dict)
+            and work_item.place_id is not None
+            and result.get("id") == work_item.place_id
+            and step_args.get("place_id") == work_item.place_id
+        ):
+            refs[f"checkpoint:{checkpoint.id}"] = "target_observed"
     evidence = (
         db.query(AgentEvidence)
         .filter(
@@ -536,9 +580,14 @@ def _data_integrity_evidence_refs(
         evidence_refs[f"evidence:{row.id}"] = (
             f"{row.source_status}|{evidence_text}"
         )
-    # Validated/discovered source rows are more specific than generic read
-    # checkpoints and must not be crowded out by a long observation history.
-    return dict(list({**evidence_refs, **refs}.items())[:20])
+    # The exact target observation is the mandatory grounding anchor and must
+    # never be crowded out by source rows. Remaining slots prefer fresh source
+    # evidence after that single-purpose checkpoint set.
+    return dict(list({**refs, **evidence_refs}.items())[:20])
+
+
+def _has_data_integrity_target_read(refs: dict[str, str]) -> bool:
+    return any(strength == "target_observed" for strength in refs.values())
 
 
 def _data_integrity_corrective_tools(
@@ -622,6 +671,7 @@ def _project_structured_integrity_result(
         and args.get("marker_changes") == 0
         and refs
         and all(strength is not None for strength in strengths)
+        and any(strength == "target_observed" for strength in strengths)
     )
     if not valid:
         return {}, {
@@ -630,6 +680,7 @@ def _project_structured_integrity_result(
             "guard_disposition": "retry",
             "detail": (
                 "Use verdict=unresolved and only server-advertised evidence_refs. "
+                "At least one cited ref must be the active target get_place observation. "
                 "Confirmed/conflict remains unavailable until the server owns "
                 "an explicit identity verdict evidence kind."
             ),
@@ -666,6 +717,16 @@ def _resume_data_integrity_corrective_result(
         return False
     if not isinstance(next_action, dict) or next_action.get("tool") != "upsert_agent_task":
         return False
+    if next_action.get("phase") == "data_integrity_terminal_verdict_v1":
+        task_id = next_action.get("task_id")
+        return bool(
+            isinstance(task_id, int)
+            and not isinstance(task_id, bool)
+            and task_id == mission.task_id
+            and next_action.get("guard_disposition") == "decide"
+        )
+    # Read compatibility for production cursors written before the structured
+    # phase marker. New writes below never publish a model-copyable result.
     args = next_action.get("args")
     if not isinstance(args, dict):
         return False
@@ -698,18 +759,19 @@ def _persist_data_integrity_corrective_cursor(
     ):
         return
     action = {
+        "phase": "data_integrity_terminal_verdict_v1",
         "tool": "upsert_agent_task",
-        "args": {
-            "task_id": mission.task_id,
-            "status": "completed",
-            "result": (
-                "verdict=unresolved; "
-                f"policy_guard={guard_error}; guard_disposition=decide; "
-                "marker_changes=0; evidence_refs=<server-owned refs>"
-            ),
-        },
+        "task_id": mission.task_id,
+        "status": "completed",
+        "guard_error": guard_error,
+        "guard_disposition": "decide",
+        "required_fields": [
+            "task_id", "status", "verdict", "reason",
+            "marker_changes", "evidence_refs",
+        ],
         "purpose": (
-            "Record a structured terminal verdict citing server-owned evidence."
+            "Use the currently advertised tool schema to record the terminal "
+            "verdict; do not copy fields from this checkpoint."
         ),
     }
     work_item.stage = "decide"
@@ -940,12 +1002,6 @@ def _active_target_mismatch(
 ) -> dict[str, Any] | None:
     """Reject a target-scoped tool call that drifts from the durable cursor."""
 
-    if mission_kind == "data_integrity" and name == "get_place":
-        # Integrity audits must compare the active record with duplicates,
-        # anchors, and conflicting branches. ``get_place`` is city-scoped and
-        # read-only, so cross-target reads are safe; every mutation remains
-        # unavailable through DATA_INTEGRITY_TOOLS and the runtime guard.
-        return None
     if (
         work_item is None
         or work_item.place_id is None
@@ -1323,7 +1379,7 @@ def _step_detail_json(
         compact_result = {
             key: result[key]
             for key in (
-                "ok", "error", "detail", "status", "proposal_id", "place_id", "task_id",
+                "ok", "error", "detail", "status", "id", "proposal_id", "place_id", "task_id",
                 "changed", "created", "marked", "merged", "resolved", "url", "title",
                 "already_visited",
             )
@@ -1372,6 +1428,7 @@ def _compact_react_messages(
     max_chars: int = 120_000,
     force: bool = False,
     recent_round_limit: int = 6,
+    focus_hint: str = "",
 ) -> tuple[list[dict[str, Any]], bool]:
     """Keep long autonomous runs inside provider context limits.
 
@@ -1393,14 +1450,22 @@ def _compact_react_messages(
     if current:
         rounds.append(current)
     recent_rounds = rounds[-max(1, recent_round_limit):]
+    continuation = (
+        f"Keep this immutable scope: {focus_hint}. Use only advertised tools; "
+        "do not inspect queue items or another place."
+        if focus_hint
+        else (
+            "최근 관찰만 사용해 현재 1차 목표를 이어가세요. 필요한 현재 상태는 list_agent_tasks와 "
+            "list_places/get_place로 다시 확인하되, 이미 끝낸 장소를 반복 조사하지 마세요."
+        )
+    )
     compact_note = {
         "role": "user",
         "content": (
             "【이전 ReAct 문맥 자동 압축】 오래된 원문·도구 응답은 AgentRunStep에 보존되어 있습니다. "
             f"현재 성과 점수 {current_score}, 실제 변경 {len(material_changes)}건. "
             f"도구 누계: {json.dumps(tool_counts, ensure_ascii=False)}. "
-            "최근 관찰만 사용해 현재 1차 목표를 이어가세요. 필요한 현재 상태는 list_agent_tasks와 "
-            "list_places/get_place로 다시 확인하되, 이미 끝낸 장소를 반복 조사하지 마세요."
+            + continuation
         ),
     }
     def assemble() -> list[dict[str, Any]]:
@@ -1749,7 +1814,9 @@ def run_agent(
         }
 
     unread_before = count_unread(db, city_id)
-    if unread_before == 0 and not allow_research:
+    queue_mode = unread_before > 0
+    autonomous_mode = bool(allow_research and not queue_mode)
+    if not queue_mode and not allow_research:
         return {
             "ok": True,
             "status": "completed",
@@ -1760,16 +1827,17 @@ def run_agent(
             "tool_counts": {},
             "city_id": city_id,
         }
-    queue = _work_queue(db, city_id=city_id)
-    research_only = unread_before == 0
+    queue = _work_queue(db, city_id=city_id) if queue_mode else {
+        "events": [], "appeals": [], "event_ids": [], "appeal_ids": [], "total": 0,
+    }
     personalization_hint = city_personalization_brief(db, city_id=city_id)[:7000]
     quality_task_ids_before = (
-        _sync_quality_tasks(db, city_id=city_id) if allow_research else []
+        _sync_quality_tasks(db, city_id=city_id) if autonomous_mode else []
     )
     primary_task = None
     active_mission = None
     active_work_item = None
-    if allow_research:
+    if autonomous_mode:
         resumable_mission = (
             db.query(AgentMission)
             .join(AgentWorkItem, AgentWorkItem.mission_id == AgentMission.id)
@@ -1862,11 +1930,72 @@ def run_agent(
                 "run_id": idle_run.id,
                 "city_id": city_id,
             }
-    continuity_hint = (
-        json.dumps(mission_context(active_mission, active_work_item), ensure_ascii=False)[:7000]
-        if active_mission is not None and active_work_item is not None
-        else "{}"
+    integrity_mode = bool(
+        autonomous_mode
+        and active_mission is not None
+        and active_mission.kind == "data_integrity"
+        and active_work_item is not None
     )
+    integrity_evidence_refs: dict[str, str] = {}
+    integrity_corrective_resume = False
+    continuity_payload = (
+        mission_context(active_mission, active_work_item)
+        if active_mission is not None and active_work_item is not None
+        else {}
+    )
+    if integrity_mode:
+        # Legacy production cursors contained a free-form ``result`` example,
+        # which the provider copied into the new structured tool and rejected.
+        # Preserve the durable state in DB but expose only server-owned phase
+        # metadata; the advertised provider schema is the sole argument truth.
+        integrity_evidence_refs = _data_integrity_evidence_refs(
+            db,
+            active_mission,
+            active_work_item,
+        )
+        integrity_corrective_resume = _resume_data_integrity_corrective_result(
+            active_mission, active_work_item
+        ) and _has_data_integrity_target_read(
+            integrity_evidence_refs
+        )
+        safe_next_action = {
+            "phase": "data_integrity_terminal_verdict_v1",
+            "tool": "upsert_agent_task",
+            "task_id": active_mission.task_id,
+            "guard_disposition": "decide",
+        } if integrity_corrective_resume else {}
+        if integrity_corrective_resume:
+            # Mission objective/success_metric and legacy recovery history may
+            # enumerate obsolete free-form result keys. In terminal correction,
+            # expose only server-owned phase/identity metadata; the advertised
+            # six-field provider schema is the sole output contract.
+            continuity_payload = {
+                "mission_id": active_mission.id,
+                "work_item_id": active_work_item.id,
+                "target": {
+                    "type": active_work_item.target_type,
+                    "key": active_work_item.target_key,
+                    "place_id": active_work_item.place_id,
+                    "title": active_work_item.title,
+                },
+                "stage": "decide",
+                "status": active_work_item.status,
+                "progress": {
+                    "active_work_item_id": active_work_item.id,
+                    "next_action": safe_next_action,
+                },
+                "next_action": safe_next_action,
+            }
+        else:
+            continuity_payload["next_action"] = safe_next_action
+            progress = continuity_payload.get("progress")
+            if isinstance(progress, dict) and "next_action" in progress:
+                progress = dict(progress)
+                progress["next_action"] = safe_next_action
+                continuity_payload["progress"] = progress
+    continuity_hint = json.dumps(
+        continuity_payload, ensure_ascii=False
+    )[:7000] if continuity_payload else "{}"
     primary_task_hint = (
         f"백로그 #{primary_task.id} '{primary_task.title}'. 상세: {primary_task.detail or '없음'}. "
         f"이전 실행 인계: {(primary_task.result or '없음')[:3000]}. "
@@ -1874,6 +2003,21 @@ def run_agent(
         if primary_task is not None
         else "지정된 백로그가 없습니다. 측정된 여행 역할 공백 중 가치가 가장 큰 하나를 먼저 선택하세요."
     )
+    if integrity_mode and primary_task is not None:
+        # Pending legacy task.result text may contain an obsolete free-form tool
+        # example. The exact task definition is useful; model-copyable handoff
+        # payloads are not. Durable observations are supplied through owned refs.
+        primary_task_hint = (
+            f"백로그 #{primary_task.id} '{primary_task.title}'. "
+            "서버 소유 evidence_refs를 인용해 현재 광고된 스키마로 "
+            "현재 과제의 근거 기반 결과만 기록하세요."
+            if integrity_corrective_resume
+            else (
+                f"백로그 #{primary_task.id} '{primary_task.title}'. "
+                f"상세: {primary_task.detail or '없음'}. "
+                f"성공조건: {primary_task.success_metric or '활성 대상 관찰을 인용한 감사 결과 기록'}."
+            )
+        )
 
     from groq import Groq
 
@@ -1882,7 +2026,7 @@ def run_agent(
     # 종료는 아래 성과 게이트/정체 판단으로 결정한다. 이 값은 비정상 무한루프만 막는 안전 상한이다.
     steps_limit = max_steps or (
         max(40, settings.agent_max_steps)
-        if research_only
+        if autonomous_mode
         else max(100, 64 + unread_before * 4)
     )
     performance_before = _performance_snapshot(db, city_id)
@@ -1890,11 +2034,13 @@ def run_agent(
         city_id=city_id,
         mission_id=active_mission.id if active_mission is not None else None,
         work_item_id=active_work_item.id if active_work_item is not None else None,
-        mode="research" if allow_research else "queue",
+        mode="research" if autonomous_mode else "queue",
         status="running",
         objective=(
-            f"{primary_task_hint} 완료 후 다음 성과 공백 진행"
-            if allow_research
+            f"{primary_task_hint}만 감사하고 종료"
+            if integrity_mode
+            else f"{primary_task_hint} 완료 후 다음 성과 공백 진행"
+            if autonomous_mode
             else "사용자 작업 큐 전원 처리"
         ),
         metrics=json.dumps({"before": performance_before}, ensure_ascii=False),
@@ -1921,7 +2067,7 @@ def run_agent(
     )
     kb_hint = json.dumps(retrieved_knowledge, ensure_ascii=False)[:7000]
 
-    if research_only:
+    if autonomous_mode:
         user_msg = (
             f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
             "현재 미읽음 작업은 없습니다. 연구 사이클을 수행하세요.\n"
@@ -1986,18 +2132,13 @@ def run_agent(
             "'다른 장소/다른 지점' 주장이면 명백한 반증이 없는 한 수용하고 "
             "이미 병합됐으면 undo_merge로 분리 (거리·이름 유사만으로 기각 금지)\n"
             "4) count상 미처리가 0인지 list_open_appeals·list_unread_events로 재확인\n"
-            "5) 큐를 비운 뒤 웹 조사 1회 필수: list_research_history → 키워드 선정(심화+새 테마) → "
-            "web_search → seen=false 글 3~6개 fetch_page → 반복 추천 미등록 장소 propose_place 3~8개, "
-            "기존 장소와 겹치는 유용한 정보는 update_place_fields/context로 보완\n"
-            "6) 여유 스텝이 남으면 재검증(list_stale_places → verify_place 3~5곳)과 "
-            "사진 보강(image_count 0인 장소 2~3곳)도 수행\n"
-            "7) 재사용 원칙은 upsert_knowledge 최신 합성본, 미완료 조사는 upsert_agent_task로 분리 후 한 줄 요약\n"
-            "일부만 처리하고 끝내면 실패다."
+            "5) 큐가 비면 같은 실행에서 연구·품질 백로그로 전환하지 말고 즉시 한 줄 요약 후 종료\n"
+            "일부만 처리하고 끝내면 실패이며, 큐 밖 작업을 시작해도 실패다."
         )
 
     # Research used to be a long fixed checklist.  Keep queue handling explicit,
     # but let research adapt its plan to measured gaps and verify each outcome.
-    if research_only:
+    if autonomous_mode:
         user_msg = (
             f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
             f"현재 상황에 맞게 검색된 지식·검증된 교훈: {kb_hint}\n"
@@ -2020,18 +2161,44 @@ def run_agent(
             "넣지 않습니다. 마지막에는 완료한 변화, 근거, 검증 결과, 남은 공백을 간결하게 보고하세요."
         )
 
-    user_msg += (
-        "\n\n【사용자 행동 기반 개인화 관찰】\n"
-        f"{personalization_hint or '[]'}\n"
-        "이 데이터는 대화·즐겨찾기·직접 추가·일정·이의제기에서 계산한 여행 행동 신호다. 민감한 속성이나 "
-        "확정 취향으로 확대 해석하지 말고, 실제 추천 근거로만 사용한다. 반복된 음료 브랜드는 같은 브랜드의 "
-        "다른 지점과 검증된 유사 음료 브랜드 발굴로 연결하고, lodging anchor는 가까운 음식점·접근성 좋은 관광지 "
-        "조사의 거점으로 사용한다. 이의제기는 거부 취향이 아니라 교정 조건이다. 이미 추천된 place_id는 중복 신규 "
-        "제안하지 말고, 외부 후보는 기존과 동일하게 출처·좌표·중복을 검증한 뒤 propose_place로 남긴다."
-    )
+    if integrity_mode:
+        integrity_phase_instruction = (
+            "서버가 이 활성 장소의 성공한 get_place 체크포인트를 이미 검증했고, 현재 요청의 "
+            "evidence_refs로 제공합니다. get_place나 조사 도구를 다시 호출하지 마세요. 이번 종결 "
+            "단계에서는 광고된 structured upsert_agent_task만 정확히 한 번 호출하세요. 정확히 "
+            "task_id, status, verdict, reason, marker_changes, evidence_refs 여섯 필드만 보내고, "
+            "원래 과제에 적힌 출력 필드 명세는 폐기되었습니다. 관련 사실은 모두 reason에 넣으며 "
+            "result를 포함한 추가 필드는 보내지 마세요."
+            if integrity_corrective_resume
+            else (
+                "이 장소만 get_place로 먼저 읽으세요. 이 성공 관찰 없이는 결과를 종료할 수 없습니다. "
+                "그 뒤 필요할 때만 web_search, fetch_page, geocode_place로 동일 장소의 정체성·지점·주소·"
+                "좌표 근거를 확인하세요. list_places와 list_agent_tasks는 이 감사에서 사용할 수 없습니다. "
+                "다른 place_id, 사용자 큐, 다른 품질 과제는 조회하거나 처리하지 마세요. 마지막에는 현재 요청에 "
+                "광고된 structured upsert_agent_task 스키마만 사용해 현재 task_id를 종료하세요. result 필드는 "
+                "보내지 마세요."
+            )
+        )
+        user_msg = (
+            f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
+            f"현재 data_integrity 과제: {primary_task_hint}\n"
+            f"서버 체크포인트: {continuity_hint}\n"
+            f"활성 대상: place_id={active_work_item.place_id}, title={active_work_item.title}.\n"
+            f"{integrity_phase_instruction}"
+        )
+    elif autonomous_mode:
+        user_msg += (
+            "\n\n【사용자 행동 기반 개인화 관찰】\n"
+            f"{personalization_hint or '[]'}\n"
+            "이 데이터는 대화·즐겨찾기·직접 추가·일정·이의제기에서 계산한 여행 행동 신호다. 민감한 속성이나 "
+            "확정 취향으로 확대 해석하지 말고, 실제 추천 근거로만 사용한다. 반복된 음료 브랜드는 같은 브랜드의 "
+            "다른 지점과 검증된 유사 음료 브랜드 발굴로 연결하고, lodging anchor는 가까운 음식점·접근성 좋은 관광지 "
+            "조사의 거점으로 사용한다. 이의제기는 거부 취향이 아니라 교정 조건이다. 이미 추천된 place_id는 중복 신규 "
+            "제안하지 말고, 외부 후보는 기존과 동일하게 출처·좌표·중복을 검증한 뒤 propose_place로 남긴다."
+        )
 
     runtime_policy = ""
-    if not allow_research:
+    if queue_mode:
         runtime_policy = (
             "\n\n【현재 운영 안전 모드 — 위의 연구 할당보다 우선】\n"
             "- 사용자 작업 큐만 처리한다. 자율 웹 조사, 신규 장소 발굴, 사진 보강, 작업량 채우기를 하지 않는다.\n"
@@ -2039,8 +2206,18 @@ def run_agent(
             "propose_place/merge_places를 호출해 근거·출처·신뢰도가 있는 관리자 승인 제안으로 남긴다.\n"
             "- 큐가 비면 즉시 종료한다. 스텝을 채우는 것은 목표가 아니다.\n"
         )
+    system_content = (
+        _data_integrity_system(
+            city,
+            active_mission,
+            active_work_item,
+            corrective_result_only=integrity_corrective_resume,
+        )
+        if integrity_mode
+        else _system_for_city(city) + runtime_policy
+    )
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _system_for_city(city) + runtime_policy},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": user_msg},
     ]
 
@@ -2073,18 +2250,10 @@ def run_agent(
     pending_model_recovery: dict[str, Any] | None = None
     terminal_model_failure_kind = ""
     local_recovery_tool_names: set[str] | None = None
-    corrective_result_only = _resume_data_integrity_corrective_result(
-        active_mission,
-        active_work_item,
+    corrective_result_only = integrity_corrective_resume
+    corrective_evidence_refs: dict[str, str] = (
+        dict(integrity_evidence_refs) if corrective_result_only else {}
     )
-    corrective_evidence_refs: dict[str, str] = {}
-    if corrective_result_only:
-        corrective_evidence_refs = _data_integrity_evidence_refs(
-            db,
-            active_mission,
-            active_work_item,
-        )
-        corrective_result_only = bool(corrective_evidence_refs)
     malformed_tool_failures: dict[str, int] = {}
     # Compatibility fallback for provider wording not recognized by the
     # adaptive classifier.
@@ -2097,7 +2266,12 @@ def run_agent(
     current_score = 0.0
     context_compactions = 0
     data_integrity_place_reads: set[int] = set()
-    data_integrity_list_task_calls = 0
+    integrity_focus_hint = (
+        f"mission_id={active_mission.id}, task_id={active_mission.task_id}, "
+        f"place_id={active_work_item.place_id}, title={active_work_item.title}"
+        if integrity_mode
+        else ""
+    )
     try:
         for _ in range(steps_limit):
             steps += 1
@@ -2106,6 +2280,7 @@ def run_agent(
                 tool_counts=tool_counts,
                 material_changes=material_changes,
                 current_score=current_score,
+                focus_hint=integrity_focus_hint,
             )
             if compacted:
                 context_compactions += 1
@@ -2137,7 +2312,7 @@ def run_agent(
                     )
                 if (
                     not mission_tool_names
-                    and research_only
+                    and autonomous_mode
                     and active_mission is not None
                     and active_mission.kind in RECOVERY_TOOLS_BY_TASK
                 ):
@@ -2201,6 +2376,17 @@ def run_agent(
                         work_item=active_work_item,
                         prompt_chars=len(json.dumps(messages, ensure_ascii=False, default=str)),
                     )
+                    if corrective_result_only:
+                        # The recovery planner is intentionally reusable across
+                        # mission stages and may suggest get_place. A terminal
+                        # integrity cursor is stricter: the exact-target read is
+                        # already server-owned evidence and every retry must keep
+                        # the same upsert-only provider/runtime boundary.
+                        strategy = {
+                            **strategy,
+                            "tool_names": ["upsert_agent_task"],
+                            "corrective_result_only": True,
+                        }
                     messages, recovery_compacted = _compact_react_messages(
                         messages,
                         tool_counts=tool_counts,
@@ -2209,6 +2395,7 @@ def run_agent(
                         max_chars=int(strategy["max_chars"]),
                         force=bool(strategy["force_compaction"]),
                         recent_round_limit=int(strategy["recent_round_limit"]),
+                        focus_hint=integrity_focus_hint,
                     )
                     if recovery_compacted:
                         context_compactions += 1
@@ -2254,7 +2441,19 @@ def run_agent(
                             "Call exactly one allowed tool with valid JSON arguments; omit optional "
                             "fields instead of emitting null, and do not narrate or switch targets. "
                             f"Allowed tools: {', '.join(strategy['tool_names'])}. "
-                            f"Current target: {active_work_item.target_key if active_work_item else 'none'}."
+                            f"Current target: {integrity_focus_hint or (active_work_item.target_key if active_work_item else 'none')}."
+                            + (
+                                " The exact active target was already observed in a server-owned "
+                                "checkpoint. Do not call get_place or any research tool; call the "
+                                "advertised structured upsert_agent_task exactly once with only "
+                                "task_id, status, verdict, reason, marker_changes, and evidence_refs. "
+                                "The original task's output-field list is superseded; put all relevant "
+                                "facts in reason and send no additional fields."
+                                if corrective_result_only
+                                else " Do not inspect or process unread queue items."
+                                if integrity_mode
+                                else ""
+                            )
                         ),
                     })
                     continue
@@ -2262,14 +2461,24 @@ def run_agent(
                     terminal_model_failure_kind = failure_kind
                 if not failure_kind and "tool_use_failed" in detail and schema_retries < 3:
                     schema_retries += 1
+                    schema_retry_instruction = (
+                        "활성 대상은 서버 체크포인트에서 이미 관찰되었습니다. get_place를 "
+                        "호출하지 말고 현재 광고된 structured upsert_agent_task에 정확히 task_id, "
+                        "status, verdict, reason, marker_changes, evidence_refs 여섯 필드만 보내세요. "
+                        "원래 과제의 출력 필드는 폐기되었으며 모든 관련 사실은 reason에 넣으세요. "
+                        if corrective_result_only
+                        else (
+                            "값이 없는 선택 필드는 null을 넣지 말고 아예 생략한 뒤 "
+                            "같은 툴을 다시 호출하세요. "
+                        )
+                    )
                     messages.append(
                         {
                             "role": "user",
                             "content": (
-                                "직전 툴 호출 인자가 스키마 검증에 실패했습니다. "
-                                "값이 없는 선택 필드는 null을 넣지 말고 아예 생략한 뒤 "
-                                "같은 툴을 다시 호출하세요. "
-                                f"오류: {detail[:600]}"
+                                "직전 툴 호출이 스키마 검증에 실패했습니다. "
+                                + schema_retry_instruction
+                                + f"오류: {detail[:600]}"
                             ),
                         }
                     )
@@ -2307,13 +2516,14 @@ def run_agent(
                         "role": "user",
                         "content": (
                             "정책 가드 교정 단계는 서술로 종료할 수 없습니다. 현재 미션의 task_id로 "
-                            "upsert_agent_task를 호출해 verdict, marker_changes=0, observed_facts 또는 "
-                            "sources를 포함한 completed 결과를 기록하세요."
+                            "현재 요청에 광고된 upsert_agent_task 스키마를 그대로 사용하세요. "
+                            "필수 필드는 task_id, status=completed, verdict=unresolved, reason, "
+                            "marker_changes=0, evidence_refs이며 result 필드는 보내지 마세요."
                         ),
                     })
                     continue
                 remaining = count_unread(db, city_id)
-                if remaining > 0 and work_nudges < 4 and steps < steps_limit:
+                if queue_mode and remaining > 0 and work_nudges < 4 and steps < steps_limit:
                     work_nudges += 1
                     left = _work_queue(db, city_id=city_id)
                     messages.append(
@@ -2328,11 +2538,11 @@ def run_agent(
                         }
                     )
                     continue
-                if allow_research:
+                if autonomous_mode:
                     _sync_quality_tasks(db, city_id=city_id, run_id=agent_run.id)
                 current_snapshot = _performance_snapshot(db, city_id)
                 current_delta = _performance_delta(performance_before, current_snapshot)
-                gaps = _research_gaps(current_delta, successful_tool_counts, current_snapshot) if allow_research else []
+                gaps = _research_gaps(current_delta, successful_tool_counts, current_snapshot) if autonomous_mode else []
                 current_score = _performance_score(current_delta, successful_tool_counts)
                 if gaps and progress_nudges < 8 and no_progress_actions < 18 and steps < steps_limit:
                     progress_nudges += 1
@@ -2392,6 +2602,13 @@ def run_agent(
             continuity_updates: list[dict[str, Any]] = []
             mission_halted = False
             for tool_call_index, tc in enumerate(tool_calls):
+                if queue_mode and count_unread(db, city_id) == 0:
+                    # A queue run has no authority to become an autonomous run.
+                    # This also covers another worker draining the queue between
+                    # the model response and local tool execution.
+                    mission_halted = True
+                    final_text = "사용자 작업 큐가 이미 비어 연구 전환 없이 종료했습니다."
+                    break
                 name = tc.function.name
                 raw_args = tc.function.arguments or "{}"
                 argument_error = ""
@@ -2479,12 +2696,6 @@ def run_agent(
                 repeated_data_integrity_place_read = bool(
                     data_integrity_get_place_id is not None
                     and data_integrity_get_place_id in data_integrity_place_reads
-                )
-                data_integrity_task_list_exhausted = bool(
-                    active_mission is not None
-                    and active_mission.kind == "data_integrity"
-                    and name == "list_agent_tasks"
-                    and data_integrity_list_task_calls >= DATA_INTEGRITY_LIST_TASKS_LIMIT
                 )
                 integrity_scope_violation = bool(
                     not argument_error
@@ -2577,7 +2788,11 @@ def run_agent(
                     result = {
                         "error": "structured_integrity_verdict_required",
                         "error_class": "policy_guard",
-                        "guard_disposition": "decide" if allowed_refs else "retry",
+                        "guard_disposition": (
+                            "decide"
+                            if _has_data_integrity_target_read(allowed_refs)
+                            else "retry"
+                        ),
                         "detail": (
                             "A data_integrity task can only close through the "
                             "server-owned structured verdict schema. Cite an "
@@ -2599,19 +2814,6 @@ def run_agent(
                             "result를 upsert_agent_task로 기록하세요."
                         ),
                         "place_id": data_integrity_get_place_id,
-                    }
-                elif data_integrity_task_list_exhausted:
-                    result = {
-                        "error": "data_integrity_task_list_budget_exhausted",
-                        "error_class": "policy_guard",
-                        "guard_disposition": "decide",
-                        "detail": (
-                            f"list_agent_tasks는 data_integrity 감사에서 최대 "
-                            f"{DATA_INTEGRITY_LIST_TASKS_LIMIT}회만 허용됩니다. 이미 확인한 활성 task_id를 "
-                            "사용해 감사 결과를 기록하세요."
-                        ),
-                        "limit": DATA_INTEGRITY_LIST_TASKS_LIMIT,
-                        "active_task_id": active_mission.task_id if active_mission else None,
                     }
                 elif argument_error:
                     malformed_attempt = malformed_tool_failures.get(name, 0) + 1
@@ -2783,10 +2985,12 @@ def run_agent(
                     and active_mission.kind == "data_integrity"
                     and result.get("error_class") == "policy_guard"
                     and result.get("guard_disposition") == "decide"
-                    and not _data_integrity_evidence_refs(
-                        db,
-                        active_mission,
-                        active_work_item,
+                    and not _has_data_integrity_target_read(
+                        _data_integrity_evidence_refs(
+                            db,
+                            active_mission,
+                            active_work_item,
+                        )
                     )
                 ):
                     # A loop/budget guard without a single durable observation
@@ -2841,8 +3045,6 @@ def run_agent(
                 ):
                     if name == "get_place" and data_integrity_get_place_id is not None:
                         data_integrity_place_reads.add(data_integrity_get_place_id)
-                    elif name == "list_agent_tasks":
-                        data_integrity_list_task_calls += 1
                 if not error:
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
                 material_change = _is_material_change(name, result)
@@ -3021,6 +3223,26 @@ def run_agent(
                 )
                 if continuity:
                     continuity_updates.append(continuity)
+                queue_drained = bool(queue_mode and count_unread(db, city_id) == 0)
+                if queue_drained:
+                    # Queue and autonomous work are different runs. Once the
+                    # last user item is closed, never execute research calls
+                    # that the model emitted later in the same/parallel round.
+                    for skipped in tool_calls[tool_call_index + 1:]:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": skipped.id,
+                            "content": json.dumps({
+                                "error": "skipped_after_queue_drained",
+                                "detail": (
+                                    "사용자 작업 큐가 비어 같은 실행의 자율 연구 호출을 "
+                                    "실행하지 않았습니다. 다음 실행이 별도로 계획합니다."
+                                ),
+                            }, ensure_ascii=False),
+                        })
+                    mission_halted = True
+                    final_text = "사용자 작업 큐를 모두 처리하고 연구 전환 없이 종료했습니다."
+                    break
                 if (
                     integrity_policy_guard
                     or terminal_corrective_guard
@@ -3203,17 +3425,20 @@ def run_agent(
     unread_after = count_unread(db, city_id)
     quality_task_ids_after = (
         _sync_quality_tasks(db, city_id=city_id, run_id=agent_run.id)
-        if allow_research
+        if autonomous_mode
         else []
     )
     performance_after = _performance_snapshot(db, city_id)
     performance_delta = _performance_delta(performance_before, performance_after)
     current_score = _performance_score(performance_delta, successful_tool_counts)
-    gaps = _research_gaps(performance_delta, successful_tool_counts, performance_after) if allow_research else []
+    gaps = _research_gaps(performance_delta, successful_tool_counts, performance_after) if autonomous_mode else []
     gap_task_ids = _ensure_gap_tasks(db, city_id=city_id, run_id=agent_run.id, gaps=gaps) if gaps else []
-    ok = unread_after == 0
+    # New user input arriving during an autonomous run belongs to the next
+    # queue-only run; it must not retroactively turn a focused mission partial.
+    outcome_unread = unread_after if queue_mode else 0
+    ok = outcome_unread == 0
     run_status = _run_outcome_status(
-        unread_after=unread_after,
+        unread_after=outcome_unread,
         gaps=gaps,
         material_change_count=len(material_changes),
     )
@@ -3221,7 +3446,7 @@ def run_agent(
     if tool_counts:
         stats = ", ".join(f"{t}×{c}" for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]))
         summary = f"{summary}\n[작업 통계] {stats}"
-    if unread_after > 0:
+    if queue_mode and unread_after > 0:
         summary = (
             f"미처리 {unread_after}건 잔존 (시작 {unread_before}건, steps={steps}). "
             f"{summary}"
@@ -3235,7 +3460,7 @@ def run_agent(
             for item in material_changes[:20]
         )
         summary = f"{summary}\n[실제 변경 {len(material_changes)}건] {changed}"
-    if allow_research:
+    if autonomous_mode:
         summary = (
             f"{summary}\n[품질 변화] 사진 없음 "
             f"{performance_before.get('imageless_places', 0)}→{performance_after.get('imageless_places', 0)}, "

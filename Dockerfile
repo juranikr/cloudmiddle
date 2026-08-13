@@ -1,6 +1,8 @@
 # 로컬 Docker Desktop 없이 GitHub Actions에서 빌드 → ECR → ECS
 FROM node:20-alpine AS frontend
 WORKDIR /fe
+ARG VITE_RUNTIME_LABEL=""
+ENV VITE_RUNTIME_LABEL=$VITE_RUNTIME_LABEL
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./

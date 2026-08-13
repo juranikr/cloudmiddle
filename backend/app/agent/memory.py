@@ -906,32 +906,21 @@ def checkpoint_after_tool(
         # verdict so an active mission is not resumed in the next batch.
         terminal_status = "completed"
         next_action = {
+            "phase": "data_integrity_terminal_verdict_v1",
             "tool": "upsert_agent_task",
-            "args": {
-                "task_id": mission.task_id,
-                "status": terminal_status,
-                "result": (
-                    f"verdict=unresolved; policy_guard={error}; "
-                    f"guard_disposition={guard_disposition}; marker_changes=0; "
-                    "observed_facts=체크포인트에 저장된 관찰만 사용; "
-                    "sources=검증 완료 출처가 없으면 none; 미해결 사유를 사실대로 기록"
-                ),
-            },
+            "task_id": mission.task_id,
+            "status": terminal_status,
+            "guard_error": error,
+            "guard_disposition": "decide",
+            "required_fields": [
+                "task_id", "status", "verdict", "reason",
+                "marker_changes", "evidence_refs",
+            ],
             "purpose": (
-                f"정책 가드({guard_disposition})를 조사 실패로 반복하지 말고 현재 감사 "
-                "과제에 검증 가능한 unresolved completed 결과를 기록"
+                "현재 provider가 광고한 upsert_agent_task 스키마만 따라 "
+                "근거 기반 terminal verdict를 기록"
             ),
         }
-        next_action["purpose"] = (
-            "Record the evidence-backed terminal verdict for this audit's own "
-            "task without mutating marker data."
-        )
-        next_action["args"]["result"] = (
-            f"verdict=unresolved; policy_guard={error}; "
-            "guard_disposition=decide; marker_changes=0; "
-            "observed_facts=<checkpoint facts>; "
-            "sources=<validated sources or none>"
-        )
     elif is_policy_guard:
         # Retry guards correct an action choice without consuming the failed
         # investigation-path budget or prematurely closing an unobserved task.

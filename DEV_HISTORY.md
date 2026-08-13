@@ -1,17 +1,17 @@
-# cloudmiddle / 지난 여행 지도 — 개발 히스토리 (Living Doc)
+# cloudmiddle / WONRAE 遠來 — 개발 히스토리 (Living Doc)
 
 > **이 파일은 프로젝트의 단일 컨텍스트 소스입니다.**  
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-12 (KST) — 성과 기반 배치 에이전트·실행 가시성·지도 핀 클러스터
+최종 갱신: 2026-08-14 (KST) — 운영 복제 기반 로컬 통합 환경·에이전트 큐/감사 연속성
 
 ---
 
 ## 1) 한 줄 요약
 
 한국 여행자를 위한 **중국 도시별 공유 여행 지도** 웹앱. 지난(济南)과 선양(沈阳)을 지원.
-핀/구역 마커, JWT 로그인, 로컬 SQLite / AWS Postgres, CloudFront HTTPS로 원격 서비스 중.
+핀/구역 마커, JWT 로그인, 로컬 SQLite·Docker Postgres / AWS Postgres, CloudFront HTTPS로 원격 서비스 중.
 
 ---
 
@@ -110,13 +110,25 @@ cloudmiddle/
   .github/workflows/deploy-api.yml
 ```
 
-- 로컬 DB 기본: SQLite `backend/jinan_travel.db` (Docker Desktop 불필요)
+- 로컬 통합 권장: Docker Compose의 PostgreSQL `cloudmiddle_local` + 실제 배포 이미지 (`127.0.0.1:18000`)
+- 경량 개발 대안: SQLite `backend/jinan_travel.db` (Docker 없이 사용 가능)
 - 프로덕션: Postgres (Secrets Manager의 `DATABASE_URL`)
 - FE API base: 배포 시 같은 오리진 `""` (`frontend/src/api.ts`)
 
 ---
 
 ## 5) 로컬 개발 (다른 PC에서)
+
+배포 전 전체 통합 검증은 저장소 루트에서 아래 한 명령으로 실행합니다.
+
+```powershell
+.\dev\predeploy.ps1
+```
+
+이 명령은 백엔드 전체 테스트, 프런트 빌드, Python 컴파일, diff/Compose 검사,
+로컬 Docker 앱·DB 기동, `db_mode=local`, 테스트 로그인과 도시 API까지 확인합니다.
+운영 스냅샷 복제·정제와 운영 DB 읽기 전용 진단은 루트 `README.md`의
+`clone-production-db.ps1` / `production-readonly.ps1` 절차를 따릅니다.
 
 ```powershell
 # Backend (Python 3.11 권장)
@@ -207,6 +219,18 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 10) 세션 로그 (최신 위)
+
+### 2026-08-14 — 운영 복제 기반 로컬 통합 테스트 + 에이전트 실행 모드 격리
+- Docker Compose를 `127.0.0.1:18000` 앱 + `127.0.0.1:55432/cloudmiddle_local` PostgreSQL로 구성하고 화면/API에 `LOCAL INTEGRATION · DB local` 표식 추가
+- `APP_DB_MODE=local|production_readonly` 안전 경계 추가: 로컬 DB 이름·호스트·포트 검증, 운영 진단은 libpq/transaction read-only + 로그인 외 HTTP 쓰기 503 + startup migration/seed 생략
+- 운영 DB는 source read-only preflight 후 Docker `pg_dump` → staging restore → 이메일/비밀번호 정제 → 검증 → 원자 교체하며, 기본 모드는 채팅·메모·일정·이의·에이전트 trace 등 private content 제거
+- `-RetainPrivateContent`는 명시적 장애 진단에만 사용하고, 다음 safe clone은 이전 private backup까지 제거; Windows 일일 예약 등록/해제 wrapper 제공
+- `dev/predeploy.ps1`로 백엔드 전체 테스트·프런트 빌드·compileall·diff·Compose·로컬 health/header/login/cities를 한 번에 검증
+- 사용자 큐와 자율 연구/DI 미션을 서로 다른 run으로 분리: 큐 run은 미션 attempts/checkpoint를 건드리지 않고, 큐가 끝난 다음 invocation에서 기존 미션을 재개
+- DI는 활성 place의 exact `get_place`만 허용하고 다른 place/list 도구를 차단하며, exact target checkpoint를 포함한 서버 소유 evidence ref가 없으면 종료 불가
+- 운영 복제본 실측: queue run #57은 #83 이의만 처리하며 DI #37/#105 불변, research run #60은 #105 감사 task/mission/work item을 원자적으로 완료하고 #103~105 marker 무변경
+- 로컬 실측 중 발견한 Groq 400 두 종류를 배포 전에 수정: corrective 단계의 `get_place` 프롬프트/도구 모순, 구형 success metric의 추가 필드가 새 structured schema에 섞이던 문제
+- 최종 로컬 기준 백엔드 243개 테스트, DI 집중 90개, 프런트 production build, Docker/UI/API 실측 통과
 
 ### 2026-08-11 — 로컬 기준선 복구 + 지난/선양 분리 + 에이전트 안전 모드
 - 원인 확인: Cursor가 `%TEMP%` 임시 clone에서 32개 커밋을 push해 원래 `cloudmiddle` 로컬만 뒤처짐

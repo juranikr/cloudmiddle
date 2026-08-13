@@ -2506,3 +2506,32 @@ textarea {
   grid-template-columns: repeat(3, 1fr) !important;
 }
 
+:root {
+  --runtime-badge-bg: rgba(38, 60, 53, 0.94);
+}
+
+.runtime-environment-badge {
+  position: fixed;
+  z-index: 20000;
+  top: max(6px, env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 24px);
+  padding: 5px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 999px;
+  background: var(--runtime-badge-bg);
+  box-shadow: 0 4px 18px rgba(23, 34, 30, 0.24);
+  color: #fffdf8;
+  font: 700 11px/1.2 system-ui, sans-serif;
+  letter-spacing: 0.08em;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.runtime-environment-badge--production_readonly {
+  --runtime-badge-bg: rgba(139, 42, 42, 0.96);
+}

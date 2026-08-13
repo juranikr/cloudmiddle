@@ -1,6 +1,9 @@
 from pathlib import Path
+from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 _DEFAULT_SQLITE = f"sqlite:///{(Path(__file__).resolve().parent.parent / 'jinan_travel.db').as_posix()}"
 
@@ -8,6 +11,9 @@ _DEFAULT_SQLITE = f"sqlite:///{(Path(__file__).resolve().parent.parent / 'jinan_
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # Unset preserves the deployed application's existing read/write behaviour.
+    # Development and diagnostic commands opt into an explicit guarded mode.
+    app_db_mode: Literal["local", "production_readonly"] | None = None
     # Docker 없을 때는 기본 SQLite. Postgres 쓰려면 DATABASE_URL 환경변수 설정.
     database_url: str = _DEFAULT_SQLITE
     jwt_secret: str = "change-me-in-production-jinan-travel-2026"
@@ -41,6 +47,42 @@ class Settings(BaseSettings):
     # 쉼표 구분. 기본: 성주한
     admin_emails: str = "joohan92@naver.com"
 
+    @model_validator(mode="after")
+    def validate_database_mode(self) -> "Settings":
+        """Fail closed when an explicit safety mode points at the wrong DB."""
+
+        try:
+            url = make_url(self.database_url)
+            backend = url.get_backend_name()
+        except Exception as exc:
+            raise ValueError("DATABASE_URL is not a valid SQLAlchemy URL") from exc
+
+        if self.app_db_mode == "production_readonly":
+            if backend not in {"postgresql", "postgres"}:
+                raise ValueError(
+                    "APP_DB_MODE=production_readonly requires a PostgreSQL DATABASE_URL"
+                )
+            return self
+
+        if self.app_db_mode != "local" or backend == "sqlite":
+            return self
+
+        if backend not in {"postgresql", "postgres"}:
+            raise ValueError("APP_DB_MODE=local supports only SQLite or PostgreSQL")
+        host = (url.host or "").strip().lower()
+        if host not in {"localhost", "127.0.0.1", "::1", "db"}:
+            raise ValueError("APP_DB_MODE=local refuses a non-local PostgreSQL host")
+        expected_port = 5432 if host == "db" else 55432
+        if url.port != expected_port:
+            raise ValueError(
+                f"APP_DB_MODE=local requires PostgreSQL port {expected_port} for host {host}"
+            )
+        if (url.database or "").strip().lower() != "cloudmiddle_local":
+            raise ValueError(
+                "APP_DB_MODE=local requires the PostgreSQL database cloudmiddle_local"
+            )
+        return self
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
@@ -52,6 +94,16 @@ class Settings(BaseSettings):
     @property
     def is_sqlite(self) -> bool:
         return self.database_url.startswith("sqlite")
+
+    @property
+    def is_production_readonly(self) -> bool:
+        return self.app_db_mode == "production_readonly"
+
+    @property
+    def runtime_db_mode(self) -> str:
+        # "application" is the backward-compatible deployed web/worker mode.
+        # It is deliberately not accepted as an APP_DB_MODE environment value.
+        return self.app_db_mode or "application"
 
 
 settings = Settings()

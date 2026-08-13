@@ -3,9 +3,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
@@ -102,6 +102,35 @@ from app import storage
 app = FastAPI(title="Cloudmiddle China Travel Map API", version="0.3.0")
 app.include_router(admin_router)
 
+@app.middleware("http")
+async def enforce_production_readonly(request: Request, call_next):
+    """Expose diagnostics as reads only; the database also enforces this."""
+
+    method = request.method.upper()
+    login_read = method == "POST" and request.url.path == "/api/auth/login"
+    if (
+        settings.is_production_readonly
+        and method not in {"GET", "HEAD", "OPTIONS"}
+        and not login_read
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "detail": (
+                    "This process is running in production_readonly diagnostic mode; "
+                    "state-changing HTTP methods are disabled."
+                )
+            },
+            headers={"X-Cloudmiddle-DB-Mode": settings.runtime_db_mode},
+        )
+    response = await call_next(request)
+    response.headers["X-Cloudmiddle-DB-Mode"] = settings.runtime_db_mode
+    return response
+
+
+# Add CORS after the read-only guard so it is the outer middleware. Blocked
+# cross-origin writes then remain a readable HTTP 503 instead of a browser-level
+# CORS failure in the diagnostic UI.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -114,6 +143,10 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
+    if settings.is_production_readonly:
+        # Every normal startup action below can write. Diagnostics must observe
+        # the deployed schema and never repair, seed, or reconcile it.
+        return
     Base.metadata.create_all(bind=engine)
     ensure_schema()
     db = SessionLocal()
@@ -248,7 +281,7 @@ def _load_place(db: Session, place_id: int) -> Optional[Marker]:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "db_mode": settings.runtime_db_mode}
 
 
 @app.get("/api/cities", response_model=list[CityOut])

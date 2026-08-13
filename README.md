@@ -13,10 +13,106 @@ FastAPI + React(Vite) + SQLite(기본) / PostgreSQL(선택) + Leaflet/OSM.
 - 운영 HTTPS: https://d232kzujcg4ufp.cloudfront.net  
 - AWS 배포(Terraform): [`infra/README.md`](infra/README.md)
 
-## Docker 없이 로컬 실행 (권장)
+## Docker로 배포 전 로컬 통합 실행 (권장)
 
-현재처럼 Docker Desktop이 안 되는 Windows에서는 **SQLite**로 바로 돌리면 됩니다.  
-(기본 `DATABASE_URL`이 SQLite입니다.)
+로컬 통합 환경은 운영과 이름·포트·볼륨이 분리된 PostgreSQL과 실제 배포용
+Dockerfile(UI 정적 빌드 + API)을 함께 실행합니다.
+
+```powershell
+# 키 없이 UI/API/DB만 확인
+.\dev\local.ps1 up
+
+# 배포 전 전체 smoke(unittest/build/compile/diff/Compose/API·로그인)
+.\dev\predeploy.ps1
+
+# 에이전트·검색 E2E도 확인할 때만 (파일은 gitignored)
+Copy-Item .env.local.example .env.local
+# .env.local에 로컬 테스트용 API 키 입력
+.\dev\local.ps1 up -EnvFile .env.local
+```
+
+- 통합 UI/API: http://127.0.0.1:18000
+- 로컬 PostgreSQL: `127.0.0.1:55432`, DB/사용자 `cloudmiddle_local`
+- 영구 볼륨: `cloudmiddle_local_pgdata`
+- 화면 상단의 `LOCAL INTEGRATION` 배지와 `/api/health`의
+  `{"status":"ok","db_mode":"local"}`로 운영과 구분합니다.
+- `GROQ_API_KEY` 등 선택 키를 전달해도 자율 연구·자동 생성·자동 병합은 기본적으로 꺼져 있습니다.
+
+운영 명령:
+
+```powershell
+.\dev\local.ps1 status
+.\dev\local.ps1 logs
+.\dev\local.ps1 down       # 볼륨 보존
+
+# 로컬 DB를 정말 초기화할 때만: cloudmiddle_local_pgdata 삭제
+.\dev\local.ps1 reset -ConfirmReset RESET-cloudmiddle_local
+```
+
+Compose는 DB와 앱 포트를 `127.0.0.1`에만 바인딩합니다. `.env.local`에는
+운영 `DATABASE_URL`이나 AWS 자격증명을 넣지 마세요.
+
+### 운영 스냅샷을 로컬 DB로 복제
+
+운영 문제를 실제 데이터 모양으로 재현해야 할 때만 아래 wrapper를 사용합니다. 이 도구는
+AWS Secrets Manager에서 URL을 프로세스 메모리로만 읽고, source/target의 host·DB·user·port
+allowlist를 확인한 다음 staging DB에 복원·검증하고 `cloudmiddle_local`로 교체합니다.
+비밀번호는 명령 인자나 출력에 포함하지 않습니다.
+
+```powershell
+# 1) AWS 접근, 운영 source와 local target guard만 검증 (DB 연결/변경 없음)
+.\dev\clone-production-db.ps1 -DryRun
+
+# 2-a) 일반 로컬 회귀 테스트: 사용자 이메일/비밀번호를 로컬 값으로 바꾸고
+#      채팅·메모·이의·일정·에이전트 trace 등 private content는 제거
+.\dev\clone-production-db.ps1 -Confirmation RESET-cloudmiddle_local
+
+# 2-b) 특정 운영 장애를 처음 정밀 진단할 때만 private content도 로컬에 보존
+.\dev\clone-production-db.ps1 `
+  -Confirmation RESET-cloudmiddle_local `
+  -RetainPrivateContent
+```
+
+복제는 **로컬 DB를 교체하는 파괴적 작업**이며 정확한 확인 문구 없이는 실행되지 않습니다.
+두 방식 모두 계정 이메일과 모든 비밀번호 해시는 운영 값과 분리되고,
+로컬 로그인은 `test@test.com` / `test1234`로 통일됩니다. `-RetainPrivateContent` 결과는
+민감한 운영 데이터이므로 이 노트북 밖으로 복사하거나 커밋하지 마세요.
+
+정기 복제가 필요하면 private content 제거가 기본인 작업만 등록합니다.
+
+```powershell
+.\dev\register-db-clone-task.ps1 -Action Register -DailyAt 04:30
+.\dev\register-db-clone-task.ps1 -Action Unregister
+```
+
+예약 작업은 현재 Windows 사용자 세션, Docker Desktop, AWS profile이 사용 가능한 경우에만
+실행됩니다. 앱 컨테이너가 열린 연결을 갖고 있다면 복제 후 `.\dev\local.ps1 up`으로
+재생성해 새 DB 연결을 확실히 사용하세요.
+
+## 호스트 개발 실행 (Vite hot reload)
+
+DB만 Docker로 실행하고 API/프론트는 호스트에서 실행할 수 있습니다.
+
+```powershell
+# 터미널 1
+.\dev\local.ps1 db
+$env:APP_DB_MODE="local"
+$env:DATABASE_URL="postgresql+psycopg2://cloudmiddle_local:cloudmiddle_local_only@127.0.0.1:55432/cloudmiddle_local"
+cd backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+
+# 터미널 2
+cd frontend
+npm install
+npm run dev
+```
+
+브라우저: `http://localhost:5173`. `VITE_API_URL`을 비워 두면 Vite가 `/api`를
+`127.0.0.1:8000`으로 프록시합니다.
+
+## Docker 없이 SQLite 실행
+
+Docker를 쓸 수 없는 환경에서는 **SQLite**로 바로 실행할 수 있습니다.
 
 ### 백엔드 (Python 3.11 + venv)
 
@@ -69,37 +165,38 @@ npm run dev
 운영 계정은 공개 README에 적지 않습니다. 접속 URL·인프라는 [`DEV_HISTORY.md`](DEV_HISTORY.md) §2를 보세요.  
 로컬/점검용 테스트 계정만: `test@test.com` / `test1234`
 
-## Docker / PostgreSQL (선택)
+## 운영 DB 읽기 전용 진단
 
-Docker Desktop이 되는 PC·서버에서는:
+운영 진단은 로컬/복제 DB 실행과 **별도 모드·별도 환경변수**를 씁니다. 운영 DB에
+`SELECT` 권한만 가진 전용 사용자부터 준비해야 합니다. 일반 앱의 쓰기 가능한
+`DATABASE_URL`을 재사용하지 마세요.
 
-```bash
-docker compose up --build -d
+```powershell
+# 현재 PowerShell 프로세스에만 주입 (명령/문서/파일에 실제 URL을 남기지 않음)
+$env:PROD_READONLY_DATABASE_URL="postgresql+psycopg2://READONLY_USER:...@HOST:5432/DB"
+.\dev\production-readonly.ps1
 ```
 
-- API: http://localhost:8000  
-- DB: Postgres (`jinan` / `jinan_secret` / `jinan_travel`)
+이 API는 `http://127.0.0.1:18001`에서만 열립니다. 두 번째 터미널에서 UI를 띄우려면:
 
-호스트에서 API만 띄우고 Postgres에 붙일 때:
-
-```bash
-# Windows PowerShell
-$env:DATABASE_URL="postgresql+psycopg2://jinan:jinan_secret@localhost:5432/jinan_travel"
-uvicorn app.main:app --reload --port 8000
+```powershell
+cd frontend
+$env:VITE_API_URL="http://127.0.0.1:18001"
+$env:VITE_RUNTIME_LABEL="PRODUCTION READ-ONLY"
+npm run dev
 ```
 
-## Docker CLI만 설치하면 되나?
+`production_readonly` 모드는 다음을 중첩 적용합니다.
 
-**안 됩니다.** `docker` CLI는 클라이언트일 뿐이고, 실제 컨테이너를 돌릴 **엔진(데몬)** 이 필요합니다.
+- PostgreSQL 연결에 `default_transaction_read_only=on` 및 transaction read-only 설정
+- 시작 시 `create_all`, 스키마 보정, 시드, proposal task reconcile 전부 생략
+- UI 로그인을 위한 정확한 `POST /api/auth/login`만 예외로 두고 나머지
+  `POST/PATCH/PUT/DELETE`는 HTTP 503
+- 진단 프로세스 전용 임시 JWT 서명 키를 매번 생성해 운영 토큰과 분리
+- 모든 응답의 `X-Cloudmiddle-DB-Mode`와 `/api/health`에 현재 모드 표시
 
-| 방식 | 이 PC에서의 현실성 |
-|------|-------------------|
-| Docker Desktop | Windows 업데이트가 막히면 설치/실행이 자주 실패. 또한 비교적 최신 Windows + WSL2가 필요 |
-| Docker CLI만 | 엔진이 없어 컨테이너 실행 불가 |
-| WSL2 + Docker Engine | 이 PC에 WSL 자체가 없음 + OS 빌드가 오래됨(1903) |
-| **SQLite (현재 기본)** | Docker 없이 바로 개발 가능 |
-
-나중에 Windows를 업데이트하거나 서버(Linux)로 옮기면 `docker compose` / Postgres로 전환하면 됩니다.
+애플리케이션 경계는 보조 방어입니다. 운영 진단 계정 자체도 반드시 DB 권한이
+읽기 전용이어야 합니다.
 
 ## 사용법
 

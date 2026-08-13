@@ -1,35 +1,66 @@
+name: cloudmiddle-local
+
 services:
   db:
     image: postgres:16-alpine
-    container_name: jinan-map-db
     environment:
-      POSTGRES_USER: jinan
-      POSTGRES_PASSWORD: jinan_secret
-      POSTGRES_DB: jinan_travel
+      POSTGRES_USER: cloudmiddle_local
+      POSTGRES_PASSWORD: cloudmiddle_local_only
+      POSTGRES_DB: cloudmiddle_local
     ports:
-      - "5432:5432"
+      - "127.0.0.1:55432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - cloudmiddle_local_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U jinan -d jinan_travel"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      test: ["CMD-SHELL", "pg_isready -U cloudmiddle_local -d cloudmiddle_local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
 
-  api:
+  app:
     build:
-      context: ./backend
+      context: .
       dockerfile: Dockerfile
-    container_name: jinan-map-api
+      args:
+        VITE_RUNTIME_LABEL: LOCAL INTEGRATION
     environment:
-      DATABASE_URL: postgresql+psycopg2://jinan:jinan_secret@db:5432/jinan_travel
-      JWT_SECRET: change-me-in-production-jinan-travel-2026
-      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      APP_DB_MODE: local
+      DATABASE_URL: postgresql+psycopg2://cloudmiddle_local:cloudmiddle_local_only@db:5432/cloudmiddle_local
+      JWT_SECRET: local-integration-only-not-for-production
+      CORS_ORIGINS: http://localhost:18000,http://127.0.0.1:18000,http://localhost:5173,http://127.0.0.1:5173
+      ADMIN_EMAILS: test@test.com
+      AGENT_AUTONOMOUS_RESEARCH: "false"
+      AGENT_ALLOW_AUTO_CREATE: "false"
+      AGENT_ALLOW_AUTO_MERGE: "false"
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+      GROQ_CHAT_MODEL: ${GROQ_CHAT_MODEL:-openai/gpt-oss-120b}
+      ARCGIS_API_KEY: ${ARCGIS_API_KEY:-}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      BRAVE_PLACE_ENABLED: ${BRAVE_PLACE_ENABLED:-true}
+      BRAVE_SEARCH_STORAGE_RIGHTS: ${BRAVE_SEARCH_STORAGE_RIGHTS:-false}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:18000:8000"
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request;
+          data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health'));
+          assert data.get('status') == 'ok' and data.get('db_mode') == 'local'
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
 
 volumes:
-  pgdata:
+  cloudmiddle_local_pgdata:
+    name: cloudmiddle_local_pgdata

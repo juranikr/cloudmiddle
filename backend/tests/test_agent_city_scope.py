@@ -15,7 +15,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.agent.runner import (
-    DATA_INTEGRITY_LIST_TASKS_LIMIT,
     DATA_INTEGRITY_TOOLS,
     RECOVERY_TOOLS_BY_TASK,
     _active_agent_task_mismatch,
@@ -257,6 +256,263 @@ class AgentCityScopeTests(unittest.TestCase):
         rows = run_tool(self.db, "list_places", {}, city_id=2)
         self.assertEqual([row["city_id"] for row in rows], [2])
 
+    def test_unread_queue_preempts_integrity_mission_then_next_run_resumes_target(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="data_integrity",
+            title=f"[integrity:queue-preemption:#{place.id}] exact target",
+            detail=f"targets:\n- #{place.id} {place.title}",
+            success_metric="read only the exact target and record a grounded result",
+            priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        self.db.commit()
+        event_ids = [
+            row.id
+            for row in self.db.query(PlaceEvent)
+            .join(Marker, Marker.id == PlaceEvent.place_id)
+            .filter(Marker.city_id == 2, PlaceEvent.groq_read_at.is_(None))
+            .all()
+        ]
+        self.assertTrue(event_ids)
+        attempts_before = (task.attempts, item.attempts)
+        checkpoints_before = self.db.query(AgentCheckpoint).count()
+        queue_requests: list[dict] = []
+
+        class QueueCompletions:
+            def create(inner_self, **kwargs):
+                queue_requests.append(kwargs)
+                calls = [
+                    SimpleNamespace(
+                        id="drain-user-queue",
+                        function=SimpleNamespace(
+                            name="mark_events_read",
+                            arguments=json.dumps({"event_ids": event_ids}),
+                        ),
+                    ),
+                    # A model may optimistically append autonomous work to the
+                    # same response. It must be acknowledged but not executed.
+                    SimpleNamespace(
+                        id="must-not-transition-to-research",
+                        function=SimpleNamespace(
+                            name="web_search",
+                            arguments=json.dumps({"query": "unrelated city research"}),
+                        ),
+                    ),
+                ]
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=calls,
+                ))])
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=QueueCompletions())
+        )
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]) as sync,
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+        ):
+            queue_result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=5,
+                autonomous_research=True,
+            )
+
+        self.assertTrue(queue_result["ok"], queue_result)
+        self.assertEqual(len(queue_requests), 1)
+        sync.assert_not_called()
+        self.db.refresh(task)
+        self.db.refresh(mission)
+        self.db.refresh(item)
+        self.assertEqual((task.attempts, item.attempts), attempts_before)
+        self.assertEqual(mission.status, "active")
+        self.assertEqual(item.status, "active")
+        self.assertEqual(self.db.query(AgentCheckpoint).count(), checkpoints_before)
+        self.assertEqual(
+            self.db.query(AgentRunStep).filter(
+                AgentRunStep.run_id == queue_result["run_id"],
+                AgentRunStep.tool == "web_search",
+            ).count(),
+            0,
+        )
+        queue_run = self.db.get(AgentRun, queue_result["run_id"])
+        self.assertEqual(queue_run.mode, "queue")
+        self.assertIsNone(queue_run.mission_id)
+        self.assertIsNone(queue_run.work_item_id)
+        self.assertEqual(count_unread(self.db, 2), 0)
+
+        research_result, research_requests = self._run_scripted_agent(
+            [("get_place", {"place_id": place.id})],
+            max_steps=1,
+        )
+
+        self.assertTrue(research_result["ok"], research_result)
+        self.assertEqual(len(research_requests), 1)
+        research_run = self.db.get(AgentRun, research_result["run_id"])
+        self.assertEqual(research_run.mode, "research")
+        self.assertEqual(research_run.mission_id, mission.id)
+        self.assertEqual(research_run.work_item_id, item.id)
+        self.db.refresh(task)
+        self.assertEqual(task.attempts, attempts_before[0] + 1)
+        target_step = self.db.query(AgentRunStep).filter(
+            AgentRunStep.run_id == research_run.id,
+            AgentRunStep.tool == "get_place",
+        ).one()
+        self.assertEqual(json.loads(target_step.detail)["result"]["id"], place.id)
+        target_checkpoint = self.db.query(AgentCheckpoint).filter(
+            AgentCheckpoint.run_id == research_run.id,
+            AgentCheckpoint.mission_id == mission.id,
+            AgentCheckpoint.work_item_id == item.id,
+        ).one()
+        self.assertEqual(target_checkpoint.outcome, "ok")
+
+    def test_new_unread_event_during_integrity_run_is_deferred_to_next_queue_run(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="data_integrity",
+            title=f"[integrity:new-unread:#{place.id}] keep focus",
+            detail=f"targets:\n- #{place.id} {place.title}",
+            success_metric="finish this target without absorbing newly arrived queue work",
+            priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+        requests: list[dict] = []
+
+        class IntegrityCompletions:
+            def create(inner_self, **kwargs):
+                requests.append(kwargs)
+                if len(requests) == 1:
+                    call = SimpleNamespace(
+                        id="read-current-target",
+                        function=SimpleNamespace(
+                            name="get_place",
+                            arguments=json.dumps({"place_id": place.id}),
+                        ),
+                    )
+                elif len(requests) == 2:
+                    self.db.add(PlaceEvent(
+                        place_id=place.id,
+                        actor="user",
+                        action=PlaceEventAction.update,
+                        summary="arrived while integrity mission was active",
+                    ))
+                    self.db.commit()
+                    call = SimpleNamespace(
+                        id="request-terminal-schema",
+                        function=SimpleNamespace(
+                            name="upsert_agent_task",
+                            arguments=json.dumps({
+                                "task_id": task.id,
+                                "status": "completed",
+                                "result": "legacy free-form terminal attempt",
+                            }),
+                        ),
+                    )
+                else:
+                    call = SimpleNamespace(
+                        id="grounded-terminal-result",
+                        function=SimpleNamespace(
+                            name="upsert_agent_task",
+                            arguments=json.dumps(_structured_integrity_args(
+                                kwargs,
+                                task_id=task.id,
+                                reason=f"Active place #{place.id} was observed before completion",
+                            )),
+                        ),
+                    )
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=[call],
+                ))])
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=IntegrityCompletions())
+        )
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=4,
+                autonomous_research=True,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["unread_after"], 1)
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(
+            "미처리 큐" not in json.dumps(request["messages"], ensure_ascii=False)
+            for request in requests[1:]
+        ))
+        self.db.refresh(task)
+        self.assertEqual(task.status, "completed")
+        mission = self.db.query(AgentMission).filter(
+            AgentMission.task_id == task.id
+        ).one()
+        attempts_after_integrity = task.attempts
+
+        event_id = self.db.query(PlaceEvent.id).filter(
+            PlaceEvent.summary == "arrived while integrity mission was active",
+            PlaceEvent.groq_read_at.is_(None),
+        ).scalar()
+        self.assertIsNotNone(event_id)
+        queue_requests: list[dict] = []
+
+        class QueueCompletions:
+            def create(inner_self, **kwargs):
+                queue_requests.append(kwargs)
+                call = SimpleNamespace(
+                    id="process-deferred-event",
+                    function=SimpleNamespace(
+                        name="mark_events_read",
+                        arguments=json.dumps({"event_ids": [event_id]}),
+                    ),
+                )
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=[call],
+                ))])
+
+        fake_client.chat.completions = QueueCompletions()
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]) as sync,
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+        ):
+            queue_result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=3,
+                autonomous_research=True,
+            )
+
+        self.assertTrue(queue_result["ok"], queue_result)
+        sync.assert_not_called()
+        queue_run = self.db.get(AgentRun, queue_result["run_id"])
+        self.assertEqual(queue_run.mode, "queue")
+        self.assertIsNone(queue_run.mission_id)
+        self.assertIsNone(queue_run.work_item_id)
+        self.db.refresh(task)
+        self.db.refresh(mission)
+        self.assertEqual(task.attempts, attempts_after_integrity)
+        self.assertEqual(mission.status, "completed")
+
     def test_durable_mission_splits_quality_task_into_resumable_place_work_items(self) -> None:
         places = self.db.query(Marker).filter(Marker.city_id == 2).all()
         second = Marker(
@@ -414,13 +670,15 @@ class AgentCityScopeTests(unittest.TestCase):
             )
             action = json.loads(item.next_action)
             if error in decide_errors:
-                self.assertEqual(action["tool"], "upsert_agent_task")
-                self.assertEqual(action["args"]["task_id"], task.id)
-                self.assertEqual(action["args"]["status"], "completed")
-                self.assertIn(
-                    "verdict=unresolved",
-                    action["args"]["result"],
+                self.assertEqual(
+                    action["phase"], "data_integrity_terminal_verdict_v1"
                 )
+                self.assertEqual(action["tool"], "upsert_agent_task")
+                self.assertEqual(action["task_id"], task.id)
+                self.assertEqual(action["status"], "completed")
+                self.assertEqual(action["guard_disposition"], "decide")
+                self.assertNotIn("args", action)
+                self.assertIn("evidence_refs", action["required_fields"])
             else:
                 self.assertEqual(action["tool"], "continue")
                 self.assertEqual(action["args"]["task_id"], task.id)
@@ -659,13 +917,14 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertIsNone(
             _active_target_mismatch("search_place_images", {"place_id": 83}, work_item)
         )
-        self.assertIsNone(
-            _active_target_mismatch(
-                "get_place",
-                {"place_id": 101},
-                work_item,
-                mission_kind="data_integrity",
-            )
+        integrity_read_mismatch = _active_target_mismatch(
+            "get_place",
+            {"place_id": 101},
+            work_item,
+            mission_kind="data_integrity",
+        )
+        self.assertEqual(
+            integrity_read_mismatch["error"], "active_work_item_mismatch"
         )
         integrity_write_mismatch = _active_target_mismatch(
             "search_place_images",
@@ -997,8 +1256,6 @@ class AgentCityScopeTests(unittest.TestCase):
     def test_data_integrity_tool_scope_contains_no_place_mutations(self) -> None:
         expected = {
             "get_place",
-            "list_places",
-            "list_agent_tasks",
             "web_search",
             "fetch_page",
             "geocode_place",
@@ -1138,7 +1395,7 @@ class AgentCityScopeTests(unittest.TestCase):
                 "evidence_refs": ["checkpoint:7"],
             },
             allowed_refs={
-                "checkpoint:7": "observed",
+                "checkpoint:7": "target_observed",
                 "evidence:9": "validated|Middle Street hotel official address",
             },
         )
@@ -1153,7 +1410,7 @@ class AgentCityScopeTests(unittest.TestCase):
                 "evidence_refs": ["evidence:9"],
             },
             allowed_refs={
-                "checkpoint:7": "observed",
+                "checkpoint:7": "target_observed",
                 "evidence:9": "validated|Middle Street hotel official address",
             },
         )
@@ -1168,9 +1425,10 @@ class AgentCityScopeTests(unittest.TestCase):
                 "verdict": "unresolved",
                 "reason": "Middle Street hotel evidence remains inconclusive",
                 "marker_changes": 0,
-                "evidence_refs": ["evidence:9", "evidence:9"],
+                "evidence_refs": ["checkpoint:7", "evidence:9", "evidence:9"],
             },
             allowed_refs={
+                "checkpoint:7": "target_observed",
                 "evidence:9": "validated|Middle Street hotel official address",
             },
         )
@@ -1234,7 +1492,10 @@ class AgentCityScopeTests(unittest.TestCase):
             phase="observe",
             tool="get_place",
             outcome="ok",
-            detail=json.dumps({"result": {"id": place.id, "title": place.title}}),
+            detail=json.dumps({
+                "args": {"place_id": place.id},
+                "result": {"id": place.id, "title": place.title},
+            }),
         )
         policy_step = AgentRunStep(
             run_id=run.id,
@@ -1302,6 +1563,9 @@ class AgentCityScopeTests(unittest.TestCase):
 
         self.assertLessEqual(len(refs), 20)
         self.assertIn(f"checkpoint:{observed_checkpoint.id}", refs)
+        self.assertEqual(
+            refs[f"checkpoint:{observed_checkpoint.id}"], "target_observed"
+        )
         self.assertNotIn(f"checkpoint:{policy_checkpoint.id}", refs)
         self.assertIn(f"evidence:{owned.id}", refs)
         self.assertNotIn(f"evidence:{wrong_work_item.id}", refs)
@@ -1340,10 +1604,10 @@ class AgentCityScopeTests(unittest.TestCase):
                 requests.append(kwargs)
                 if len(requests) == 1:
                     call = SimpleNamespace(
-                        id="read-comparison",
+                        id="read-active-target",
                         function=SimpleNamespace(
                             name="get_place",
-                            arguments=json.dumps({"place_id": comparison.id}),
+                            arguments=json.dumps({"place_id": place.id}),
                         ),
                     )
                     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
@@ -1351,10 +1615,10 @@ class AgentCityScopeTests(unittest.TestCase):
                     ))])
                 if len(requests) == 2:
                     call = SimpleNamespace(
-                        id="read-task-id",
+                        id="read-foreign-target",
                         function=SimpleNamespace(
-                            name="list_agent_tasks",
-                            arguments=json.dumps({"limit": 12}),
+                            name="get_place",
+                            arguments=json.dumps({"place_id": comparison.id}),
                         ),
                     )
                     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
@@ -1389,7 +1653,7 @@ class AgentCityScopeTests(unittest.TestCase):
                                 "status": "completed",
                                 "result": (
                                     "verdict=unresolved; marker_changes=0; "
-                                    f"observed_facts=place #{comparison.id} and task list read"
+                                    f"observed_facts=active place #{place.id} read"
                                 ),
                             }),
                         ),
@@ -1406,8 +1670,8 @@ class AgentCityScopeTests(unittest.TestCase):
                                 kwargs,
                                 task_id=task.id,
                                 reason=(
-                                    f"Place #{comparison.id} and the task list "
-                                    "were read before the forbidden write"
+                                    f"Active place #{place.id} was read before "
+                                    "the foreign-target and forbidden-write attempts"
                                 ),
                             )),
                         ),
@@ -1454,23 +1718,20 @@ class AgentCityScopeTests(unittest.TestCase):
             )
         )
         self.assertEqual(advertised[-1], {"upsert_agent_task"})
-        comparison_step = (
+        place_steps = (
             self.db.query(AgentRunStep)
             .filter(AgentRunStep.tool == "get_place")
-            .order_by(AgentRunStep.id.desc())
-            .first()
+            .order_by(AgentRunStep.id)
+            .all()
         )
-        self.assertIsNotNone(comparison_step)
-        self.assertEqual(comparison_step.outcome, "ok")
-        self.assertEqual(json.loads(comparison_step.detail)["result"]["id"], comparison.id)
-        task_list_step = (
-            self.db.query(AgentRunStep)
-            .filter(AgentRunStep.tool == "list_agent_tasks")
-            .order_by(AgentRunStep.id.desc())
-            .first()
+        self.assertEqual([step.outcome for step in place_steps], ["ok", "error"])
+        self.assertEqual(
+            json.loads(place_steps[0].detail)["result"]["id"], place.id
         )
-        self.assertIsNotNone(task_list_step)
-        self.assertEqual(task_list_step.outcome, "ok")
+        foreign_result = json.loads(place_steps[1].detail)["result"]
+        self.assertEqual(foreign_result["error"], "active_work_item_mismatch")
+        self.assertEqual(foreign_result["active_place_id"], place.id)
+        self.assertEqual(foreign_result["requested_place_id"], comparison.id)
         forbidden_step = (
             self.db.query(AgentRunStep)
             .filter(AgentRunStep.tool == "verify_place")
@@ -1484,6 +1745,78 @@ class AgentCityScopeTests(unittest.TestCase):
             step_detail["result"]["error"],
             "tool_not_allowed_for_data_integrity",
         )
+
+    def test_data_integrity_requires_active_target_read_before_terminal_phase(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="data_integrity",
+            title="target observation is mandatory",
+            detail=f"targets:\n- #{place.id} {place.title}",
+            success_metric="cite a successful get_place observation for this target",
+            priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+
+        result, requests = self._run_scripted_agent(
+            [
+                ("upsert_agent_task", {
+                    "task_id": task.id,
+                    "status": "completed",
+                    "result": "premature completion before target observation",
+                }),
+                ("get_place", {"place_id": place.id}),
+                ("upsert_agent_task", {
+                    "task_id": task.id,
+                    "status": "completed",
+                    "result": "request structured close after target observation",
+                }),
+                ("upsert_agent_task", {
+                    "task_id": task.id,
+                    "status": "completed",
+                    "result": (
+                        "verdict=unresolved; marker_changes=0; "
+                        f"observed_facts=active place #{place.id} was read"
+                    ),
+                }),
+            ],
+            max_steps=5,
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(requests), 4)
+        guard_steps = (
+            self.db.query(AgentRunStep)
+            .filter(
+                AgentRunStep.run_id == result["run_id"],
+                AgentRunStep.tool == "upsert_agent_task",
+                AgentRunStep.outcome == "error",
+            )
+            .order_by(AgentRunStep.sequence)
+            .all()
+        )
+        self.assertEqual(len(guard_steps), 2)
+        first_guard = json.loads(guard_steps[0].detail)["result"]
+        second_guard = json.loads(guard_steps[1].detail)["result"]
+        self.assertEqual(first_guard["error"], "structured_integrity_verdict_required")
+        self.assertEqual(first_guard["guard_disposition"], "retry")
+        self.assertEqual(first_guard["allowed_evidence_refs"], [])
+        self.assertEqual(second_guard["error"], "structured_integrity_verdict_required")
+        self.assertEqual(second_guard["guard_disposition"], "decide")
+        self.assertTrue(
+            any(ref.startswith("checkpoint:") for ref in second_guard["allowed_evidence_refs"])
+        )
+        self.assertEqual(requests[-1]["tool_choice"], "required")
+        self.assertEqual(
+            {tool["function"]["name"] for tool in requests[-1]["tools"]},
+            {"upsert_agent_task"},
+        )
+        self.db.refresh(task)
+        self.assertEqual(task.status, "completed")
+        self.assertIn("evidence_refs=[", task.result)
 
     def test_data_integrity_blocks_missing_and_foreign_task_writes_then_completes_own(self) -> None:
         for event in self.db.query(PlaceEvent).all():
@@ -1754,6 +2087,149 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0].outcome, "ok")
 
+    def test_legacy_corrective_schema_recovery_keeps_upsert_only_contract(self) -> None:
+        """Reproduce run 58: old decide cursor + provider tool-schema failure."""
+
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="data_integrity",
+            title="legacy run 56 decide cursor",
+            detail=(
+                f"Target:\n- #{place.id} {place.title}\n"
+                "Finish with obsolete fields: qunar_identity, ctrip_identity, "
+                "branch_comparison, conflicting_fields, sources, "
+                "recommended_remediation. LEGACY_OUTPUT_FIELD_TRAP"
+            ),
+            success_metric=(
+                "Return qunar_identity and ctrip_identity in separate fields. "
+                "LEGACY_SUCCESS_METRIC_TRAP"
+            ),
+            priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+        observed, _ = self._run_scripted_agent(
+            [("get_place", {"place_id": place.id})],
+            max_steps=1,
+        )
+        self.assertTrue(observed["ok"], observed)
+        mission = self.db.query(AgentMission).filter(
+            AgentMission.task_id == task.id
+        ).one()
+        item = self.db.query(AgentWorkItem).filter(
+            AgentWorkItem.mission_id == mission.id
+        ).one()
+        legacy_action = {
+            "tool": "upsert_agent_task",
+            "args": {
+                "task_id": task.id,
+                "status": "completed",
+                "result": (
+                    "verdict=unresolved; policy_guard=duplicate_data_integrity_place_read; "
+                    "guard_disposition=decide; marker_changes=0; evidence_refs=<server-owned refs>"
+                ),
+            },
+            "purpose": "legacy production corrective cursor",
+        }
+        item.stage = "decide"
+        item.status = "active"
+        item.next_action = json.dumps(legacy_action)
+        progress = json.loads(mission.progress or "{}")
+        progress["next_action"] = legacy_action
+        mission.progress = json.dumps(progress)
+        self.db.commit()
+        requests: list[dict] = []
+
+        class Completions:
+            def create(inner_self, **kwargs):
+                requests.append(kwargs)
+                if len(requests) == 1:
+                    # Groq run 58 rejected a get_place generation because only
+                    # the structured terminal tool was advertised.
+                    raise RuntimeError(
+                        "Error code: 400 - tool_use_failed: additionalProperties "
+                        "qunar_identity, ctrip_identity, branch_comparison, "
+                        "conflicting_fields, sources, recommended_remediation not allowed"
+                    )
+                call = SimpleNamespace(
+                    id="recovered-structured-close",
+                    function=SimpleNamespace(
+                        name="upsert_agent_task",
+                        arguments=json.dumps(_structured_integrity_args(
+                            kwargs,
+                            task_id=task.id,
+                            reason=(
+                                f"Exact active place #{place.id} was already observed "
+                                "in the cited server checkpoint"
+                            ),
+                        )),
+                    ),
+                )
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=[call],
+                ))])
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+        ):
+            completed = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=3,
+                autonomous_research=True,
+            )
+
+        self.assertTrue(completed["ok"], completed)
+        self.assertEqual(completed["model_recovery_attempts"], 1)
+        self.assertEqual(len(requests), 2)
+        for request in requests:
+            self.assertEqual(request["tool_choice"], "required")
+            self.assertEqual(
+                {tool["function"]["name"] for tool in request["tools"]},
+                {"upsert_agent_task"},
+            )
+        initial_prompt = json.dumps(requests[0]["messages"], ensure_ascii=False)
+        recovery_prompt = json.dumps(requests[1]["messages"], ensure_ascii=False)
+        self.assertIn("already validated a successful get_place checkpoint", initial_prompt)
+        self.assertIn("Do not call get_place", initial_prompt)
+        self.assertIn("get_place나 조사 도구를 다시 호출하지 마세요", initial_prompt)
+        self.assertIn("Do not call get_place or any research tool", recovery_prompt)
+        for prompt in (initial_prompt, recovery_prompt):
+            self.assertIn(
+                "task_id, status, verdict, reason, marker_changes, evidence_refs",
+                prompt,
+            )
+            self.assertNotIn("LEGACY_OUTPUT_FIELD_TRAP", prompt)
+            self.assertNotIn("LEGACY_SUCCESS_METRIC_TRAP", prompt)
+            for obsolete_field in (
+                "qunar_identity", "ctrip_identity", "branch_comparison",
+                "conflicting_fields", "recommended_remediation",
+            ):
+                self.assertNotIn(obsolete_field, prompt)
+        recovery_steps = self.db.query(AgentRunStep).filter(
+            AgentRunStep.run_id == completed["run_id"],
+            AgentRunStep.tool == "model_output",
+        ).all()
+        self.assertEqual(len(recovery_steps), 1)
+        strategy = json.loads(recovery_steps[0].detail)["strategy"]
+        self.assertEqual(strategy["tool_names"], ["upsert_agent_task"])
+        self.assertTrue(strategy["corrective_result_only"])
+        self.db.refresh(task)
+        self.db.refresh(mission)
+        self.db.refresh(item)
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(mission.status, "completed")
+        self.assertEqual(item.status, "done")
+
     def test_integrity_decide_phase_resumes_as_required_upsert_only_next_run(self) -> None:
         for event in self.db.query(PlaceEvent).all():
             event.groq_read_at = datetime.now(timezone.utc)
@@ -1785,8 +2261,12 @@ class AgentCityScopeTests(unittest.TestCase):
         item = self.db.query(AgentWorkItem).filter(AgentWorkItem.mission_id == mission.id).one()
         action = json.loads(item.next_action)
         self.assertEqual(item.stage, "decide")
+        self.assertEqual(action["phase"], "data_integrity_terminal_verdict_v1")
         self.assertEqual(action["tool"], "upsert_agent_task")
-        self.assertIn("guard_disposition=decide", action["args"]["result"])
+        self.assertEqual(action["task_id"], task.id)
+        self.assertEqual(action["status"], "completed")
+        self.assertEqual(action["guard_disposition"], "decide")
+        self.assertNotIn("args", action)
 
         final_result = (
             "verdict=unresolved; marker_changes=0; "
@@ -1822,6 +2302,90 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(item.status, "done")
         self.assertEqual(item.stage, "complete")
         self.assertEqual(json.loads(item.next_action), {})
+
+    def test_legacy_integrity_cursor_resumes_without_exposing_old_result_example(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="data_integrity",
+            title="legacy production cursor",
+            detail=f"targets:\n- #{place.id} {place.title}",
+            success_metric="resume through the current structured provider schema",
+            priority=100,
+        )
+        self.db.add(task)
+        self.db.commit()
+        observed, _ = self._run_scripted_agent(
+            [("get_place", {"place_id": place.id})],
+            max_steps=1,
+        )
+        self.assertTrue(observed["ok"], observed)
+        mission = self.db.query(AgentMission).filter(
+            AgentMission.task_id == task.id
+        ).one()
+        item = self.db.query(AgentWorkItem).filter(
+            AgentWorkItem.mission_id == mission.id
+        ).one()
+        legacy_action = {
+            "tool": "upsert_agent_task",
+            "args": {
+                "task_id": task.id,
+                "status": "completed",
+                "result": (
+                    "verdict=unresolved; policy_guard=duplicate_data_integrity_place_read; "
+                    "guard_disposition=decide; marker_changes=0; LEGACY_COPY_TRAP"
+                ),
+            },
+        }
+        item.stage = "decide"
+        item.status = "active"
+        item.next_action = json.dumps(legacy_action)
+        task.result = "LEGACY_TASK_RESULT_TRAP result=<obsolete free-form payload>"
+        progress = json.loads(mission.progress or "{}")
+        progress["active_work_item_id"] = item.id
+        progress["next_action"] = legacy_action
+        mission.progress = json.dumps(progress)
+        self.db.commit()
+
+        completed, requests = self._run_scripted_agent(
+            [("upsert_agent_task", {
+                "task_id": task.id,
+                "status": "completed",
+                "result": (
+                    "verdict=unresolved; marker_changes=0; "
+                    f"observed_facts=active place #{place.id} was read"
+                ),
+            })],
+            max_steps=1,
+        )
+
+        self.assertTrue(completed["ok"], completed)
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request["tool_choice"], "required")
+        self.assertEqual(
+            {tool["function"]["name"] for tool in request["tools"]},
+            {"upsert_agent_task"},
+        )
+        parameters = request["tools"][0]["function"]["parameters"]
+        self.assertNotIn("result", parameters["properties"])
+        self.assertEqual(parameters["properties"]["verdict"]["enum"], ["unresolved"])
+        self.assertNotIn(
+            "LEGACY_COPY_TRAP",
+            json.dumps(request["messages"], ensure_ascii=False),
+        )
+        self.assertNotIn(
+            "LEGACY_TASK_RESULT_TRAP",
+            json.dumps(request["messages"], ensure_ascii=False),
+        )
+        self.db.refresh(task)
+        self.db.refresh(mission)
+        self.db.refresh(item)
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(mission.status, "completed")
+        self.assertEqual(item.status, "done")
 
     def test_resumed_corrective_malformed_json_retries_before_status_guard(self) -> None:
         for event in self.db.query(PlaceEvent).all():
@@ -2002,8 +2566,12 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(item.status, "active")
         self.assertEqual(item.stage, "decide")
         action = json.loads(item.next_action)
+        self.assertEqual(action["phase"], "data_integrity_terminal_verdict_v1")
         self.assertEqual(action["tool"], "upsert_agent_task")
-        self.assertIn("guard_disposition=decide", action["args"]["result"])
+        self.assertEqual(action["task_id"], task.id)
+        self.assertEqual(action["status"], "completed")
+        self.assertEqual(action["guard_disposition"], "decide")
+        self.assertNotIn("args", action)
         progress = json.loads(mission.progress)
         self.assertEqual(progress["next_action"]["tool"], "upsert_agent_task")
         failed_step = self.db.query(AgentRunStep).filter(
@@ -2435,15 +3003,6 @@ class AgentCityScopeTests(unittest.TestCase):
         for event in self.db.query(PlaceEvent).all():
             event.groq_read_at = datetime.now(timezone.utc)
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
-        comparison = Marker(
-            city_id=2,
-            category=MarkerCategory.restaurant,
-            shape=MarkerShape.point,
-            title="comparison place",
-            description="read-only comparison",
-            lat=41.81,
-            lng=123.36,
-        )
         task = AgentTask(
             city_id=2,
             kind="data_integrity",
@@ -2452,19 +3011,19 @@ class AgentCityScopeTests(unittest.TestCase):
             success_metric="reuse one observation and record the verdict",
             priority=100,
         )
-        self.db.add_all([comparison, task])
+        self.db.add(task)
         self.db.commit()
 
         result, requests = self._run_scripted_agent(
             [
-                ("get_place", {"place_id": comparison.id}),
-                ("get_place", {"place_id": comparison.id}),
+                ("get_place", {"place_id": place.id}),
+                ("get_place", {"place_id": place.id}),
                 ("upsert_agent_task", {
                     "task_id": task.id,
                     "status": "completed",
                     "result": (
                         "verdict=unresolved; marker_changes=0; "
-                        f"observed_facts=place #{comparison.id} read once; sources=none"
+                        f"observed_facts=place #{place.id} read once; sources=none"
                     ),
                 }),
             ],
@@ -2773,7 +3332,7 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(item.status, "done")
         self.assertEqual(json.loads(item.failed_approaches), [])
 
-    def test_data_integrity_list_task_calls_have_a_small_runtime_budget(self) -> None:
+    def test_data_integrity_rejects_list_tools_outside_narrow_scope(self) -> None:
         for event in self.db.query(PlaceEvent).all():
             event.groq_read_at = datetime.now(timezone.utc)
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
@@ -2787,36 +3346,43 @@ class AgentCityScopeTests(unittest.TestCase):
         )
         self.db.add(task)
         self.db.commit()
-        calls = [
-            ("list_agent_tasks", {"limit": 12})
-            for _ in range(DATA_INTEGRITY_LIST_TASKS_LIMIT + 1)
-        ]
-        calls.append(("upsert_agent_task", {
-            "task_id": task.id,
-            "status": "completed",
-            "result": (
-                "verdict=unresolved; marker_changes=0; "
-                "observed_facts=task backlog read twice; sources=none"
-            ),
-        }))
-
-        result, _ = self._run_scripted_agent(calls, max_steps=len(calls) + 1)
+        result, requests = self._run_scripted_agent(
+            [
+                ("list_agent_tasks", {"limit": 12}),
+                ("list_places", {"q": place.title, "limit": 12}),
+                ("get_place", {"place_id": place.id}),
+                ("get_place", {"place_id": place.id}),
+                ("upsert_agent_task", {
+                    "task_id": task.id,
+                    "status": "completed",
+                    "result": "verdict=unresolved; marker_changes=0; target read",
+                }),
+            ],
+            max_steps=6,
+        )
 
         self.assertTrue(result["ok"], result)
-        task_steps = (
+        list_steps = (
             self.db.query(AgentRunStep)
             .filter(
                 AgentRunStep.run_id == result["run_id"],
-                AgentRunStep.tool == "list_agent_tasks",
+                AgentRunStep.tool.in_(("list_agent_tasks", "list_places")),
             )
             .order_by(AgentRunStep.sequence)
             .all()
         )
-        self.assertEqual(len(task_steps), DATA_INTEGRITY_LIST_TASKS_LIMIT + 1)
-        self.assertTrue(all(step.outcome == "ok" for step in task_steps[:-1]))
-        exhausted = json.loads(task_steps[-1].detail)["result"]
-        self.assertEqual(exhausted["error"], "data_integrity_task_list_budget_exhausted")
-        self.assertEqual(exhausted["limit"], DATA_INTEGRITY_LIST_TASKS_LIMIT)
+        self.assertEqual(len(list_steps), 2)
+        self.assertTrue(all(step.outcome == "error" for step in list_steps))
+        self.assertTrue(all(
+            json.loads(step.detail)["result"]["error"]
+            == "tool_not_allowed_for_data_integrity"
+            for step in list_steps
+        ))
+        self.assertTrue(all(
+            {tool["function"]["name"] for tool in request["tools"]}
+            in (set(DATA_INTEGRITY_TOOLS), {"upsert_agent_task"})
+            for request in requests
+        ))
         self.db.refresh(task)
         self.assertEqual(task.status, "completed")
 
@@ -3260,6 +3826,17 @@ class AgentCityScopeTests(unittest.TestCase):
         parsed = json.loads(detail)
         self.assertTrue(parsed["truncated"])
         self.assertLessEqual(len(detail), 3000)
+
+        large_place_detail = _step_detail_json(
+            {"place_id": 104},
+            {"id": 104, "title": "large target", "images": ["x" * 2000] * 8},
+            {"new_evidence": 0},
+            max_chars=1000,
+        )
+        parsed_place = json.loads(large_place_detail)
+        self.assertTrue(parsed_place["truncated"])
+        self.assertEqual(parsed_place["args"]["place_id"], 104)
+        self.assertEqual(parsed_place["result"]["id"], 104)
 
     def test_long_react_context_is_compacted_by_complete_tool_round(self) -> None:
         messages: list[dict] = [
