@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy import create_engine
@@ -55,6 +58,7 @@ from app.models import (
     AgentKnowledgeArchive,
     AgentProposal,
     AgentRun,
+    AgentRunStep,
     AgentTask,
     AgentEvidence,
     AgentLesson,
@@ -623,6 +627,81 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(learned["mode"], "compact_retry")
         self.assertTrue(learned["adapted_from_history"])
 
+    def test_batch_malformed_tool_arguments_are_not_executed_as_empty_object(self) -> None:
+        event = (
+            self.db.query(PlaceEvent)
+            .join(Marker, Marker.id == PlaceEvent.place_id)
+            .filter(Marker.city_id == 2)
+            .one()
+        )
+        requests = []
+
+        class Completions:
+            def create(inner_self, **kwargs):
+                requests.append(kwargs)
+                round_number = len(requests)
+                if round_number == 1:
+                    call = SimpleNamespace(
+                        id="bad-json",
+                        function=SimpleNamespace(
+                            name="mark_events_read",
+                            arguments='{"event_ids":[',
+                        ),
+                    )
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                        content="", tool_calls=[call],
+                    ))])
+                if round_number == 2:
+                    # The malformed call must not have reached run_tool.
+                    self.db.refresh(event)
+                    self.assertIsNone(event.groq_read_at)
+                    call = SimpleNamespace(
+                        id="valid-json",
+                        function=SimpleNamespace(
+                            name="mark_events_read",
+                            arguments=json.dumps({"event_ids": [event.id]}),
+                        ),
+                    )
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                        content="", tool_calls=[call],
+                    ))])
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="처리를 완료했습니다.", tool_calls=[],
+                ))])
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=4,
+                autonomous_research=False,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.db.refresh(event)
+        self.assertIsNotNone(event.groq_read_at)
+        recovery_tools = {
+            item["function"]["name"] for item in requests[1].get("tools", [])
+        }
+        self.assertEqual(recovery_tools, {"mark_events_read"})
+        malformed_step = (
+            self.db.query(AgentRunStep)
+            .filter(AgentRunStep.tool == "mark_events_read", AgentRunStep.outcome == "error")
+            .order_by(AgentRunStep.id.asc())
+            .first()
+        )
+        self.assertIsNotNone(malformed_step)
+        detail = json.loads(malformed_step.detail)
+        self.assertEqual(detail["result"]["error"], "malformed_tool_arguments")
+        self.assertTrue(detail["result"]["signature"])
+
     def test_exhausted_image_target_rotates_when_model_tries_next_target(self) -> None:
         mission = type("Mission", (), {"kind": "quality_images"})()
         work = type("Work", (), {"place_id": 103})()
@@ -1175,6 +1254,8 @@ class AgentCityScopeTests(unittest.TestCase):
                 "category": "tourist",
                 "lat": 41.793,
                 "lng": 123.449,
+                "coordinate_source": "official_detail",
+                "coordinate_source_url": "https://example.org/official",
                 "evidence": "공식 박물관 안내와 좌표를 확인했습니다.",
                 "source_urls": ["https://example.org/official"],
                 "confidence": 0.9,
@@ -1226,6 +1307,8 @@ class AgentCityScopeTests(unittest.TestCase):
                 "category": "tourist",
                 "lat": 41.85,
                 "lng": 123.43,
+                "coordinate_source": "official_detail",
+                "coordinate_source_url": "https://example.org/beiling",
                 "evidence": "공식 안내와 위치 자료를 교차 확인했습니다.",
                 "source_urls": ["https://example.org/beiling"],
                 "confidence": 0.9,
@@ -1263,6 +1346,8 @@ class AgentCityScopeTests(unittest.TestCase):
             "category": "tourist",
             "lat": 41.85,
             "lng": 123.43,
+            "coordinate_source": "official_detail",
+            "coordinate_source_url": "https://example.org/beiling",
             "evidence": "공식 안내와 위치 자료를 교차 확인했습니다.",
             "source_urls": ["https://example.org/beiling"],
             "confidence": 0.9,
@@ -1656,6 +1741,7 @@ class AgentCityScopeTests(unittest.TestCase):
                 "category": "tourist",
                 "lat": 41.793,
                 "lng": 123.449,
+                "coordinate_source": "manual",
             },
             city_id=2,
             approved=True,

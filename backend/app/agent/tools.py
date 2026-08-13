@@ -19,6 +19,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from app import storage
 from app.config import settings
+from app.coordinate_attestation import issue_coordinate_attestation, trusted_coordinate_evidence
+from app.db_lock import transaction_lock
 
 from app.events import (
     diff_marker_fields,
@@ -28,9 +30,12 @@ from app.events import (
     marker_field_snapshot,
     summary_for_changes,
 )
-from app.geocode import search_address
+from app.geocode import parse_viewbox, search_address
 from app.gcj02 import gcj02_to_wgs84
 from app.knowledge import list_knowledge, upsert_knowledge
+from app.place_identity import PlaceIdentityInput, same_place_candidate
+from app.place_integrity import assess_new_place
+from app.search_providers import search_brave_places
 from app.messages import (
     list_open_appeals,
     mark_appeals_read,
@@ -513,6 +518,11 @@ TOOLS: list[dict[str, Any]] = [
                         "enum": ["history", "food", "market_night", "neighborhood", "nature", "shopping", "rest", "practical", "general"],
                         "description": "이틀 여행에서 이 장소가 채우는 역할. 박물관은 history, 식당은 food처럼 실제 목적 기준",
                     },
+                    "source_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "replace_description의 대상 장소를 확인한, 이번 실행에서 실제로 읽은 URL",
+                    },
                 },
                 "required": ["place_id", "expected_title"],
             },
@@ -785,7 +795,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "웹 검색(DuckDuckGo). 각 결과에 seen(이미 열람한 페이지 여부)이 붙고, "
+                "다중 웹 검색(Yahoo·Yandex, 설정 시 Brave 구조화 장소 검색). "
+                "place_candidates는 주소·좌표가 있는 발견 후보이며 storage_allowed=false이면 "
+                "이름·주소를 다른 공개 페이지와 geocode_place로 교차 검증한 뒤에만 저장한다. "
+                "각 웹 결과에 seen(이미 열람한 페이지 여부)이 붙고, "
                 "검색어·시각은 자동으로 이력에 기록된다. "
                 "past_searches로 같은 검색어의 과거 조사 횟수를 알려주니, "
                 "이미 여러 번 조사한 검색어보다 새 키워드를 우선할 것. "
@@ -905,7 +918,8 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "verify_place",
             "description": (
-                "장소 재검증 결과를 기록한다(last_verified_at 갱신 → 재검증 목록에서 제외). "
+                "장소 재검증 결과를 기록한다. valid/closed/moved는 last_verified_at을 갱신하고, "
+                "uncertain은 확인 실패 상태로 남겨 다음 조사에서 다시 선택되게 한다. "
                 "status: valid(영업·존재 확인) | closed(폐업·소멸 추정) | moved(같은 지점의 이전 확인) "
                 "| uncertain(판단 불가). "
                 "주의 — moved로 판정하기 전에 반드시 한 번 더 검토: 웹에서 찾은 다른 주소가 "
@@ -1139,21 +1153,43 @@ def _matching_existing_place(
     title: str,
     lat: float,
     lng: float,
+    chain_name: str = "",
+    branch_name: str = "",
+    address: str = "",
     max_distance_m: float = 800.0,
 ) -> Optional[Marker]:
-    key = _candidate_title_key(title)
-    if len(key) < 4:
+    city = db.get(City, city_id)
+    if city is None or len(_candidate_title_key(title)) < 4:
         return None
+    incoming = PlaceIdentityInput(
+        city=city.name_local or city.slug,
+        title=title,
+        chain_name=chain_name,
+        branch_name=branch_name,
+        address=address,
+        lat=lat,
+        lng=lng,
+    )
     rows = db.query(Marker).filter(
         Marker.city_id == city_id,
         Marker.shape == MarkerShape.point,
         Marker.merged_into_id.is_(None),
     ).all()
     for row in rows:
-        row_key = _candidate_title_key(row.title)
-        if len(row_key) < 4 or not (key in row_key or row_key in key):
-            continue
-        if _haversine_m(lat, lng, row.lat, row.lng) <= max_distance_m:
+        row_chain = row.chain.name_local if row.chain is not None else ""
+        decision = same_place_candidate(
+            incoming,
+            PlaceIdentityInput(
+                city=city.name_local or city.slug,
+                title=row.title,
+                chain_name=row_chain,
+                branch_name=row.branch_name or "",
+                address=row.description or "",
+                lat=row.lat,
+                lng=row.lng,
+            ),
+        )
+        if decision.same and (decision.distance_m is None or decision.distance_m <= max_distance_m):
             return row
     return None
 
@@ -1221,6 +1257,9 @@ def _pending_proposal(
     confidence: float,
     place_id: Optional[int] = None,
 ) -> dict[str, Any]:
+    # Different payload wording can still describe the same branch, so lock the
+    # whole city/action identity check rather than only the final payload hash.
+    transaction_lock(db, f"agent-proposal:{city_id}:{action}")
     try:
         existing_place = _matching_existing_place(
             db,
@@ -1228,6 +1267,9 @@ def _pending_proposal(
             title=title,
             lat=float(payload["lat"]),
             lng=float(payload["lng"]),
+            chain_name=str(payload.get("chain_name_local") or ""),
+            branch_name=str(payload.get("branch_name") or ""),
+            address=str(payload.get("address") or payload.get("description") or ""),
         )
     except (KeyError, TypeError, ValueError):
         existing_place = None
@@ -1256,16 +1298,55 @@ def _pending_proposal(
         .first()
     )
     if existing is None:
-        title_key = _candidate_title_key(title)
         same_action = db.query(AgentProposal).filter(
             AgentProposal.city_id == city_id,
             AgentProposal.action == action,
             AgentProposal.status == "pending",
         ).all()
-        existing = next(
-            (row for row in same_action if _candidate_title_key(row.title) == title_key),
-            None,
+        city = db.get(City, city_id)
+        incoming = PlaceIdentityInput(
+            city=(city.name_local or city.slug) if city else str(city_id),
+            title=title,
+            chain_name=str(payload.get("chain_name_local") or ""),
+            branch_name=str(payload.get("branch_name") or ""),
+            address=str(payload.get("address") or payload.get("description") or ""),
+            lat=payload.get("lat"),
+            lng=payload.get("lng"),
         )
+        for candidate in same_action:
+            try:
+                candidate_payload = json.loads(candidate.payload or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            decision = same_place_candidate(
+                incoming,
+                PlaceIdentityInput(
+                    city=(city.name_local or city.slug) if city else str(city_id),
+                    title=candidate.title,
+                    chain_name=str(candidate_payload.get("chain_name_local") or ""),
+                    branch_name=str(candidate_payload.get("branch_name") or ""),
+                    address=str(candidate_payload.get("address") or candidate_payload.get("description") or ""),
+                    lat=candidate_payload.get("lat"),
+                    lng=candidate_payload.get("lng"),
+                ),
+            )
+            same_large_feature = False
+            if (
+                str(payload.get("category") or "") in {"tourist", "transport"}
+                and _candidate_title_key(candidate.title) == _candidate_title_key(title)
+            ):
+                try:
+                    same_large_feature = _haversine_m(
+                        float(payload["lat"]),
+                        float(payload["lng"]),
+                        float(candidate_payload["lat"]),
+                        float(candidate_payload["lng"]),
+                    ) <= 1_500
+                except (KeyError, TypeError, ValueError):
+                    same_large_feature = False
+            if decision.same or same_large_feature:
+                existing = candidate
+                break
     if existing:
         completed_tasks = _complete_matching_proposal_tasks(
             db, city_id=city_id, proposal_title=existing.title, proposal_id=existing.id
@@ -2138,6 +2219,40 @@ def run_tool(
                         "잘못 덮어쓰지 않도록 대상 이름을 본문에 명시하고 다시 확인하세요."
                     ),
                 }
+            requested_sources = {
+                _normalize_evidence_url(str(url))
+                for url in (args.get("source_urls") or [])
+                if _normalize_evidence_url(str(url))
+            }
+            validated_sources = {
+                _normalize_evidence_url(str(url))
+                for url in (args.get("_validated_source_urls") or [])
+                if _normalize_evidence_url(str(url))
+            }
+            if not requested_sources or not requested_sources.issubset(validated_sources):
+                return {
+                    "error": "description_source_not_validated",
+                    "detail": (
+                        "설명을 교체하려면 이번 실행에서 fetch_page로 읽은 대상 장소 출처를 "
+                        "source_urls에 넣어야 합니다."
+                    ),
+                }
+            visits = db.query(AgentWebVisit).filter(
+                AgentWebVisit.city_id == city_id,
+            ).all()
+            matching_visits = [
+                visit for visit in visits
+                if _normalize_evidence_url(visit.url) in requested_sources
+                and _source_mentions_place(m, visit.title, visit.url)
+            ]
+            if not matching_visits:
+                return {
+                    "error": "description_source_place_mismatch",
+                    "detail": (
+                        "읽은 출처의 제목·URL에서 현재 장소명 또는 지점명을 확인할 수 없습니다. "
+                        "다른 지점의 설명을 덮어쓰지 마세요."
+                    ),
+                }
             cleaned = "\n".join(
                 line for line in replace_description.splitlines()
                 if not line.strip().startswith("[이전 제목 보존]")
@@ -2191,6 +2306,10 @@ def run_tool(
         return {"ok": True, "changed": changed}
 
     if name in {"create_place", "propose_place"}:
+        if name == "create_place" and approved:
+            # Serialize duplicate-check + insert for administrator approvals and
+            # any approved replay of the same city's place identity.
+            transaction_lock(db, f"approved-place-create:{city_id}")
         title = str(args.get("title") or "추천 장소")[:200]
         desc = str(args.get("description") or "")[:2000]
         if not _has_hangul(title):
@@ -2241,20 +2360,79 @@ def run_tool(
                     "confidence": max(0.0, min(float(raw.get("confidence") or 0.5), 1.0)),
                 }
             )
+        coordinate_evidence = (
+            dict(args.get("_coordinate_evidence") or {})
+            if isinstance(args.get("_coordinate_evidence"), dict)
+            else None
+        )
+        stored_attestation = args.get("_integrity_attestation")
+        if coordinate_evidence is None and approved and isinstance(stored_attestation, dict):
+            try:
+                attestation_version = int(stored_attestation.get("version") or 0)
+            except (TypeError, ValueError):
+                attestation_version = 999
+            signed_candidate = {
+                **args,
+                "coordinate_attestation": stored_attestation.get("coordinate_attestation"),
+            }
+            trusted_evidence = trusted_coordinate_evidence(signed_candidate)
+            if attestation_version >= 2 and trusted_evidence is None:
+                return {
+                    "error": "proposal_integrity_attestation_invalid",
+                    "detail": "제안 이후 좌표 근거가 변경되었거나 서명을 확인할 수 없어 승인할 수 없습니다.",
+                }
+            if trusted_evidence is not None:
+                # Approval never trusts the old pass/fail flag. It re-runs
+                # current rules against this signed server observation.
+                coordinate_evidence = trusted_evidence
+        coordinate_lat = args.get("lat")
+        coordinate_lng = args.get("lng")
+        if coordinate_evidence is not None:
+            # The model may select an observation, but it cannot rewrite the
+            # observation's location or provenance.
+            coordinate_lat = coordinate_evidence.get("lat", coordinate_lat)
+            coordinate_lng = coordinate_evidence.get("lng", coordinate_lng)
         payload = {
             "title": title,
             "description": desc,
+            "address": str(args.get("address") or "")[:300],
             "category": cat.value,
             "travel_role": str(args.get("travel_role") or "general")[:30],
-            "lat": float(args["lat"]),
-            "lng": float(args["lng"]),
+            "lat": float(coordinate_lat),
+            "lng": float(coordinate_lng),
             "context": str(args.get("context") or "")[:8000],
-            "coordinate_source": str(args.get("coordinate_source") or "agent_research")[:50],
-            "coordinate_external_id": str(args.get("coordinate_external_id") or "")[:200],
-            "coordinate_query": str(args.get("coordinate_query") or title)[:300],
-            "coordinate_source_url": str(args.get("coordinate_source_url") or "")[:1000],
+            "coordinate_source": str(
+                (coordinate_evidence or {}).get("source")
+                or args.get("coordinate_source")
+                or "agent_research"
+            )[:50],
+            "coordinate_external_id": str(
+                (coordinate_evidence or {}).get("external_id")
+                or args.get("coordinate_external_id")
+                or ""
+            )[:200],
+            "coordinate_query": str(
+                (coordinate_evidence or {}).get("display_name")
+                or (coordinate_evidence or {}).get("title")
+                or args.get("coordinate_query")
+                or title
+            )[:300],
+            "coordinate_source_url": str(
+                (coordinate_evidence or {}).get("source_url")
+                or args.get("coordinate_source_url")
+                or ""
+            )[:1000],
             "coordinate_confidence": max(
-                0.0, min(float(args.get("coordinate_confidence") or args.get("confidence") or 0.5), 1.0)
+                0.0,
+                min(
+                    float(
+                        (coordinate_evidence or {}).get("confidence")
+                        or args.get("coordinate_confidence")
+                        or args.get("confidence")
+                        or 0.5
+                    ),
+                    1.0,
+                ),
             ),
             "zone_id": int(args["zone_id"]) if args.get("zone_id") is not None else None,
             "chain_name_local": str(args.get("chain_name_local") or "").strip()[:160],
@@ -2262,6 +2440,75 @@ def run_tool(
             "branch_name": str(args.get("branch_name") or "").strip()[:120],
             "insights": insights_payload,
         }
+        if name == "propose_place":
+            existing_place = _matching_existing_place(
+                db,
+                city_id=city_id,
+                title=title,
+                lat=payload["lat"],
+                lng=payload["lng"],
+                chain_name=payload["chain_name_local"],
+                branch_name=payload["branch_name"],
+                address=payload["address"] or payload["description"],
+            )
+            if existing_place is not None:
+                return {
+                    "ok": True,
+                    "proposal_created": False,
+                    "proposal_id": None,
+                    "duplicate": True,
+                    "existing_place_id": existing_place.id,
+                }
+        strict_integrity = (
+            name == "propose_place"
+            or (name == "create_place" and approved)
+            or bool(args.get("_integrity_attestation"))
+        )
+        if strict_integrity:
+            city = db.get(City, city_id)
+            anchors = db.query(Marker).filter(
+                Marker.city_id == city_id,
+                Marker.shape == MarkerShape.point,
+                Marker.category.in_([
+                    MarkerCategory.tourist,
+                    MarkerCategory.shopping,
+                    MarkerCategory.transport,
+                ]),
+                Marker.merged_into_id.is_(None),
+            ).all()
+            integrity = assess_new_place(
+                payload,
+                city_viewbox=city.search_viewbox if city is not None else "",
+                coordinate_evidence=coordinate_evidence,
+                anchors=anchors,
+            )
+            if not integrity.ok:
+                return {
+                    "error": "place_integrity_failed",
+                    "detail": integrity.error,
+                    "integrity_errors": integrity.details.get("errors", []),
+                    "integrity": integrity.details,
+                }
+            signed_coordinate = (
+                issue_coordinate_attestation(payload, coordinate_evidence).get("coordinate_attestation")
+                if coordinate_evidence is not None
+                else None
+            )
+            payload["_integrity_attestation"] = {
+                "version": 2,
+                "warnings": list(integrity.warnings),
+                "details": integrity.details,
+                "coordinate_evidence": {
+                    field: coordinate_evidence.get(field)
+                    for field in (
+                        "title", "display_name", "branch_name", "address",
+                        "lat", "lng", "source", "source_url", "external_id",
+                        "confidence", "storage_allowed",
+                    )
+                    if coordinate_evidence is not None and field in coordinate_evidence
+                } if coordinate_evidence is not None else None,
+                "coordinate_attestation": signed_coordinate,
+            }
         if not settings.agent_allow_auto_create and not approved:
             source_urls = [str(u) for u in (args.get("source_urls") or []) if str(u).strip()]
             evidence = str(args.get("evidence") or "").strip()
@@ -2275,6 +2522,27 @@ def run_tool(
                     "error": "insights_required",
                     "detail": "신규 장소 제안에는 출처가 있는 구조화 정보가 2건 이상 필요합니다.",
                 }
+            validated_urls = {
+                _normalize_evidence_url(str(url))
+                for url in (args.get("_validated_source_urls") or [])
+                if _normalize_evidence_url(str(url))
+            }
+            if "_validated_source_urls" in args:
+                requested_urls = {
+                    _normalize_evidence_url(url)
+                    for url in source_urls
+                    if _normalize_evidence_url(url)
+                }
+                insight_urls = {
+                    _normalize_evidence_url(str(item.get("source_url") or ""))
+                    for item in insights_payload
+                    if _normalize_evidence_url(str(item.get("source_url") or ""))
+                }
+                if (requested_urls | insight_urls) - validated_urls:
+                    return {
+                        "error": "proposal_source_not_validated",
+                        "detail": "장소 제안의 사실 출처는 이번 실행에서 유효한 본문을 읽은 URL이어야 합니다.",
+                    }
             return _pending_proposal(
                 db,
                 city_id=city_id,
@@ -2291,6 +2559,9 @@ def run_tool(
             title=title,
             lat=payload["lat"],
             lng=payload["lng"],
+            chain_name=payload["chain_name_local"],
+            branch_name=payload["branch_name"],
+            address=payload["address"] or payload["description"],
         )
         if existing_place is not None:
             return {
@@ -3127,6 +3398,21 @@ def run_tool(
         city = db.query(City).filter(City.id == city_id, City.status == "active").first()
         if city is None:
             return {"results": [], "error": f"unknown city_id: {city_id}"}
+        local_candidates = [
+            {
+                "id": marker.id,
+                "title": marker.title,
+                "description": marker.description or "",
+                "lat": marker.lat,
+                "lng": marker.lng,
+                "type": marker.category.value,
+            }
+            for marker in db.query(Marker).filter(
+                Marker.city_id == city_id,
+                Marker.shape == MarkerShape.point,
+                Marker.merged_into_id.is_(None),
+            ).all()
+        ]
         try:
             hits = search_address(
                 query,
@@ -3134,6 +3420,7 @@ def run_tool(
                 viewbox=city.search_viewbox,
                 city_name=city.name_local,
                 city_context=city.search_context,
+                local_candidates=local_candidates,
                 arcgis_api_key=settings.arcgis_api_key,
             )
         except Exception as exc:
@@ -3145,6 +3432,47 @@ def run_tool(
         if not query:
             return {"results": []}
         max_results = max(1, min(int(args.get("max_results") or 8), 15))
+        city = db.get(City, city_id)
+        place_candidates: list[dict[str, Any]] = []
+        provider_attempts: list[dict[str, Any]] = []
+        if settings.brave_place_enabled and settings.brave_search_api_key and city is not None:
+            bounds = parse_viewbox(city.search_viewbox)
+            try:
+                brave_result = search_brave_places(
+                    api_key=settings.brave_search_api_key,
+                    query=query,
+                    latitude=city.center_lat,
+                    longitude=city.center_lng,
+                    count=max_results,
+                    city_bounds=(bounds.south, bounds.west, bounds.north, bounds.east) if bounds else None,
+                    storage_allowed=settings.brave_search_storage_rights,
+                )
+            except Exception as exc:  # noqa: BLE001 - optional provider must not break text search
+                brave_result = {
+                    "status": "error",
+                    "error": "provider_exception",
+                    "detail": str(exc)[:180],
+                    "results": [],
+                }
+            place_candidates = list(brave_result.get("results") or [])
+            provider_attempts.append({
+                "provider": "brave_place",
+                "status": brave_result.get("status"),
+                "error": brave_result.get("error"),
+                "http_status": brave_result.get("http_status"),
+                "result_count": len(place_candidates),
+                "outside_city_count": int(brave_result.get("outside_city_count") or 0),
+                "retries": int(brave_result.get("retries") or 0),
+            })
+        elif settings.brave_place_enabled:
+            provider_attempts.append({
+                "provider": "brave_place",
+                "status": "skipped_no_key",
+                "result_count": 0,
+            })
+        results: list[dict[str, Any]] = []
+        search_backends: list[str] = []
+        backend_errors: list[str] = []
         try:
             try:
                 from ddgs import DDGS
@@ -3155,10 +3483,7 @@ def run_tool(
             # discard otherwise good results when the last engine times out. Merge
             # two bounded engines instead: Yahoo is fast for Chinese text and
             # Yandex often exposes Chinese POI detail pages Yahoo omits.
-            results: list[dict[str, Any]] = []
-            search_backends: list[str] = []
             backend_batches: list[list[dict[str, Any]]] = []
-            backend_errors: list[str] = []
             with DDGS() as ddgs:
                 for backend in ("yahoo", "yandex"):
                     try:
@@ -3189,25 +3514,35 @@ def run_tool(
                         break
                 if len(results) >= raw_limit:
                     break
-            if not results:
+            if not results and not place_candidates:
                 raise RuntimeError("; ".join(backend_errors) or "no search results")
         except Exception as exc:  # noqa: BLE001
-            db.add(
-                AgentSearchLog(
-                    query=query[:300],
-                    city_id=city_id,
-                    results_count=0,
-                    new_count=0,
+            if place_candidates:
+                backend_errors.append(f"text_search: {exc}")
+                results = []
+                search_backends = []
+            else:
+                db.add(
+                    AgentSearchLog(
+                        query=query[:300],
+                        city_id=city_id,
+                        results_count=0,
+                        new_count=0,
+                    )
                 )
-            )
-            db.commit()
-            logger.warning(
-                "web_search failed city=%s query=%r error=%s",
-                city_id,
-                query[:120],
-                str(exc)[:240],
-            )
-            return {"error": str(exc), "results": []}
+                db.commit()
+                logger.warning(
+                    "web_search failed city=%s query=%r error=%s",
+                    city_id,
+                    query[:120],
+                    str(exc)[:240],
+                )
+                return {
+                    "error": str(exc),
+                    "results": [],
+                    "place_candidates": [],
+                    "provider_attempts": provider_attempts,
+                }
 
         raw_result_count = len(results)
         results, discarded_count = _filter_search_results(query, results, limit=max_results)
@@ -3264,7 +3599,10 @@ def run_tool(
         db.commit()
         return {
             "results": out,
+            "place_candidates": place_candidates,
+            "provider_attempts": provider_attempts,
             "backend": "+".join(search_backends),
+            "backend_errors": backend_errors,
             "raw_results_count": raw_result_count,
             "discarded_count": discarded_count,
             "past_searches": {
@@ -3625,7 +3963,8 @@ def run_tool(
                 }
         before = marker_field_snapshot(m)
         now = datetime.now(timezone.utc)
-        m.last_verified_at = now
+        if status != "uncertain":
+            m.last_verified_at = now
         tag = {
             "valid": "정보 유효",
             "closed": "폐업 추정",
@@ -3657,6 +3996,13 @@ def run_tool(
             actor="agent",
         )
         db.commit()
-        return {"ok": True, "status": status, "last_verified_at": now.isoformat()}
+        return {
+            "ok": True,
+            "status": status,
+            "last_verified_at": (
+                m.last_verified_at.isoformat() if m.last_verified_at else None
+            ),
+            "requires_retry": status == "uncertain",
+        }
 
     return {"error": f"unknown_tool:{name}"}

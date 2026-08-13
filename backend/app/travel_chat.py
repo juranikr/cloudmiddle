@@ -8,10 +8,20 @@ from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
 
+from app.agent.candidate_curator import curate_grounded_candidate, grounded_candidate_packets
+from app.agent.memory import observe_lesson
+from app.agent.model_recovery import allowed_tools_after_failure, make_recovery_plan
 from app.agent.tools import TOOLS, run_tool
 from app.config import settings
+from app.coordinate_attestation import (
+    issue_coordinate_attestation,
+    strip_untrusted_coordinate,
+    trusted_coordinate_evidence,
+)
+from app.db_lock import transaction_lock
 from app.geocode import parse_viewbox
 from app.models import (
+    AgentProposal,
     City,
     Marker,
     MarkerShape,
@@ -20,6 +30,8 @@ from app.models import (
     TravelPlan,
     TravelPlanItem,
 )
+from app.place_identity import PlaceIdentityInput, same_place_candidate
+from app.place_integrity import compare_china_addresses
 from app.personalization import build_user_travel_profile, profile_prompt_context
 from app.share_import import import_share_text, looks_like_share_text
 
@@ -126,6 +138,41 @@ class ChatIntent:
         return self
 
 
+CHAT_INTENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": [
+                "answer", "research", "write", "research_and_write", "continue",
+                "correct", "explain_failure",
+            ],
+        },
+        "scope": {
+            "type": "string",
+            "enum": ["single", "selected", "remaining", "all", "unspecified"],
+        },
+        "subject": {"type": "string"},
+        "goal": {"type": "string"},
+        "wants_research": {"type": "boolean"},
+        "wants_write": {"type": "boolean"},
+        "continuation": {"type": "boolean"},
+        "starts_new_work": {"type": "boolean"},
+        "requested_count": {"type": ["integer", "null"]},
+        "target_keys": {"type": "array", "items": {"type": "string"}},
+        "constraints": {"type": "array", "items": {"type": "string"}},
+        "exclusions": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": [
+        "action", "scope", "subject", "goal", "wants_research", "wants_write",
+        "continuation", "starts_new_work", "requested_count", "target_keys",
+        "constraints", "exclusions", "confidence",
+    ],
+}
+
+
 def _tool_subset(names: set[str]) -> list[dict[str, Any]]:
     return [tool for tool in TOOLS if tool.get("function", {}).get("name") in names]
 
@@ -159,6 +206,151 @@ def _work_state(work: TravelChatWork | None) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError):
         return {}
     return state if isinstance(state, dict) else {}
+
+
+def _append_chat_work_event(
+    db: Session,
+    work: TravelChatWork | None,
+    *,
+    bucket: str,
+    event: dict[str, Any],
+    phase: str | None = None,
+    next_action: str | None = None,
+) -> None:
+    """Persist bounded execution history before a later model call can fail."""
+
+    if work is None:
+        return
+    state = _work_state(work)
+    state["version"] = 2
+    values = [item for item in state.get(bucket, []) if isinstance(item, dict)]
+    values.append(event)
+    state[bucket] = values[-20:]
+    if event.get("proposal_id") is not None:
+        state["proposal_ids"] = sorted(set([
+            *[int(item) for item in state.get("proposal_ids", []) if str(item).isdigit()],
+            int(event["proposal_id"]),
+        ]))
+    if phase:
+        state["phase"] = phase
+    if next_action:
+        state["next_action"] = next_action
+    state["last_error"] = event if event.get("error") else state.get("last_error", {})
+    work.state = json.dumps(state, ensure_ascii=False, default=str)
+    db.commit()
+    db.refresh(work)
+
+
+def _reconcile_chat_work_proposals(db: Session, work: TravelChatWork | None) -> None:
+    """Repair work state when a proposal committed before a timeout/HTTP failure."""
+
+    if work is None:
+        return
+    state = _work_state(work)
+    candidates = [dict(item) for item in state.get("candidates", []) if isinstance(item, dict)]
+    if not candidates:
+        return
+    city = db.get(City, work.city_id)
+    city_name = (city.name_local or city.slug) if city is not None else str(work.city_id)
+    proposals = (
+        db.query(AgentProposal)
+        .filter(
+            AgentProposal.city_id == work.city_id,
+            AgentProposal.status.in_(["pending", "approved", "rejected"]),
+        )
+        .order_by(AgentProposal.id.desc())
+        .limit(200)
+        .all()
+    )
+    completed = set(str(item) for item in state.get("completed_keys", []))
+    proposal_ids = {int(item) for item in state.get("proposal_ids", []) if str(item).isdigit()}
+    changed = False
+    for candidate in candidates:
+        if str(candidate.get("status") or "") in {"proposed", "approved", "mapped", "duplicate"}:
+            continue
+        incoming = PlaceIdentityInput(
+            city=city_name,
+            title=str(candidate.get("title") or ""),
+            branch_name=str(candidate.get("branch_name") or ""),
+            address=str(candidate.get("address") or ""),
+            lat=candidate.get("lat"),
+            lng=candidate.get("lng"),
+        )
+        for proposal in proposals:
+            try:
+                payload = json.loads(proposal.payload or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            decision = same_place_candidate(
+                incoming,
+                PlaceIdentityInput(
+                    city=city_name,
+                    title=proposal.title,
+                    chain_name=str(payload.get("chain_name_local") or ""),
+                    branch_name=str(payload.get("branch_name") or ""),
+                    address=str(payload.get("address") or payload.get("description") or ""),
+                    lat=payload.get("lat"),
+                    lng=payload.get("lng"),
+                ),
+            )
+            if not decision.same:
+                continue
+            candidate["proposal_id"] = proposal.id
+            candidate["status"] = {
+                "pending": "proposed",
+                "approved": "approved",
+                "rejected": "dismissed",
+            }[proposal.status]
+            if proposal.result_place_id:
+                candidate["place_id"] = proposal.result_place_id
+            proposal_ids.add(proposal.id)
+            if proposal.status != "rejected":
+                completed.add(str(candidate.get("key") or ""))
+            changed = True
+            break
+    if not changed:
+        return
+    state["version"] = 2
+    state["candidates"] = candidates
+    state["completed_keys"] = sorted(item for item in completed if item)
+    state["proposal_ids"] = sorted(proposal_ids)
+    state["observations"] = [
+        *[item for item in state.get("observations", []) if isinstance(item, dict)],
+        {"event": "proposal_reconciled", "proposal_ids": sorted(proposal_ids)},
+    ][-20:]
+    terminal = {"proposed", "approved", "mapped", "duplicate", "dismissed"}
+    if bool(state.get("wants_write")) and candidates and all(
+        str(item.get("status") or "") in terminal for item in candidates
+    ):
+        work.status = "completed"
+        state["phase"] = "complete"
+        state["next_action"] = "done"
+    work.state = json.dumps(state, ensure_ascii=False, default=str)
+    db.commit()
+    db.refresh(work)
+
+
+def _compact_chat_messages(messages: list[dict[str, Any]], *, max_chars: int) -> list[dict[str, Any]]:
+    """Shrink old payloads while preserving every assistant/tool call pairing."""
+
+    total = sum(len(str(item.get("content") or "")) for item in messages)
+    if total <= max_chars:
+        return messages
+    compacted: list[dict[str, Any]] = []
+    recent_start = max(2, len(messages) - 10)
+    for index, original in enumerate(messages):
+        item = dict(original)
+        content = str(item.get("content") or "")
+        if index >= recent_start or index < 2:
+            limit = 12_000 if index < 2 else 7_000
+        elif item.get("role") == "tool":
+            limit = 1_600
+        else:
+            limit = 2_400
+        if len(content) > limit:
+            item["content"] = content[:limit] + "\n[이전 결과 압축]"
+        compacted.append(item)
+    return compacted
 
 
 def _active_chat_work(db: Session, *, user_id: int, city_id: int) -> TravelChatWork | None:
@@ -207,6 +399,11 @@ def _work_summary(work: TravelChatWork | None) -> dict[str, Any] | None:
         "constraints": list(state.get("constraints") or [])[:20],
         "exclusions": list(state.get("exclusions") or [])[:20],
         "failed": list(state.get("failed") or [])[-10:],
+        "attempts": list(state.get("attempts") or [])[-6:],
+        "observations": list(state.get("observations") or [])[-6:],
+        "recovery_history": list(state.get("recovery_history") or [])[-6:],
+        "proposal_ids": list(state.get("proposal_ids") or [])[-20:],
+        "last_error": state.get("last_error") or {},
     }
 
 
@@ -269,7 +466,14 @@ def _classify_chat_intent(
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
         ],
         "temperature": 0.0,
-        "response_format": {"type": "json_object"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "travel_chat_intent",
+                "strict": True,
+                "schema": CHAT_INTENT_SCHEMA,
+            },
+        },
     }
     if "gpt-oss" in model:
         request["extra_body"] = {"reasoning_effort": "low"}
@@ -305,6 +509,21 @@ def _classify_chat_intent(
     except Exception as exc:  # noqa: BLE001
         # Fail closed for mutations but keep ordinary conversation available.
         logger.warning("travel_chat intent classification failed error=%s", str(exc)[:300])
+        if active_work is not None:
+            state = _work_state(active_work)
+            return ChatIntent(
+                action="continue",
+                scope=active_work.scope,
+                subject=active_work.subject,
+                goal=active_work.goal or message,
+                wants_research=bool(state.get("wants_research")),
+                wants_write=bool(state.get("wants_write")),
+                continuation=True,
+                requested_count=active_work.requested_count,
+                constraints=list(state.get("constraints") or []),
+                exclusions=list(state.get("exclusions") or []),
+                confidence=0.35,
+            ).normalized()
         return ChatIntent(action="answer", goal=message, confidence=0.0)
 
 
@@ -413,9 +632,31 @@ def _ensure_chat_work(
         # still open. Keep that ledger untouched so the user can resume it
         # later instead of letting this answer overwrite its phase/candidates.
         return None
+    transaction_lock(db, f"travel-chat-work:{user_id}:{city_id}")
+    # Re-read after acquiring the cross-process lock. Two mobile retries may
+    # both have observed "no active work" before either request inserted it.
+    latest_active = (
+        db.query(TravelChatWork)
+        .filter(
+            TravelChatWork.user_id == user_id,
+            TravelChatWork.city_id == city_id,
+            TravelChatWork.status == "active",
+        )
+        .order_by(TravelChatWork.id.desc())
+        .with_for_update()
+        .first()
+    )
+    if latest_active is not None:
+        active_work = latest_active
     if active_work is not None and intent.starts_new_work and not intent.continuation:
-        active_work.status = "superseded"
-        active_work = None
+        same_request = (
+            active_work.action == intent.action
+            and active_work.subject == intent.subject
+            and _compact_candidate_text(active_work.goal) == _compact_candidate_text(intent.goal)
+        )
+        if not same_request:
+            active_work.status = "superseded"
+            active_work = None
     if active_work is None:
         active_work = TravelChatWork(
             user_id=user_id,
@@ -427,7 +668,7 @@ def _ensure_chat_work(
             goal=intent.goal,
             requested_count=intent.requested_count,
             state=json.dumps({
-                "version": 1,
+                "version": 2,
                 "phase": "understand",
                 "next_action": "research" if intent.wants_research else "write",
                 "wants_research": intent.wants_research,
@@ -437,6 +678,11 @@ def _ensure_chat_work(
                 "constraints": intent.constraints or [],
                 "exclusions": intent.exclusions or [],
                 "failed": [],
+                "attempts": [],
+                "observations": [],
+                "recovery_history": [],
+                "proposal_ids": [],
+                "last_error": {},
             }, ensure_ascii=False),
         )
         db.add(active_work)
@@ -603,6 +849,31 @@ def _merge_work_candidates(
             continue
         item = dict(raw)
         key = str(item.get("key") or _compact_candidate_text(str(item.get("title") or "")))
+        incoming_identity = PlaceIdentityInput(
+            city=str(work.city_id),
+            title=str(item.get("title") or ""),
+            branch_name=str(item.get("branch_name") or ""),
+            address=str(item.get("address") or ""),
+            lat=item.get("lat"),
+            lng=item.get("lng"),
+        )
+        matching_key = next((
+            existing_key
+            for existing_key, existing_item in existing.items()
+            if same_place_candidate(
+                incoming_identity,
+                PlaceIdentityInput(
+                    city=str(work.city_id),
+                    title=str(existing_item.get("title") or ""),
+                    branch_name=str(existing_item.get("branch_name") or ""),
+                    address=str(existing_item.get("address") or ""),
+                    lat=existing_item.get("lat"),
+                    lng=existing_item.get("lng"),
+                ),
+            ).same
+        ), None)
+        if matching_key is not None:
+            key = matching_key
         item["key"] = key
         previous = existing.get(key, {})
         merged = {**previous, **{field: value for field, value in item.items() if value not in (None, "", [])}}
@@ -614,6 +885,7 @@ def _merge_work_candidates(
     completed = set(str(item) for item in state.get("completed_keys", []))
     titles = [str(item) for item in (proposal_titles or [])]
     proposal_values = list(dict.fromkeys(int(item) for item in (proposal_ids or [])))
+    title_proposal_pairs = list(zip(titles, proposal_ids or []))
     for key, item in existing.items():
         title_key = _compact_candidate_text(str(item.get("title") or ""))
         if any(
@@ -621,8 +893,16 @@ def _merge_work_candidates(
             for title in titles
         ):
             item["status"] = "proposed"
-            if proposal_values:
-                item["proposal_id"] = proposal_values[min(len(completed), len(proposal_values) - 1)]
+            matching_id = next((
+                int(proposal_id)
+                for proposal_title, proposal_id in title_proposal_pairs
+                if title_key in _compact_candidate_text(proposal_title)
+                or _compact_candidate_text(proposal_title) in title_key
+            ), None)
+            if matching_id is not None:
+                item["proposal_id"] = matching_id
+            elif proposal_values:
+                item["proposal_id"] = proposal_values[0]
             completed.add(key)
     state["candidates"] = list(existing.values())[:30]
     state["completed_keys"] = sorted(completed)
@@ -701,6 +981,7 @@ def _resolve_shared_place_candidate(
         "coordinate_source_url": result.source_url,
         "coordinate_query": result.title,
     }
+    candidate = issue_coordinate_attestation(candidate)
     return candidate, trace
 
 
@@ -753,7 +1034,20 @@ def _coordinate_record_matches_proposal(
         str(proposal.get("branch_name") or ""),
     ]))
     coordinate_entity = str(coordinate.get("display_name") or "")
-    return _entity_text_matches(proposed_entity, coordinate_entity)
+    if not _entity_text_matches(proposed_entity, coordinate_entity):
+        return False
+    proposal_address = str(proposal.get("address") or "") or _extract_address(
+        str(proposal.get("description") or ""),
+        "\n".join(
+            str(item.get("content") or "")
+            for item in (proposal.get("insights") or [])
+            if isinstance(item, dict)
+        ),
+    )
+    coordinate_address = str(coordinate.get("address") or "")
+    if proposal_address and coordinate_address:
+        return compare_china_addresses(proposal_address, coordinate_address).ok
+    return True
 
 
 def _candidate_title_from_page(value: str) -> str:
@@ -834,23 +1128,25 @@ def _extract_grounded_candidates(
 ) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
 
-    def add_candidate(title: str, url: str, text: str = "", quality: float = 0.0) -> None:
+    def add_candidate(
+        title: str,
+        url: str,
+        text: str = "",
+        quality: float = 0.0,
+        *,
+        require_answer_mention: bool = True,
+    ) -> None:
         clean_title = _candidate_title_from_page(title)
-        if not clean_title or not _candidate_matches_answer(clean_title, answer):
+        if not clean_title or (
+            require_answer_mention and not _candidate_matches_answer(clean_title, answer)
+        ):
             return
         key_text = _compact_candidate_text(clean_title)
         if len(key_text) < 4:
             return
-        # Collapse SEO/title variants of the same business by a stable shared core.
-        existing_key = next(
-            (
-                key for key in grouped
-                if key in key_text or key_text in key or (
-                    len(key) >= 6 and len(key_text) >= 6 and key[:6] == key_text[:6]
-                )
-            ),
-            key_text,
-        )
+        # Never merge branches by a 4/6-character brand prefix. Exact variants
+        # can be reconciled later with branch/address/coordinate evidence.
+        existing_key = key_text
         row = grouped.setdefault(existing_key, {
             "title": clean_title,
             "address": "",
@@ -883,30 +1179,57 @@ def _extract_grounded_candidates(
                     float(hit.get("quality") or 0),
                 )
         elif name == "fetch_page":
+            coordinate_rows = result.get("coordinate_candidates") or []
             add_candidate(
                 str(result.get("title") or ""),
                 str(result.get("url") or item.get("args", {}).get("url") or ""),
                 str(result.get("text") or ""),
                 0.85,
+                require_answer_mention=not bool(coordinate_rows),
             )
 
     candidates = list(grouped.values())
     if locked_candidate:
-        locked_key = _compact_candidate_text(str(locked_candidate.get("title") or ""))
-        matching = next(
-            (row for row in candidates if locked_key in _compact_candidate_text(str(row["title"]))
-             or _compact_candidate_text(str(row["title"])) in locked_key),
-            None,
+        safe_locked = strip_untrusted_coordinate(locked_candidate)
+        locked_title_key = _compact_candidate_text(str(safe_locked.get("title") or ""))
+        locked_has_branch_identity = bool(
+            str(safe_locked.get("branch_name") or "").strip()
+            or str(safe_locked.get("address") or "").strip()
         )
+        matching = None
+        for row in candidates:
+            observed_title_key = _compact_candidate_text(str(row.get("title") or ""))
+            decision = same_place_candidate(
+                PlaceIdentityInput(
+                    city="",
+                    title=str(safe_locked.get("title") or ""),
+                    branch_name=str(safe_locked.get("branch_name") or ""),
+                    address=str(safe_locked.get("address") or ""),
+                    lat=safe_locked.get("lat"),
+                    lng=safe_locked.get("lng"),
+                ),
+                PlaceIdentityInput(
+                    city="",
+                    title=str(row.get("title") or ""),
+                    branch_name=str(row.get("branch_name") or ""),
+                    address=str(row.get("address") or ""),
+                    lat=row.get("lat"),
+                    lng=row.get("lng"),
+                ),
+            )
+            # A bare chain name is not enough to bind a newly observed branch.
+            if decision.same and (locked_has_branch_identity or locked_title_key == observed_title_key):
+                matching = row
+                break
         if matching is None:
-            matching = dict(locked_candidate)
+            matching = safe_locked
             matching["source_urls"] = list(matching.get("source_urls") or [])
             candidates.insert(0, matching)
         else:
-            matching["title"] = str(locked_candidate.get("title") or matching["title"])
-            matching["address"] = matching.get("address") or str(locked_candidate.get("address") or "")
+            matching["address"] = matching.get("address") or str(safe_locked.get("address") or "")
+            matching["branch_name"] = matching.get("branch_name") or str(safe_locked.get("branch_name") or "")
             matching["source_urls"] = list(dict.fromkeys([
-                *(locked_candidate.get("source_urls") or []),
+                *(safe_locked.get("source_urls") or []),
                 *(matching.get("source_urls") or []),
             ]))[:8]
         candidates = [matching]
@@ -921,7 +1244,12 @@ def _extract_grounded_candidates(
             result = item.get("result")
             if not isinstance(result, dict):
                 continue
-            query = str((item.get("args") or {}).get("query") or (item.get("args") or {}).get("url") or "")
+            query = str(
+                (item.get("args") or {}).get("query")
+                or result.get("title")
+                or (item.get("args") or {}).get("url")
+                or ""
+            )
             if title_key and title_key not in _compact_candidate_text(query) and (
                 not address or _compact_candidate_text(address) not in _compact_candidate_text(query)
             ):
@@ -939,6 +1267,27 @@ def _extract_grounded_candidates(
                         float(candidate.get("confidence") or 0),
                         float(point.get("confidence") or 0.75),
                     )
+                    candidate["coordinate_source"] = str(point.get("source") or "agent_research")
+                    candidate["coordinate_external_id"] = str(point.get("external_id") or "")
+                    candidate["coordinate_source_url"] = str(
+                        point.get("source_url") or result.get("url") or ""
+                    )
+                    candidate["coordinate_query"] = str(point.get("display_name") or query)[:300]
+                    attested = issue_coordinate_attestation(candidate, {
+                        "title": str(point.get("display_name") or candidate.get("title") or ""),
+                        "display_name": str(point.get("display_name") or candidate.get("title") or ""),
+                        "branch_name": str(point.get("branch_name") or candidate.get("branch_name") or ""),
+                        "address": str(point.get("address") or candidate.get("address") or ""),
+                        "lat": point.get("lat"),
+                        "lng": point.get("lng"),
+                        "source": str(point.get("source") or "agent_research"),
+                        "source_url": str(point.get("source_url") or result.get("url") or ""),
+                        "external_id": str(point.get("external_id") or ""),
+                        "confidence": float(point.get("confidence") or 0.75),
+                        "storage_allowed": point.get("storage_allowed") is not False,
+                    })
+                    candidate.clear()
+                    candidate.update(attested)
                 except (KeyError, TypeError, ValueError):
                     pass
                 break
@@ -1263,6 +1612,9 @@ def answer_travel_chat(
     client = Groq(api_key=settings.groq_api_key)
     model = settings.groq_chat_model or settings.groq_model or "openai/gpt-oss-20b"
     active_work = _active_chat_work(db, user_id=user_id, city_id=city_id)
+    _reconcile_chat_work_proposals(db, active_work)
+    if active_work is not None and active_work.status != "active":
+        active_work = None
     intent = _classify_chat_intent(
         client,
         model=model,
@@ -1451,9 +1803,11 @@ def answer_travel_chat(
     food_geo_candidates: list[dict[str, Any]] = []
     city_bounds = parse_viewbox(city.search_viewbox or "")
     for item in pending_work:
-        try:
-            lat, lng = float(item["lat"]), float(item["lng"])
-        except (KeyError, TypeError, ValueError):
+        evidence = trusted_coordinate_evidence(item)
+        if evidence is None:
+            continue
+        lat, lng = float(evidence["lat"]), float(evidence["lng"])
+        if city_bounds is not None and not city_bounds.contains(lat, lng):
             continue
         verified_coordinates.append((lat, lng))
         verified_coordinate_records.append({
@@ -1463,8 +1817,14 @@ def answer_travel_chat(
                 str(item.get("title") or ""),
                 str(item.get("address") or ""),
             ])),
-            "display_name": str(item.get("title") or ""),
-            "confidence": float(item.get("confidence") or 0.5),
+            "display_name": str(evidence.get("display_name") or evidence.get("title") or ""),
+            "address": str(evidence.get("address") or ""),
+            "branch_name": str(evidence.get("branch_name") or ""),
+            "source": str(evidence.get("source") or "agent_research"),
+            "source_url": str(evidence.get("source_url") or ""),
+            "external_id": str(evidence.get("external_id") or ""),
+            "confidence": float(evidence.get("confidence") or 0.5),
+            "storage_allowed": True,
         })
 
     def add_food_geo_candidate(query: str, results: list[dict[str, Any]]) -> None:
@@ -1474,26 +1834,44 @@ def answer_travel_chat(
         identity = re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", label.casefold())
         identity = identity.replace(city.name_local.casefold(), "").replace(city.name_ko.casefold(), "")
         identity = re.sub(r"^(?:20\d{2})+", "", identity)
-        # Detail-page titles contain long SEO suffixes. The first four Han/Hangul
-        # characters are stable enough to collapse the same branch from OSM,
-        # Ctrip and Qunar without merging unrelated nearby restaurants.
-        identity_prefix = identity[:4]
+        incoming = PlaceIdentityInput(
+            city=city.name_local,
+            title=label,
+            branch_name=str(results[0].get("branch_name") or ""),
+            address=str(results[0].get("address") or ""),
+            lat=results[0].get("lat"),
+            lng=results[0].get("lng"),
+        )
         for marker in markers:
-            marker_identity = re.sub(
-                r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+",
-                "",
-                str(marker.title or "").casefold(),
-            )
-            marker_identity = marker_identity.replace(city.name_local.casefold(), "").replace(
-                city.name_ko.casefold(), ""
-            )
-            if identity_prefix and marker_identity[:4] == identity_prefix:
+            if same_place_candidate(
+                incoming,
+                PlaceIdentityInput(
+                    city=city.name_local,
+                    title=marker.title,
+                    branch_name=marker.branch_name or "",
+                    address=marker.description or "",
+                    lat=marker.lat,
+                    lng=marker.lng,
+                ),
+            ).same:
                 return
-        if identity_prefix and any(
-            str(item.get("identity") or "")[:4] == identity_prefix
-            for item in food_geo_candidates
-        ):
-            return
+        for item in food_geo_candidates:
+            existing_results = item.get("results") or []
+            if not existing_results:
+                continue
+            existing = existing_results[0]
+            if same_place_candidate(
+                incoming,
+                PlaceIdentityInput(
+                    city=city.name_local,
+                    title=str(existing.get("display_name") or item.get("query") or ""),
+                    branch_name=str(existing.get("branch_name") or ""),
+                    address=str(existing.get("address") or ""),
+                    lat=existing.get("lat"),
+                    lng=existing.get("lng"),
+                ),
+            ).same:
+                return
         food_geo_candidates.append({
             "query": query[:300],
             "identity": identity,
@@ -1522,7 +1900,13 @@ def answer_travel_chat(
                 "lng": point[1],
                 "query": query,
                 "display_name": str(coordinate.get("display_name") or fetch_result.get("title") or query),
+                "address": str(coordinate.get("address") or ""),
+                "branch_name": str(coordinate.get("branch_name") or ""),
+                "source": str(coordinate.get("source") or "agent_research"),
+                "source_url": str(coordinate.get("source_url") or fetch_result.get("url") or ""),
+                "external_id": str(coordinate.get("external_id") or ""),
                 "confidence": float(coordinate.get("confidence") or 0.5),
+                "storage_allowed": True,
             })
             grounded.append({
                 "display_name": str(fetch_result.get("title") or query)[:300],
@@ -1616,6 +2000,109 @@ def answer_travel_chat(
             }.issubset(successful_candidate_keys)
         target_count = intent.requested_count or (2 if food_discovery else 1)
         return successful_write_count >= target_count
+
+    def record_write_success(args: dict[str, Any], result: dict[str, Any]) -> None:
+        """Update memory and commit the exact write before another model call."""
+
+        nonlocal write_succeeded, successful_write_count
+        if not result.get("ok"):
+            return
+        write_succeeded = True
+        successful_write_count += 1
+        serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
+        for target in brand_targets:
+            if any(alias.casefold() in serialized_args for alias in BRAND_ANSWER_ALIASES[target]):
+                successful_write_targets.add(target)
+        if result.get("proposal_id") is not None:
+            proposal_ids.append(int(result["proposal_id"]))
+        if result.get("existing_place_id") is not None:
+            existing_write_place_ids.append(int(result["existing_place_id"]))
+        proposal_title = str(args.get("title") or "").strip()
+        if proposal_title and proposal_title not in proposal_titles:
+            proposal_titles.append(proposal_title)
+        saved_candidate: dict[str, Any] | None = None
+        if proposal_title:
+            insight_text = "\n".join(
+                str(item.get("content") or "")
+                for item in (args.get("insights") or [])
+                if isinstance(item, dict)
+            )
+            proposal_address = str(args.get("address") or "").strip() or _extract_address(
+                str(args.get("description") or ""),
+                str(args.get("evidence") or ""),
+                insight_text,
+            )
+            proposal_key = hashlib.sha256(
+                (
+                    f"{_compact_candidate_text(proposal_title)}|"
+                    f"{_compact_candidate_text(proposal_address)}"
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            saved_candidate = {
+                "key": proposal_key,
+                "title": proposal_title,
+                "address": proposal_address,
+                "branch_name": str(args.get("branch_name") or ""),
+                "category": str(args.get("category") or "other"),
+                "source_urls": list(dict.fromkeys(
+                    str(url) for url in (args.get("source_urls") or []) if str(url)
+                ))[:8],
+                "lat": args.get("lat"),
+                "lng": args.get("lng"),
+                "coordinate_source": str(args.get("coordinate_source") or ""),
+                "coordinate_source_url": str(args.get("coordinate_source_url") or ""),
+                "coordinate_external_id": str(args.get("coordinate_external_id") or ""),
+                "confidence": float(args.get("confidence") or 0.5),
+                "status": "proposed" if result.get("proposal_id") is not None else "mapped",
+            }
+            if result.get("proposal_id") is not None:
+                saved_candidate["proposal_id"] = int(result["proposal_id"])
+            if result.get("existing_place_id") is not None:
+                saved_candidate["place_id"] = int(result["existing_place_id"])
+            successful_write_candidates.append(saved_candidate)
+        incoming = PlaceIdentityInput(
+            city=city.name_local,
+            title=proposal_title,
+            branch_name=str(args.get("branch_name") or ""),
+            address=str(args.get("address") or args.get("description") or ""),
+            lat=args.get("lat"),
+            lng=args.get("lng"),
+        )
+        for item in pending_work:
+            if same_place_candidate(
+                incoming,
+                PlaceIdentityInput(
+                    city=city.name_local,
+                    title=str(item.get("title") or ""),
+                    branch_name=str(item.get("branch_name") or ""),
+                    address=str(item.get("address") or ""),
+                    lat=item.get("lat"),
+                    lng=item.get("lng"),
+                ),
+            ).same:
+                successful_candidate_keys.add(str(item.get("key") or ""))
+        if saved_candidate is not None:
+            _merge_work_candidates(
+                active_work,
+                [saved_candidate],
+                proposal_ids=[int(result["proposal_id"])] if result.get("proposal_id") else [],
+                proposal_titles=[proposal_title],
+                phase="write",
+                next_action="write",
+            )
+        _append_chat_work_event(
+            db,
+            active_work,
+            bucket="observations",
+            event={
+                "event": "write_committed",
+                "title": proposal_title[:200],
+                "proposal_id": result.get("proposal_id"),
+                "existing_place_id": result.get("existing_place_id"),
+            },
+            phase="write",
+            next_action="done" if writes_complete() else "write",
+        )
 
     def complete(
         *,
@@ -1828,6 +2315,10 @@ def answer_travel_chat(
             })
 
     force_required = False
+    planning_failure_counts: dict[str, int] = {}
+    tool_failure_counts: dict[str, int] = {}
+    recovery_tool_names: set[str] | None = None
+    active_recovery: dict[str, Any] | None = None
     tool_round_limit = (
         14 if food_discovery and write_intent and not brand_targets
         else MAX_WRITE_TOOL_ROUNDS if write_intent
@@ -1942,23 +2433,125 @@ def answer_travel_chat(
                         "max_results만 사용한다."
                     ),
                 })
+        if recovery_tool_names is not None:
+            narrowed = set(round_tools) & recovery_tool_names
+            round_tools = narrowed or (recovery_tool_names & allowed)
+            if len(round_tools) == 1:
+                only_tool = next(iter(round_tools))
+                round_choice = {"type": "function", "function": {"name": only_tool}}
+            elif round_tools:
+                round_choice = "required"
+            messages.append({
+                "role": "system",
+                "content": (
+                    "직전 오류와 같은 출력을 반복하지 않는다. 현재 복구 단계에서 허용된 도구만 한 번 "
+                    f"정확히 실행한다: {sorted(round_tools)}. null인 선택 필드는 생략하고 JSON 스키마를 지킨다."
+                ),
+            })
+            recovery_tool_names = None
         try:
             response = complete(tool_names=round_tools, tool_choice=round_choice)
         except Exception as exc:  # noqa: BLE001
+            failure_text = str(exc)
+            initial_plan = make_recovery_plan(
+                exc,
+                attempt=1,
+                phase="write" if write_intent else "research",
+                available_tools=round_tools,
+                next_tool="propose_place" if write_intent and "propose_place" in round_tools else "",
+            )
+            failure_kind = initial_plan.failure_kind
+            attempt = planning_failure_counts.get(failure_kind, 0) + 1
+            planning_failure_counts[failure_kind] = attempt
+            plan = make_recovery_plan(
+                exc,
+                attempt=attempt,
+                phase="write" if write_intent else "research",
+                available_tools=round_tools,
+                next_tool="propose_place" if write_intent and "propose_place" in round_tools else "",
+            )
+            evidence_ref = f"chat-work:{active_work.id if active_work else 0}:round:{_round + 1}:recovery:{attempt}"
             logger.warning(
                 "travel_chat tool planning failed user=%s city=%s round=%s error=%s",
                 user_id,
                 city_id,
                 _round + 1,
-                str(exc)[:400],
+                failure_text[:400],
             )
             tool_results.append({
                 "name": "tool_planning",
                 "args": {"round": _round + 1},
-                "result": {"error": str(exc)[:300]},
+                "result": {
+                    "error": failure_kind,
+                    "detail": failure_text[:300],
+                    "recovery_mode": plan.mode,
+                    "next_tools": sorted(plan.allowed_tools),
+                },
             })
+            recovery_event = {
+                "error": failure_kind,
+                "attempt": attempt,
+                "mode": plan.mode,
+                "tools": sorted(plan.allowed_tools),
+                "evidence_ref": evidence_ref,
+            }
+            _append_chat_work_event(
+                db,
+                active_work,
+                bucket="recovery_history",
+                event=recovery_event,
+                phase="write" if write_intent else "research",
+                next_action="server_curate" if write_intent and attempt >= 2 else "retry_model",
+            )
+            observe_lesson(
+                db,
+                key=f"model_output_recovery:{failure_kind}:{plan.mode}",
+                city_id=None,
+                category="model_runtime",
+                trigger=f"대화 모델 출력 실패: {failure_kind}",
+                action=(
+                    f"{plan.mode}로 문맥과 도구를 축소하고, 반복되면 서버 후보 정제로 전환"
+                ),
+                expected_effect="파싱 가능한 출력 또는 검증 후보의 결정적 저장",
+                evidence_ref=evidence_ref,
+                applicability={"channels": ["chat", "batch"], "failure_kinds": [failure_kind]},
+                successful=False,
+            )
+            db.commit()
+            active_recovery = {**recovery_event, "plan": plan}
+            if plan.force_compaction:
+                messages = _compact_chat_messages(messages, max_chars=plan.max_context_chars)
+            recovery_tool_names = set(plan.allowed_tools)
             force_required = True
+            if attempt >= 2:
+                break
             continue
+        if active_recovery is not None:
+            plan = active_recovery["plan"]
+            observe_lesson(
+                db,
+                key=f"model_output_recovery:{active_recovery['error']}:{active_recovery['mode']}",
+                city_id=None,
+                category="model_runtime",
+                trigger=f"대화 모델 출력 실패: {active_recovery['error']}",
+                action=f"{active_recovery['mode']}로 문맥과 도구를 축소",
+                expected_effect="파싱 가능한 출력 또는 검증 후보의 결정적 저장",
+                evidence_ref=str(active_recovery["evidence_ref"]) + ":recovered",
+                applicability={"channels": ["chat", "batch"], "failure_kinds": [active_recovery["error"]]},
+                successful=True,
+            )
+            _append_chat_work_event(
+                db,
+                active_work,
+                bucket="recovery_history",
+                event={
+                    "event": "model_output_recovered",
+                    "error": active_recovery["error"],
+                    "mode": active_recovery["mode"],
+                },
+            )
+            db.commit()
+            active_recovery = None
         reply = response.choices[0].message
         calls = reply.tool_calls or []
         if not calls:
@@ -2005,25 +2598,76 @@ def answer_travel_chat(
                 write_attempted = True
             try:
                 args = json.loads(call.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
+                if not isinstance(args, dict):
+                    raise json.JSONDecodeError("tool arguments must be an object", str(args), 0)
+            except (json.JSONDecodeError, TypeError) as exc:
+                error_key = "malformed_tool_arguments"
+                attempt = tool_failure_counts.get(error_key, 0) + 1
+                tool_failure_counts[error_key] = attempt
+                result = {
+                    "error": error_key,
+                    "detail": "도구 인자가 올바른 JSON 객체가 아닙니다. 빈 인자로 실행하지 않고 다시 계획합니다.",
+                    "tool": name,
+                    "arguments_preview": str(call.function.arguments or "")[:240],
+                }
+                raw_signature = hashlib.sha256(
+                    str(call.function.arguments or "").encode("utf-8")
+                ).hexdigest()[:16]
+                seen_tool_calls.add(f"{name}:malformed:{raw_signature}")
+                tool_results.append({"name": name, "args": {}, "result": result})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+                recovery_tool_names = set(allowed_tools_after_failure(
+                    error_key,
+                    attempt=attempt,
+                    phase="write" if name in WRITE_TOOLS else "research",
+                    available_tools=allowed,
+                    last_tool=name,
+                    next_tool=name,
+                ))
+                _append_chat_work_event(
+                    db,
+                    active_work,
+                    bucket="attempts",
+                    event={
+                        "error": error_key,
+                        "tool": name,
+                        "attempt": attempt,
+                        "detail": str(exc)[:180],
+                    },
+                    next_action="retry_tool_schema",
+                )
+                continue
             if name == "web_search" and food_discovery:
                 business_name = _food_business_name(city, str(args.get("query") or ""))
                 if business_name and business_name not in food_business_names:
                     food_business_names.append(business_name)
             signature = f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
             if index >= MAX_TOOL_CALLS_PER_ROUND:
-                result: Any = {"error": "이번 답변의 조사 예산을 넘었습니다. 현재 결과로 답을 정리하세요."}
+                result: Any = {
+                    "error": "round_tool_budget_exhausted",
+                    "detail": "이번 답변의 조사 예산을 넘었습니다. 현재 결과로 답을 정리하세요.",
+                }
             elif signature in seen_tool_calls:
-                result = {"error": "이미 실행한 동일 도구 요청입니다. 반복하지 말고 현재 결과로 답하세요."}
+                result = {
+                    "error": "duplicate_tool_call",
+                    "detail": "이미 실행한 동일 도구 요청입니다. 반복하지 말고 현재 결과로 답하세요.",
+                }
             elif name not in allowed:
                 result = {"error": "이 대화에서 허용되지 않은 작업입니다"}
             else:
+                # Precondition failures are real attempts too. Remember the
+                # signature so the model must change evidence or arguments.
+                seen_tool_calls.add(signature)
                 unsupported_evidence: list[str] = []
                 unread_fact_sources: list[str] = []
                 missing_business_evidence = False
                 coordinate_mismatch = False
                 coordinate_target_unmatched = False
+                selected_coordinate_evidence: dict[str, Any] | None = None
                 snack_scope_invalid = False
                 snack_scope_check: dict[str, Any] | None = None
                 if name == "propose_place":
@@ -2118,11 +2762,36 @@ def answer_travel_chat(
                         try:
                             proposed_lat = float(args["lat"])
                             proposed_lng = float(args["lng"])
-                            coordinate_mismatch = min(
-                                ((proposed_lat - float(item["lat"])) * 111_000) ** 2
-                                + ((proposed_lng - float(item["lng"])) * 85_000) ** 2
-                                for item in relevant_coordinates
-                            ) ** 0.5 > 1_500
+                            selected_coordinate_evidence = min(
+                                relevant_coordinates,
+                                key=lambda item: (
+                                    ((proposed_lat - float(item["lat"])) * 111_000) ** 2
+                                    + ((proposed_lng - float(item["lng"])) * 85_000) ** 2
+                                ),
+                            )
+                            # Coordinates and provenance belong to the server
+                            # observation. The model only chooses the entity.
+                            args["lat"] = float(selected_coordinate_evidence["lat"])
+                            args["lng"] = float(selected_coordinate_evidence["lng"])
+                            args["coordinate_source"] = str(
+                                selected_coordinate_evidence.get("source") or "agent_research"
+                            )
+                            args["coordinate_external_id"] = str(
+                                selected_coordinate_evidence.get("external_id") or ""
+                            ) or None
+                            args["coordinate_source_url"] = str(
+                                selected_coordinate_evidence.get("source_url") or ""
+                            ) or None
+                            args["coordinate_query"] = str(
+                                selected_coordinate_evidence.get("display_name")
+                                or selected_coordinate_evidence.get("query")
+                                or args.get("title")
+                                or ""
+                            )[:300]
+                            args["coordinate_confidence"] = float(
+                                selected_coordinate_evidence.get("confidence") or 0.5
+                            )
+                            coordinate_mismatch = False
                         except (KeyError, TypeError, ValueError):
                             coordinate_mismatch = True
                 if snack_scope_invalid:
@@ -2172,8 +2841,19 @@ def answer_travel_chat(
                         "detail": "제안 좌표가 서버 지오코딩 후보와 1.5km 이상 다릅니다. 확인된 후보 좌표로 다시 호출하세요.",
                     }
                 else:
-                    seen_tool_calls.add(signature)
-                    result = run_tool(db, name, args, city_id=city_id)
+                    tool_args = args
+                    if name == "propose_place":
+                        tool_args = {
+                            **args,
+                            "_coordinate_evidence": selected_coordinate_evidence,
+                            "_validated_source_urls": sorted(fetched_source_urls),
+                        }
+                    elif name == "upsert_place_insights":
+                        tool_args = {
+                            **args,
+                            "_validated_source_urls": sorted(fetched_source_urls),
+                        }
+                    result = run_tool(db, name, tool_args, city_id=city_id)
                     if name == "web_search" and isinstance(result, dict):
                         result = dict(result)
                         result["auto_fetched_pages"] = fetch_food_evidence(result)
@@ -2200,7 +2880,13 @@ def answer_travel_chat(
                         "lng": coordinate[1],
                         "query": str(args.get("query") or ""),
                         "display_name": str(hit.get("display_name") or ""),
+                        "address": str(hit.get("address") or ""),
+                        "branch_name": str(hit.get("branch_name") or ""),
+                        "source": str(hit.get("source") or "agent_research"),
+                        "source_url": str(hit.get("source_url") or ""),
+                        "external_id": str(hit.get("external_id") or ""),
                         "confidence": float(hit.get("confidence") or 0.5),
+                        "storage_allowed": True,
                     })
                     grounded_hits.append(hit)
                 if grounded_hits:
@@ -2236,66 +2922,32 @@ def answer_travel_chat(
                             "fetched_pages": fetched_pages,
                         }
             if name in WRITE_TOOLS and isinstance(result, dict) and result.get("ok"):
-                write_succeeded = True
-                successful_write_count += 1
-                serialized_args = json.dumps(args, ensure_ascii=False, default=str).casefold()
-                for target in brand_targets:
-                    if any(
-                        alias.casefold() in serialized_args
-                        for alias in BRAND_ANSWER_ALIASES[target]
-                    ):
-                        successful_write_targets.add(target)
-                if result.get("proposal_id") is not None:
-                    proposal_ids.append(int(result["proposal_id"]))
-                if result.get("existing_place_id") is not None:
-                    existing_write_place_ids.append(int(result["existing_place_id"]))
-                proposal_title = str(args.get("title") or "").strip()
-                if proposal_title and proposal_title not in proposal_titles:
-                    proposal_titles.append(proposal_title)
-                if proposal_title:
-                    # Keep insight boundaries so address extraction cannot run
-                    # into the next tip/menu sentence.
-                    insight_text = "\n".join(
-                        str(item.get("content") or "")
-                        for item in (args.get("insights") or [])
-                        if isinstance(item, dict)
-                    )
-                    proposal_address = str(args.get("address") or "").strip() or _extract_address(
-                        str(args.get("description") or ""),
-                        str(args.get("evidence") or ""),
-                        insight_text,
-                    )
-                    proposal_key = hashlib.sha256(
-                        (
-                            f"{_compact_candidate_text(proposal_title)}|"
-                            f"{_compact_candidate_text(proposal_address)}"
-                        ).encode("utf-8")
-                    ).hexdigest()[:16]
-                    saved_candidate = {
-                        "key": proposal_key,
-                        "title": proposal_title,
-                        "address": proposal_address,
-                        "category": str(args.get("category") or "other"),
-                        "source_urls": list(dict.fromkeys(
-                            str(url) for url in (args.get("source_urls") or []) if str(url)
-                        ))[:8],
-                        "lat": args.get("lat"),
-                        "lng": args.get("lng"),
-                        "confidence": float(args.get("confidence") or 0.5),
-                        "status": "proposed" if result.get("proposal_id") is not None else "mapped",
-                    }
-                    if result.get("proposal_id") is not None:
-                        saved_candidate["proposal_id"] = int(result["proposal_id"])
-                    if result.get("existing_place_id") is not None:
-                        saved_candidate["place_id"] = int(result["existing_place_id"])
-                    successful_write_candidates.append(saved_candidate)
-                proposed_title_key = _compact_candidate_text(str(args.get("title") or ""))
-                for item in pending_work:
-                    item_title_key = _compact_candidate_text(str(item.get("title") or ""))
-                    if proposed_title_key and item_title_key and (
-                        proposed_title_key in item_title_key or item_title_key in proposed_title_key
-                    ):
-                        successful_candidate_keys.add(str(item.get("key") or ""))
+                record_write_success(args, result)
+            elif isinstance(result, dict) and result.get("error"):
+                error_key = str(result.get("error") or "tool_error")[:120]
+                attempt = tool_failure_counts.get(error_key, 0) + 1
+                tool_failure_counts[error_key] = attempt
+                routed = allowed_tools_after_failure(
+                    error_key,
+                    attempt=attempt,
+                    phase="write" if write_intent else "research",
+                    available_tools=allowed,
+                    last_tool=name,
+                )
+                if routed:
+                    recovery_tool_names = set(routed)
+                _append_chat_work_event(
+                    db,
+                    active_work,
+                    bucket="attempts",
+                    event={
+                        "error": error_key,
+                        "tool": name,
+                        "attempt": attempt,
+                        "next_tools": sorted(routed),
+                    },
+                    next_action="server_curate" if write_intent and attempt >= 2 else "retry_precondition",
+                )
             logger.info(
                 "travel_chat tool user=%s city=%s round=%s tool=%s ok=%s error=%s",
                 user_id,
@@ -2312,8 +2964,131 @@ def answer_travel_chat(
                     "content": json.dumps(result, ensure_ascii=False, default=str)[:7000],
                 }
             )
+        observed_candidates = _extract_grounded_candidates(
+            "",
+            tool_results,
+            message=resolved_message,
+            locked_candidate=locked_candidate,
+            subject=intent.subject,
+        )
+        if observed_candidates:
+            _merge_work_candidates(
+                active_work,
+                observed_candidates,
+                phase="write" if write_intent else "research",
+                next_action="write" if write_intent else "await_user",
+            )
+            _append_chat_work_event(
+                db,
+                active_work,
+                bucket="observations",
+                event={
+                    "event": "grounded_candidates_checkpointed",
+                    "count": len(observed_candidates),
+                    "keys": [str(item.get("key") or "") for item in observed_candidates[:8]],
+                },
+            )
         if write_intent and writes_complete():
             break
+
+    if write_intent and not writes_complete():
+        packets = grounded_candidate_packets(
+            tool_results,
+            city_name=city.name_local,
+            locked_candidates=pending_work,
+        )
+        for packet in packets:
+            if writes_complete():
+                break
+            incoming = PlaceIdentityInput(
+                city=city.name_local,
+                title=str(packet.get("title") or ""),
+                address=str(packet.get("address") or ""),
+                lat=packet.get("lat"),
+                lng=packet.get("lng"),
+            )
+            already_written = any(
+                same_place_candidate(
+                    incoming,
+                    PlaceIdentityInput(
+                        city=city.name_local,
+                        title=str(item.get("title") or ""),
+                        address=str(item.get("address") or ""),
+                        lat=item.get("lat"),
+                        lng=item.get("lng"),
+                    ),
+                ).same
+                for item in successful_write_candidates
+            )
+            if already_written:
+                continue
+            try:
+                curated = curate_grounded_candidate(
+                    client,
+                    model=model,
+                    city_name=city.name_local,
+                    user_goal=resolved_message,
+                    subject=intent.subject,
+                    packet=packet,
+                )
+            except Exception as exc:  # noqa: BLE001
+                curated = {
+                    "ok": False,
+                    "error": make_recovery_plan(
+                        exc,
+                        attempt=1,
+                        phase="write",
+                        available_tools={"propose_place"},
+                    ).failure_kind,
+                    "detail": str(exc)[:300],
+                }
+            tool_results.append({
+                "name": "curate_grounded_candidate",
+                "args": {
+                    "candidate_key": str(packet.get("candidate_key") or "")[:300],
+                    "title": str(packet.get("title") or "")[:200],
+                },
+                "result": {
+                    "ok": bool(curated.get("ok")),
+                    "error": str(curated.get("error") or ""),
+                    "detail": str(curated.get("detail") or "")[:300],
+                },
+            })
+            if not curated.get("ok"):
+                continue
+            args = dict(curated["args"])
+            args["_validated_source_urls"] = sorted(fetched_source_urls)
+            if snack_discovery:
+                snack_check = _classify_snack_fit(client, model=model, candidate=args)
+                tool_results.append({
+                    "name": "snack_scope_check",
+                    "args": {"title": str(args.get("title") or "")[:200]},
+                    "result": snack_check,
+                })
+                if not snack_check.get("allowed"):
+                    continue
+                args["consumption_mode"] = snack_check.get("consumption_mode")
+            write_attempted = True
+            result = run_tool(db, "propose_place", args, city_id=city_id)
+            tool_results.append({"name": "propose_place", "args": args, "result": result})
+            if isinstance(result, dict) and result.get("ok"):
+                record_write_success(args, result)
+                observe_lesson(
+                    db,
+                    key="chat_grounded_candidate_server_commit",
+                    city_id=city_id,
+                    category="workflow",
+                    trigger="검색·좌표 후보가 있지만 모델 도구 저장이 완료되지 않음",
+                    action="strict 구조화 출력 후 서버 좌표·출처를 잠가 propose_place 실행",
+                    expected_effect="유효 후보 발견 대비 승인 제안 전환율 향상",
+                    evidence_ref=(
+                        f"chat-work:{active_work.id if active_work else 0}:"
+                        f"proposal:{result.get('proposal_id') or result.get('existing_place_id') or 0}"
+                    ),
+                    applicability={"channels": ["chat"], "actions": ["research_and_write"]},
+                    successful=True,
+                )
+                db.commit()
 
     if not final_text:
         if write_intent:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from sqlalchemy.orm import Session, joinedload
 
 from app.agent.tools import TOOLS, is_useful_fetched_page, run_tool
+from app.agent.model_recovery import classify_failure, make_recovery_plan
 from app.config import settings
 from app.agent.memory import (
     checkpoint_after_tool,
@@ -45,6 +47,7 @@ from app.models import (
 )
 from app.personalization import city_personalization_brief
 from app.knowledge import normalize_knowledge_metadata
+from app.place_identity import PlaceIdentityInput, same_place_candidate
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
 목표: 미읽음 이력·이의신청·롤백·웹조사를 바탕으로 지도를 정리하고,
@@ -442,11 +445,8 @@ RECOVERY_TOOLS_BY_TASK = {
 
 
 def _model_output_failure_kind(detail: str) -> str:
-    normalized = (detail or "").casefold()
-    for kind, markers in MODEL_OUTPUT_FAILURE_MARKERS.items():
-        if any(marker in normalized for marker in markers):
-            return kind
-    return ""
+    kind = classify_failure(detail)
+    return kind if kind in MODEL_OUTPUT_FAILURE_MARKERS else ""
 
 
 def _filtered_tools(tool_names: list[str] | set[str] | None) -> list[dict[str, Any]]:
@@ -760,6 +760,41 @@ def _evidence_handoff_items(name: str, result: Any, new_keys: set[str]) -> list[
                     f"{item.get('image_url') or item.get('url')}"
                 )
     return [item[:700] for item in items if item.strip()]
+
+
+def _matching_coordinate_evidence(
+    args: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    city_name: str,
+) -> dict[str, Any] | None:
+    """Resolve a proposal to a coordinate record observed by this run."""
+
+    incoming = PlaceIdentityInput(
+        city=city_name,
+        title=str(args.get("title") or ""),
+        chain_name=str(args.get("chain_name_local") or ""),
+        branch_name=str(args.get("branch_name") or ""),
+        address=str(args.get("address") or args.get("description") or ""),
+        lat=args.get("lat"),
+        lng=args.get("lng"),
+    )
+    matches: list[tuple[float, dict[str, Any]]] = []
+    for record in records:
+        decision = same_place_candidate(
+            incoming,
+            PlaceIdentityInput(
+                city=city_name,
+                title=str(record.get("display_name") or record.get("title") or ""),
+                branch_name=str(record.get("branch_name") or ""),
+                address=str(record.get("address") or ""),
+                lat=record.get("lat"),
+                lng=record.get("lng"),
+            ),
+        )
+        if decision.same:
+            matches.append((decision.distance_m if decision.distance_m is not None else 10**9, record))
+    return dict(min(matches, key=lambda item: item[0])[1]) if matches else None
 
 
 def _run_outcome_status(*, unread_after: int, gaps: list[str], material_change_count: int) -> str:
@@ -1529,6 +1564,7 @@ def run_agent(
     }
     evidence_keys: set[str] = set()
     validated_source_urls: set[str] = set()
+    verified_coordinate_records: list[dict[str, Any]] = []
     material_changes: list[dict[str, Any]] = []
     repeated_calls = 0
     image_searches_by_place: dict[int, int] = {}
@@ -1539,6 +1575,8 @@ def run_agent(
     model_recovery_history: list[dict[str, Any]] = []
     pending_model_recovery: dict[str, Any] | None = None
     terminal_model_failure_kind = ""
+    local_recovery_tool_names: set[str] | None = None
+    malformed_tool_failures: dict[str, int] = {}
     # Compatibility fallback for provider wording not recognized by the
     # adaptive classifier.
     schema_retries = 0
@@ -1566,6 +1604,8 @@ def run_agent(
                     pending_model_recovery.get("strategy") if pending_model_recovery else {}
                 )
                 mission_tool_names = active_recovery_strategy.get("tool_names")
+                if not mission_tool_names and local_recovery_tool_names:
+                    mission_tool_names = sorted(local_recovery_tool_names)
                 if (
                     not mission_tool_names
                     and research_only
@@ -1719,6 +1759,9 @@ def run_agent(
                 pending_model_recovery = None
                 db.commit()
             msg = resp.choices[0].message
+            # A local malformed-argument restriction applies to one provider
+            # round. A new failure below can install the next narrower retry.
+            local_recovery_tool_names = None
             tool_calls = msg.tool_calls or []
             if not tool_calls:
                 final_text = msg.content or ""
@@ -1788,12 +1831,20 @@ def run_agent(
             continuity_updates: list[dict[str, Any]] = []
             mission_halted = False
             for tc in tool_calls:
+                name = tc.function.name
                 raw_args = tc.function.arguments or "{}"
+                argument_error = ""
                 try:
                     args = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    args = {}
-                name = tc.function.name
+                    if not isinstance(args, dict):
+                        raise ValueError("tool arguments must decode to an object")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raw_digest = hashlib.sha256(raw_args.encode("utf-8", errors="replace")).hexdigest()
+                    argument_error = f"malformed_tool_arguments: {exc}"
+                    args = {
+                        "_malformed_arguments_sha256": raw_digest,
+                        "_malformed_arguments_preview": raw_args[:300],
+                    }
                 used_tools.add(name)
                 tool_counts[name] = tool_counts.get(name, 0) + 1
                 signature = _tool_signature(name, args)
@@ -1826,7 +1877,31 @@ def run_agent(
                     and not is_new_evidence_followup
                 )
                 target_mismatch = _active_target_mismatch(name, args, active_work_item)
-                if target_mismatch is not None:
+                malformed_attempt = 0
+                if argument_error:
+                    malformed_attempt = malformed_tool_failures.get(name, 0) + 1
+                    malformed_tool_failures[name] = malformed_attempt
+                    plan = make_recovery_plan(
+                        argument_error,
+                        attempt=malformed_attempt,
+                        phase="write" if name in MUTATION_TOOLS else "research",
+                        available_tools={name},
+                        last_tool=name,
+                        next_tool=name,
+                    )
+                    local_recovery_tool_names = set(plan.allowed_tools)
+                    result = {
+                        "error": "malformed_tool_arguments",
+                        "detail": (
+                            "도구 인자가 JSON 객체가 아니어서 도구를 실행하지 않았습니다. "
+                            "같은 대상을 유지하고 유효한 JSON으로 한 번만 다시 호출하세요."
+                        ),
+                        "attempt": malformed_attempt,
+                        "recovery_mode": plan.mode,
+                        "allowed_tools": sorted(plan.allowed_tools),
+                        "signature": args["_malformed_arguments_sha256"],
+                    }
+                elif target_mismatch is not None:
                     result = target_mismatch
                 elif decision_required:
                     result = {
@@ -1872,12 +1947,35 @@ def run_agent(
                             image_searches_by_place.get(image_place_id, 0) + 1
                         )
                     tool_args = args
-                    if name in {"verify_place", "upsert_place_insights"}:
+                    if name in {
+                        "verify_place",
+                        "upsert_place_insights",
+                        "update_place_fields",
+                        "propose_place",
+                    }:
                         tool_args = {
                             **args,
                             "_validated_source_urls": sorted(validated_source_urls),
                         }
-                    result = run_tool(db, name, tool_args, city_id=city_id)
+                    if name == "propose_place":
+                        coordinate_evidence = _matching_coordinate_evidence(
+                            args,
+                            verified_coordinate_records,
+                            city_name=city.name_local or city.slug,
+                        )
+                        if coordinate_evidence is None:
+                            result = {
+                                "error": "coordinate_target_not_verified",
+                                "detail": (
+                                    "이번 실행에서 같은 상호·지점으로 확인한 geocode/fetch_page 좌표가 없습니다. "
+                                    "모델 좌표를 직접 저장하지 말고 정확한 지점 좌표를 먼저 확인하세요."
+                                ),
+                            }
+                        else:
+                            tool_args = {**tool_args, "_coordinate_evidence": coordinate_evidence}
+                            result = run_tool(db, name, tool_args, city_id=city_id)
+                    else:
+                        result = run_tool(db, name, tool_args, city_id=city_id)
                     if (
                         name == "fetch_page"
                         and isinstance(result, dict)
@@ -1886,6 +1984,35 @@ def run_agent(
                         and result.get("url")
                     ):
                         validated_source_urls.add(str(result["url"]))
+                    if name in {"geocode_place", "fetch_page"} and isinstance(result, dict):
+                        coordinate_rows = (
+                            result.get("results") or []
+                            if name == "geocode_place"
+                            else result.get("coordinate_candidates") or []
+                        )
+                        for raw_coordinate in coordinate_rows:
+                            if not isinstance(raw_coordinate, dict) or raw_coordinate.get("storage_allowed") is False:
+                                continue
+                            try:
+                                float(raw_coordinate["lat"])
+                                float(raw_coordinate["lng"])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            record = {
+                                **raw_coordinate,
+                                "display_name": str(
+                                    raw_coordinate.get("display_name")
+                                    or result.get("title")
+                                    or args.get("query")
+                                    or ""
+                                ),
+                                "source_url": str(
+                                    raw_coordinate.get("source_url")
+                                    or result.get("url")
+                                    or ""
+                                ),
+                            }
+                            verified_coordinate_records.append(record)
                     if normalized_query:
                         recent_search_queries.add(normalized_query)
                 error = isinstance(result, dict) and bool(result.get("error"))
@@ -2037,6 +2164,13 @@ def run_agent(
                 )
                 if continuity:
                     continuity_updates.append(continuity)
+                if argument_error and malformed_attempt >= 3:
+                    mission_halted = True
+                    final_text = (
+                        f"{name} 도구 인자 생성이 세 번 연속 깨져 실행하지 않고 안전 종료했습니다. "
+                        "실패 서명과 현재 대상은 체크포인트에 남겼으며 다음 실행은 다른 복구 전략으로 이어집니다."
+                    )
+                    break
                 if _mission_has_no_executable_target(active_mission, active_work_item):
                     # One model response may contain parallel calls. Once the
                     # orchestrator pauses/completes the mission, later calls no
@@ -2044,10 +2178,11 @@ def run_agent(
                     mission_halted = True
                     break
             if mission_halted:
-                final_text = (
-                    "현재 미션의 실행 가능한 대상이 모두 완료되었거나 차단되어 종료했습니다. "
-                    "저장된 체크포인트와 재시도 조건에서 다음 실행이 이어집니다."
-                )
+                if not final_text:
+                    final_text = (
+                        "현재 미션의 실행 가능한 대상이 모두 완료되었거나 차단되어 종료했습니다. "
+                        "저장된 체크포인트와 재시도 조건에서 다음 실행이 이어집니다."
+                    )
                 break
             if continuity_updates:
                 messages.append(

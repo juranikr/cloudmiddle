@@ -194,6 +194,29 @@ def ensure_schema() -> None:
                     text("ALTER TABLE travel_chat_messages ADD COLUMN tool_trace TEXT DEFAULT '[]' NOT NULL")
                 )
 
+        if "travel_chat_work" in tables and engine.dialect.name == "postgresql":
+            # Keep the newest ledger if an older deployment admitted concurrent
+            # active rows, then enforce one resumable task per user/city.
+            conn.execute(text("""
+                WITH ranked AS (
+                  SELECT id,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY user_id, city_id ORDER BY id DESC
+                         ) AS position
+                  FROM travel_chat_work
+                  WHERE status = 'active'
+                )
+                UPDATE travel_chat_work AS work
+                SET status = 'superseded'
+                FROM ranked
+                WHERE work.id = ranked.id AND ranked.position > 1
+            """))
+            conn.execute(text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_travel_chat_work_active_user_city
+                ON travel_chat_work (user_id, city_id)
+                WHERE status = 'active'
+            """))
+
         # 기여자 백필: 기존 markers.user_id → place_contributors
         tables_now = set(inspect(engine).get_table_names())
 

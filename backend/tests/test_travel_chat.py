@@ -10,8 +10,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.agent.tools import TOOLS, _filter_search_results, _search_result_quality
 from app.config import settings
+from app.coordinate_attestation import issue_coordinate_attestation
 from app.db import Base
-from app.models import City, Marker, MarkerCategory, TravelChatMessage, TravelChatWork
+from app.models import AgentProposal, City, Marker, MarkerCategory, TravelChatMessage, TravelChatWork
 from app.travel_chat import (
     ChatIntent,
     CITY_FOOD_DETAIL_SOURCES,
@@ -34,6 +35,7 @@ from app.travel_chat import (
     _pending_work_candidates,
     _research_seed_queries,
     _research_seed_query,
+    _reconcile_chat_work_proposals,
     _resolve_context_message,
     _resolve_shared_place_candidate,
     _share_text_for_turn,
@@ -90,6 +92,72 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertEqual(candidate["travel_role"], "rest")
         self.assertEqual(candidate["lat"], 41.8011621)
         self.assertEqual(candidate["coordinate_source"], "amap_share")
+        self.assertEqual(candidate["coordinate_attestation"]["version"], 1)
+
+    def test_unsigned_legacy_candidate_cannot_supply_coordinates(self) -> None:
+        locked = {
+            "title": "喜茶(中街店)",
+            "branch_name": "中街店",
+            "address": "中街路1号",
+            "lat": 39.9,
+            "lng": 116.4,
+            "coordinate_source": "agent_research",
+            "source_urls": ["https://example.test/legacy"],
+            "status": "located",
+        }
+
+        candidates = _extract_grounded_candidates(
+            "",
+            [],
+            message="계속 추가해줘",
+            locked_candidate=locked,
+            subject="drink",
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertNotIn("lat", candidates[0])
+        self.assertNotIn("lng", candidates[0])
+        self.assertEqual(candidates[0]["status"], "location_needed")
+
+    def test_locked_branch_does_not_absorb_another_branch_page(self) -> None:
+        locked = {
+            "title": "喜茶(中街店)",
+            "branch_name": "中街店",
+            "address": "中街路1号",
+            "source_urls": ["https://example.test/zhongjie"],
+        }
+        tool_results = [{
+            "name": "fetch_page",
+            "args": {"url": "https://example.test/joy-city"},
+            "result": {
+                "url": "https://example.test/joy-city",
+                "title": "喜茶(大悦城店)",
+                "text": "喜茶大悦城店 地址：小东路6号",
+                "coordinate_candidates": [{
+                    "display_name": "喜茶(大悦城店)",
+                    "branch_name": "大悦城店",
+                    "address": "小东路6号",
+                    "lat": 41.80,
+                    "lng": 123.46,
+                    "source": "360map_embedded_poi",
+                    "source_url": "https://example.test/joy-city",
+                    "storage_allowed": True,
+                }],
+            },
+        }]
+
+        candidates = _extract_grounded_candidates(
+            "",
+            tool_results,
+            message="계속 추가해줘",
+            locked_candidate=locked,
+            subject="drink",
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["branch_name"], "中街店")
+        self.assertNotIn("https://example.test/joy-city", candidates[0]["source_urls"])
+        self.assertNotIn("lat", candidates[0])
 
     def test_shenyang_snack_bootstrap_is_separate_from_meal_sources(self) -> None:
         snack_sources = CITY_SNACK_DETAIL_SOURCES["shenyang"]
@@ -575,6 +643,40 @@ class _FailingCompletions:
         raise RuntimeError("Tool choice is none, but model called a tool")
 
 
+class _ParseFailThenCurateCompletions:
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        schema = (kwargs.get("response_format") or {}).get("json_schema") or {}
+        if schema.get("name") == "grounded_place_curator":
+            content = json.dumps({
+                "accepted": True,
+                "reason": "포장 간식 매장입니다.",
+                "local_name": "不老林糖果",
+                "korean_name": "부라오린 사탕 중제점",
+                "branch_name": "中街店",
+                "category": "shopping",
+                "travel_role": "food",
+                "description": "선양에서 포장 사탕을 살 수 있는 중제 지점입니다.",
+                "evidence": "보존된 후보의 상호와 주소, 좌표 출처를 확인했습니다.",
+                "confidence": 0.88,
+                "insights": [
+                    {
+                        "kind": "location", "title": "위치", "content": "중제 지점으로 확인됩니다.",
+                        "year_label": "", "source_index": 0, "confidence": 0.85,
+                    },
+                    {
+                        "kind": "tip", "title": "간식", "content": "포장 사탕을 고르기 좋은 매장입니다.",
+                        "year_label": "", "source_index": 0, "confidence": 0.8,
+                    },
+                ],
+            }, ensure_ascii=False)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+        raise RuntimeError("Error code: 400 - output_parse_failed: Parsing failed")
+
+
 class _SnackResearchThenWriteCompletions:
     """Reproduces Groq asking for more research after a coordinate appears."""
 
@@ -642,6 +744,105 @@ class TravelChatLoopTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.engine.dispose()
+
+    def test_committed_proposal_is_reconciled_after_response_failure(self) -> None:
+        candidate = {
+            "key": "branch-1",
+            "title": "喜茶(中街店) (헤이티 중제점)",
+            "branch_name": "中街店",
+            "address": "中街路1号",
+            "lat": 41.8012,
+            "lng": 123.4521,
+            "status": "located",
+        }
+        work = TravelChatWork(
+            user_id=1,
+            city_id=1,
+            status="active",
+            action="write",
+            scope="single",
+            subject="drink",
+            goal="헤이티 중제점 추가",
+            requested_count=1,
+            state=json.dumps({
+                "version": 2,
+                "phase": "write",
+                "next_action": "write",
+                "wants_write": True,
+                "candidates": [candidate],
+                "completed_keys": [],
+                "proposal_ids": [],
+            }, ensure_ascii=False),
+        )
+        proposal = AgentProposal(
+            city_id=1,
+            action="create_place",
+            title=candidate["title"],
+            payload=json.dumps({
+                "title": candidate["title"],
+                "branch_name": candidate["branch_name"],
+                "address": candidate["address"],
+                "lat": candidate["lat"],
+                "lng": candidate["lng"],
+            }, ensure_ascii=False),
+            evidence="response failed after this row committed",
+            source_urls="[]",
+            confidence=0.9,
+            proposal_key="committed-before-timeout",
+            status="pending",
+        )
+        self.db.add_all([work, proposal])
+        self.db.commit()
+
+        _reconcile_chat_work_proposals(self.db, work)
+        _reconcile_chat_work_proposals(self.db, work)
+
+        state = json.loads(work.state)
+        self.assertEqual(work.status, "completed")
+        self.assertEqual(state["proposal_ids"], [proposal.id])
+        self.assertEqual(state["candidates"][0]["status"], "proposed")
+        self.assertEqual(
+            sum(item.get("event") == "proposal_reconciled" for item in state["observations"]),
+            1,
+        )
+        self.assertEqual(self.db.query(AgentProposal).count(), 1)
+
+    def test_duplicate_mobile_retry_reuses_equivalent_active_work(self) -> None:
+        work = TravelChatWork(
+            user_id=1,
+            city_id=1,
+            status="active",
+            action="research_and_write",
+            scope="single",
+            subject="drink",
+            goal="헤이티 중제점 추가",
+            requested_count=1,
+            state=json.dumps({"version": 2, "candidates": []}, ensure_ascii=False),
+        )
+        self.db.add(work)
+        self.db.commit()
+        intent = ChatIntent(
+            action="research_and_write",
+            scope="single",
+            subject="drink",
+            goal="헤이티 중제점 추가",
+            wants_research=True,
+            wants_write=True,
+            starts_new_work=True,
+            requested_count=1,
+        )
+
+        selected = _ensure_chat_work(
+            self.db,
+            user_id=1,
+            city_id=1,
+            intent=intent,
+            active_work=None,
+        )
+
+        self.assertEqual(selected.id, work.id)
+        self.assertEqual(self.db.query(TravelChatWork).count(), 1)
+        self.assertEqual(selected.status, "active")
 
     def test_unrelated_answer_does_not_mutate_open_work(self) -> None:
         work = TravelChatWork(
@@ -1113,6 +1314,95 @@ class TravelChatLoopTests(unittest.TestCase):
             )
 
         self.assertIn("현재 지도", result["row"].content)
+
+    def test_repeated_parse_failure_switches_to_server_grounded_commit(self) -> None:
+        candidate = {
+            "key": "candy-zhongjie",
+            "title": "不老林糖果(中街店)",
+            "branch_name": "中街店",
+            "address": "中街路123号",
+            "description": "포장 사탕을 판매하는 중제 지점입니다.",
+            "category": "shopping",
+            "lat": 41.8012,
+            "lng": 123.4521,
+            "coordinate_source": "360map_embedded_poi",
+            "coordinate_source_url": "https://m.map.360.cn/candy",
+            "coordinate_external_id": "poi-candy",
+            "source_urls": ["https://m.map.360.cn/candy"],
+            "confidence": 0.88,
+            "status": "located",
+        }
+        candidate = issue_coordinate_attestation(candidate, {
+            "title": candidate["title"],
+            "display_name": candidate["title"],
+            "branch_name": candidate["branch_name"],
+            "address": candidate["address"],
+            "lat": candidate["lat"],
+            "lng": candidate["lng"],
+            "source": candidate["coordinate_source"],
+            "source_url": candidate["coordinate_source_url"],
+            "external_id": candidate["coordinate_external_id"],
+            "confidence": candidate["confidence"],
+            "storage_allowed": True,
+        })
+        self.db.add(TravelChatWork(
+            user_id=1,
+            city_id=1,
+            status="active",
+            action="research_and_write",
+            scope="single",
+            subject="shopping",
+            goal="부라오린 사탕 지점을 추가",
+            requested_count=1,
+            state=json.dumps({
+                "version": 2,
+                "phase": "write",
+                "next_action": "write",
+                "wants_research": True,
+                "wants_write": True,
+                "candidates": [candidate],
+                "completed_keys": [],
+                "constraints": [],
+                "exclusions": [],
+                "failed": [],
+            }, ensure_ascii=False),
+        ))
+        self.db.commit()
+        completions = _ParseFailThenCurateCompletions()
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: fake_client
+        proposal_calls = []
+
+        def fake_tool(_db, name, args, **_kwargs):
+            if name == "web_search":
+                return {"results": []}
+            if name == "propose_place":
+                proposal_calls.append(args)
+                return {"ok": True, "proposal_created": True, "proposal_id": 88}
+            return {"results": []}
+
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch.object(settings, "groq_api_key", "test-key"),
+            patch("app.travel_chat._classify_chat_intent", return_value=ChatIntent(
+                action="continue", scope="single", subject="shopping",
+                goal="부라오린 사탕 지점을 추가", wants_research=True,
+                wants_write=True, continuation=True, requested_count=1,
+            )),
+            patch("app.travel_chat.run_tool", side_effect=fake_tool),
+        ):
+            result = answer_travel_chat(
+                self.db, user_id=1, city_id=1, message="계속해서 추가해줘",
+            )
+
+        self.assertEqual(len(proposal_calls), 1)
+        self.assertEqual(proposal_calls[0]["lat"], candidate["lat"])
+        self.assertEqual(proposal_calls[0]["coordinate_external_id"], "poi-candy")
+        self.assertIn("#88", result["row"].content)
+        state = json.loads(self.db.query(TravelChatWork).one().state)
+        self.assertEqual(state["proposal_ids"], [88])
+        self.assertTrue(any(item.get("error") == "output_parse_failed" for item in state["recovery_history"]))
 
 
 if __name__ == "__main__":

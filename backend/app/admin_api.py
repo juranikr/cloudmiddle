@@ -32,6 +32,7 @@ from app.models import (
     User,
 )
 from app.knowledge import list_knowledge, rebuild_knowledge_base
+from app.db_lock import transaction_lock
 from app.rollback import is_rollbackable, list_agent_actions, rollback_event
 from app.schemas import AgentKnowledgeOut, AgentRunResponse, UserOut
 
@@ -44,6 +45,29 @@ def _json_dict(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _restore_applying_proposal(
+    db: Session,
+    *,
+    proposal_id: int,
+    original_status: str,
+    admin_id: int,
+) -> None:
+    """Release an approval claim only when this request still owns it."""
+
+    db.rollback()
+    failed_row = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+    if (
+        failed_row is not None
+        and failed_row.status == "applying"
+        and failed_row.decided_by_user_id == admin_id
+    ):
+        failed_row.status = original_status
+        failed_row.decision_note = ""
+        failed_row.decided_by_user_id = None
+        failed_row.decided_at = None
+        db.commit()
 
 
 def _json_list(raw: str) -> list[str]:
@@ -516,7 +540,13 @@ def approve_agent_proposal(
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
 ) -> AgentProposalOut:
-    row = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+    transaction_lock(db, f"agent-proposal-decision:{proposal_id}")
+    row = (
+        db.query(AgentProposal)
+        .filter(AgentProposal.id == proposal_id)
+        .with_for_update()
+        .first()
+    )
     if row is None:
         raise HTTPException(status_code=404, detail="제안을 찾을 수 없습니다")
     if row.status != "pending":
@@ -525,9 +555,36 @@ def approve_agent_proposal(
         payload = json.loads(row.payload or "{}")
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="제안 데이터가 손상되었습니다") from exc
-    result = run_tool(db, row.action, payload, city_id=row.city_id, approved=True)
+    original_status = row.status
+    if row.action not in {"create_place", "merge_places"}:
+        raise HTTPException(status_code=400, detail="지원하지 않는 제안 작업입니다")
+    # Claim the decision before the applying tool performs its own commit. This
+    # closes the post-apply/pre-status race for both another approval and reject.
+    row.status = "applying"
+    row.decision_note = body.note.strip()
+    row.decided_by_user_id = admin.id
+    row.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    try:
+        result = run_tool(db, row.action, payload, city_id=row.city_id, approved=True)
+    except Exception as exc:  # noqa: BLE001 - approval claim must never remain orphaned
+        _restore_applying_proposal(
+            db,
+            proposal_id=proposal_id,
+            original_status=original_status,
+            admin_id=admin.id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="제안 적용 중 오류가 발생해 승인 상태를 원복했습니다. 다시 시도해 주세요.",
+        ) from exc
     if not isinstance(result, dict) or result.get("error") or not result.get("ok"):
-        db.rollback()
+        _restore_applying_proposal(
+            db,
+            proposal_id=proposal_id,
+            original_status=original_status,
+            admin_id=admin.id,
+        )
         detail = (
             result.get("detail") or result.get("error")
             if isinstance(result, dict)
@@ -536,10 +593,9 @@ def approve_agent_proposal(
         raise HTTPException(status_code=400, detail=f"제안을 적용하지 못했습니다: {detail}")
     row = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
     assert row is not None
+    if row.status != "applying" or row.decided_by_user_id != admin.id:
+        raise HTTPException(status_code=409, detail="제안 결정 상태가 변경되었습니다")
     row.status = "approved"
-    row.decision_note = body.note.strip()
-    row.decided_by_user_id = admin.id
-    row.decided_at = datetime.now(timezone.utc)
     row.result_place_id = int(result.get("place_id") or result.get("target_id") or 0) or None
     db.commit()
     db.refresh(row)
@@ -553,7 +609,13 @@ def reject_agent_proposal(
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
 ) -> AgentProposalOut:
-    row = db.query(AgentProposal).filter(AgentProposal.id == proposal_id).first()
+    transaction_lock(db, f"agent-proposal-decision:{proposal_id}")
+    row = (
+        db.query(AgentProposal)
+        .filter(AgentProposal.id == proposal_id)
+        .with_for_update()
+        .first()
+    )
     if row is None:
         raise HTTPException(status_code=404, detail="제안을 찾을 수 없습니다")
     if row.status != "pending":

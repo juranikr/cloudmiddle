@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     # 값이 있으면 ArcGIS를 forStorage=true로 호출해 선택 좌표를 영구 저장할 수 있다.
     # 값이 없으면 UI에서 참고 위치로만 노출하고 지도 직접 지정 절차를 거친다.
     arcgis_api_key: str = ""
+    # Optional structured POI discovery. Brave Place results are discovery-only
+    # unless the account explicitly grants storage rights; transient IDs are not
+    # persisted as durable coordinate identifiers.
+    brave_search_api_key: str = ""
+    brave_place_enabled: bool = True
+    brave_search_storage_rights: bool = False
     # Safety ceiling only. The runner stops earlier on completed outcomes or
     # repeated no-progress observations rather than consuming a fixed quota.
     agent_max_steps: int = 180
