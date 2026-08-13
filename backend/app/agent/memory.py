@@ -1192,7 +1192,34 @@ def evaluate_knowledge_uses(db: Session, *, run_id: int, material_change_count: 
     """
 
     helpful = material_change_count > 0
+    run = db.get(AgentRun, run_id)
+    run_metrics = _json_dict(run.metrics) if run is not None else {}
+    recovery_history = [
+        item for item in run_metrics.get("model_recovery_history", [])
+        if isinstance(item, dict)
+    ]
     uses = db.query(AgentKnowledgeUse).filter(AgentKnowledgeUse.run_id == run_id).all()
     for use in uses:
+        if use.lesson_id is not None:
+            lesson = db.get(AgentLesson, use.lesson_id)
+            applicability = _json_dict(lesson.applicability) if lesson is not None else {}
+            failure_kinds = {
+                str(item) for item in applicability.get("failure_kinds", []) if str(item)
+            }
+            if failure_kinds:
+                triggered = [
+                    item for item in recovery_history
+                    if str(item.get("failure_kind") or "") in failure_kinds
+                ]
+                if not triggered:
+                    # Absence of the lesson's trigger is not evidence against it.
+                    # This avoids degrading a parser-recovery lesson merely
+                    # because the next run produced valid JSON throughout.
+                    use.outcome = "not_triggered"
+                elif any(item.get("outcome") == "recovered" for item in triggered):
+                    use.outcome = "recovery_succeeded"
+                else:
+                    use.outcome = "recovery_failed"
+                continue
         use.outcome = "productive_run" if helpful else "no_material_change"
     db.commit()

@@ -37,6 +37,7 @@ from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
 from app.agent.memory import (
     checkpoint_after_tool,
+    evaluate_knowledge_uses,
     ensure_mission_for_task,
     learn_from_recent_runs,
     retrieve_contextual_knowledge,
@@ -50,6 +51,7 @@ from app.agent.memory import (
 from app.rollback import list_agent_actions
 from app.models import (
     AgentKnowledge,
+    AgentKnowledgeUse,
     AgentKnowledgeArchive,
     AgentProposal,
     AgentRun,
@@ -533,6 +535,60 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(lesson.success_count, 1)
         self.assertEqual(lesson.failure_count, 0)
         self.assertIn("output_parse_failed", item.state_summary)
+
+    def test_recovery_lesson_is_evaluated_only_when_its_trigger_occurs(self) -> None:
+        lesson = AgentLesson(
+            lesson_key="model_output_recovery:tool_schema_failed:focused_retry",
+            scope="global",
+            category="model_runtime",
+            trigger="tool schema failure",
+            action="focused retry",
+            expected_effect="parseable output",
+            applicability=json.dumps({"failure_kinds": ["tool_schema_failed"]}),
+        )
+        run_without_trigger = AgentRun(
+            city_id=2,
+            status="completed",
+            metrics=json.dumps({"model_recovery_history": []}),
+        )
+        self.db.add_all([lesson, run_without_trigger])
+        self.db.flush()
+        use_without_trigger = AgentKnowledgeUse(
+            lesson_id=lesson.id,
+            run_id=run_without_trigger.id,
+        )
+        self.db.add(use_without_trigger)
+        self.db.commit()
+
+        evaluate_knowledge_uses(
+            self.db,
+            run_id=run_without_trigger.id,
+            material_change_count=0,
+        )
+        self.assertEqual(use_without_trigger.outcome, "not_triggered")
+
+        run_with_trigger = AgentRun(
+            city_id=2,
+            status="partial",
+            metrics=json.dumps({
+                "model_recovery_history": [{
+                    "failure_kind": "tool_schema_failed",
+                    "outcome": "recovered",
+                }],
+            }),
+        )
+        self.db.add(run_with_trigger)
+        self.db.flush()
+        use_with_trigger = AgentKnowledgeUse(lesson_id=lesson.id, run_id=run_with_trigger.id)
+        self.db.add(use_with_trigger)
+        self.db.commit()
+
+        evaluate_knowledge_uses(
+            self.db,
+            run_id=run_with_trigger.id,
+            material_change_count=0,
+        )
+        self.assertEqual(use_with_trigger.outcome, "recovery_succeeded")
 
     def test_model_parse_recovery_restricts_tools_and_escalates_strategy(self) -> None:
         self.assertEqual(
