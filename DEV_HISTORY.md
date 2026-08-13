@@ -228,9 +228,12 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 - `dev/predeploy.ps1`로 백엔드 전체 테스트·프런트 빌드·compileall·diff·Compose·로컬 health/header/login/cities를 한 번에 검증
 - 사용자 큐와 자율 연구/DI 미션을 서로 다른 run으로 분리: 큐 run은 미션 attempts/checkpoint를 건드리지 않고, 큐가 끝난 다음 invocation에서 기존 미션을 재개
 - DI는 활성 place의 exact `get_place`만 허용하고 다른 place/list 도구를 차단하며, exact target checkpoint를 포함한 서버 소유 evidence ref가 없으면 종료 불가
-- 운영 복제본 실측: queue run #57은 #83 이의만 처리하며 DI #37/#105 불변, research run #60은 #105 감사 task/mission/work item을 원자적으로 완료하고 #103~105 marker 무변경
+- 로컬 운영 복제본 실측: queue run #57은 #83 이의만 처리하며 DI #37/#105 불변, research run #60은 #105 감사 task/mission/work item을 원자적으로 완료하고 #103~105 marker 무변경
 - 로컬 실측 중 발견한 Groq 400 두 종류를 배포 전에 수정: corrective 단계의 `get_place` 프롬프트/도구 모순, 구형 success metric의 추가 필드가 새 structured schema에 섞이던 문제
 - 최종 로컬 기준 백엔드 243개 테스트, DI 집중 90개, 프런트 production build, Docker/UI/API 실측 통과
+- 운영 배포 `2bf5c8b` / Actions run `31721345506` 성공, ECS rollout/health 정상
+- 운영 연속 실행 검증: run #57은 queue mode로 사용자 큐 2→0 처리하면서 DI task #37 attempts=1·mission #11 last_run=56 유지; run #58은 #105 corrective 미션을 재개해 첫 근거 형식 오류를 같은 실행에서 교정하고 task #37·mission #11·work item #51 완료
+- 운영 run #58 전후 marker #103·#104·#105의 `updated_at` 불변, `marker_changes=0`; `partial` 표시는 감사 실패가 아니라 도시 전체 사진·정보 품질 공백이 남았다는 뜻
 
 ### 2026-08-11 — 로컬 기준선 복구 + 지난/선양 분리 + 에이전트 안전 모드
 - 원인 확인: Cursor가 `%TEMP%` 임시 clone에서 32개 커밋을 push해 원래 `cloudmiddle` 로컬만 뒤처짐
