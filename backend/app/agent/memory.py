@@ -1028,7 +1028,16 @@ def rotate_blocked_work_item(
     current: Optional[AgentWorkItem],
     run_id: int,
     reason: str,
+    activate_next: bool = True,
+    commit: bool = True,
 ) -> Optional[AgentWorkItem]:
+    """Block the current cursor and optionally activate its ready successor.
+
+    ``commit=False`` lets a caller include the rotation in a larger atomic
+    checkpoint transition. ``activate_next=False`` records the successor as a
+    resume cursor without charging an attempt before it is actually executed.
+    """
+
     if mission is None or current is None:
         return current
     current.status = "blocked"
@@ -1039,19 +1048,22 @@ def rotate_blocked_work_item(
         AgentWorkItem.mission_id == mission.id,
         AgentWorkItem.status == "ready",
     ).order_by(AgentWorkItem.priority.desc(), AgentWorkItem.id.asc()).first()
-    if next_item is not None:
+    progress = _json_dict(mission.progress)
+    if next_item is not None and activate_next:
         next_item.status = "active"
         next_item.attempts += 1
         next_item.last_run_id = run_id
-        mission.progress = _dump({
+        progress.update({
             "active_work_item_id": next_item.id,
             "rotation_reason": reason[:1000],
             "next_action": _json_dict(next_item.next_action),
         })
+        mission.progress = _dump(progress)
     else:
         mission.status = "paused"
-        mission.progress = _dump({
+        progress.update({
             "active_work_item_id": None,
+            "resume_work_item_id": next_item.id if next_item is not None else None,
             "rotation_reason": reason[:1000],
             "blocked_work_items": db.query(AgentWorkItem).filter(
                 AgentWorkItem.mission_id == mission.id,
@@ -1059,13 +1071,19 @@ def rotate_blocked_work_item(
             ).count(),
             "retry_condition": "새 출처 또는 12시간 냉각 후 재평가",
         })
+        mission.progress = _dump(progress)
     run = db.get(AgentRun, run_id)
     if run is not None:
         # Keep the run summary cursor aligned with the durable mission cursor;
         # otherwise the admin history shows the blocked item even though the
         # next run will correctly resume its ready successor.
-        run.work_item_id = next_item.id if next_item is not None else current.id
-    db.commit()
+        run.work_item_id = (
+            next_item.id
+            if next_item is not None and activate_next
+            else current.id
+        )
+    if commit:
+        db.commit()
     return next_item
 
 

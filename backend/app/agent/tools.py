@@ -1804,6 +1804,7 @@ def run_tool(
     *,
     city_id: int,
     approved: bool = False,
+    server_pure_read: bool = False,
 ) -> Any:
     if name == "list_unread_events":
         limit = int(args.get("limit") or 30)
@@ -3104,15 +3105,28 @@ def run_tool(
         return {"ok": True, "changed": bool(changes), "chain_id": chain.id}
 
     if name == "list_agent_tasks":
-        reconcile_proposal_tasks(db, city_id=city_id)
+        # ``server_pure_read`` is trusted call provenance, deliberately outside
+        # model-controlled ``args`` and the published tool schema. Integrity
+        # audits use it to inspect the backlog without the legacy reconciliation
+        # write/commit side effect. Ordinary callers retain self-healing.
+        if not server_pure_read:
+            reconcile_proposal_tasks(db, city_id=city_id)
         limit = max(1, min(int(args.get("limit") or 12), 50))
-        rows = (
+        query = (
             db.query(AgentTask)
             .filter(AgentTask.city_id == city_id, AgentTask.status == "pending")
             .order_by(AgentTask.priority.desc(), AgentTask.created_at.asc())
             .limit(limit)
-            .all()
         )
+        if server_pure_read:
+            # A SELECT normally autoflushes unrelated pending ORM changes. That
+            # would violate the integrity audit's read-only boundary even with
+            # reconciliation disabled, especially if a later checkpoint commits
+            # the surrounding session. Keep this query free of implicit writes.
+            with db.no_autoflush:
+                rows = query.all()
+        else:
+            rows = query.all()
         return [
             {
                 "id": row.id,

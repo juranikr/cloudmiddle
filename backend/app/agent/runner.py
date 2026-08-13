@@ -430,11 +430,14 @@ EXPENSIVE_RESEARCH_TOOLS = {"web_search", "fetch_page", "geocode_place", "search
 DATA_INTEGRITY_TOOLS = frozenset({
     "get_place",
     "list_places",
+    "list_agent_tasks",
     "web_search",
     "fetch_page",
     "geocode_place",
     "upsert_agent_task",
 })
+DATA_INTEGRITY_LIST_TASKS_LIMIT = 2
+DATA_INTEGRITY_TASK_RESULT_STATUSES = frozenset({"completed", "blocked"})
 
 MODEL_OUTPUT_FAILURE_MARKERS = {
     "output_parse_failed": ("output_parse_failed", "parsing failed"),
@@ -628,9 +631,17 @@ def _active_target_mismatch(
     name: str,
     args: dict[str, Any],
     work_item: AgentWorkItem | None,
+    *,
+    mission_kind: str = "",
 ) -> dict[str, Any] | None:
     """Reject a target-scoped tool call that drifts from the durable cursor."""
 
+    if mission_kind == "data_integrity" and name == "get_place":
+        # Integrity audits must compare the active record with duplicates,
+        # anchors, and conflicting branches. ``get_place`` is city-scoped and
+        # read-only, so cross-target reads are safe; every mutation remains
+        # unavailable through DATA_INTEGRITY_TOOLS and the runtime guard.
+        return None
     if (
         work_item is None
         or work_item.place_id is None
@@ -655,6 +666,159 @@ def _active_target_mismatch(
         "active_place_id": active_place_id,
         "requested_place_id": requested_place_id,
     }
+
+
+def _active_agent_task_mismatch(
+    name: str,
+    args: dict[str, Any],
+    mission: AgentMission | None,
+) -> dict[str, Any] | None:
+    """Keep a data-integrity audit from creating or editing another task."""
+
+    if mission is None or mission.kind != "data_integrity" or name != "upsert_agent_task":
+        return None
+    active_task_id = mission.task_id
+    raw_task_id = args.get("task_id")
+    requested_task_id = (
+        raw_task_id
+        if isinstance(raw_task_id, int) and not isinstance(raw_task_id, bool)
+        else None
+    )
+    if active_task_id is not None and requested_task_id == active_task_id:
+        return None
+    return {
+        "error": "active_agent_task_mismatch",
+        "detail": (
+            "data_integrity 과제는 현재 활성 과제의 결과만 기록할 수 있습니다. "
+            f"task_id={active_task_id}를 명시해 다시 호출하세요. task_id 누락, 새 과제 생성, "
+            "다른 과제 수정은 실행하지 않습니다."
+        ),
+        "active_task_id": active_task_id,
+        "requested_task_id": requested_task_id,
+    }
+
+
+def _project_data_integrity_task_result_args(
+    name: str,
+    args: dict[str, Any],
+    mission: AgentMission | None,
+    task: AgentTask | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Project an integrity-task write onto its narrow server-owned shape."""
+
+    if mission is None or mission.kind != "data_integrity" or name != "upsert_agent_task":
+        return args, None
+    if (
+        task is None
+        or task.id != mission.task_id
+        or task.city_id != mission.city_id
+        or task.kind != "data_integrity"
+    ):
+        return {}, {
+            "error": "active_agent_task_not_writable",
+            "detail": (
+                "서버가 활성 data_integrity 과제 원본을 확인하지 못해 결과를 기록하지 않았습니다. "
+                "새 과제를 만들거나 다른 종류의 과제로 대체하지 않습니다."
+            ),
+            "active_task_id": mission.task_id,
+        }
+    status = str(args.get("status") or "").strip().lower()
+    if status not in DATA_INTEGRITY_TASK_RESULT_STATUSES:
+        return {}, {
+            "error": "invalid_data_integrity_task_status",
+            "detail": (
+                "data_integrity 과제 결과는 completed 또는 blocked로만 종료할 수 있습니다. "
+                "기존 과제 정의는 서버가 보존하며 pending 전환이나 임의 상태 변경은 실행하지 않습니다."
+            ),
+            "allowed_statuses": sorted(DATA_INTEGRITY_TASK_RESULT_STATUSES),
+            "requested_status": status or None,
+        }
+    # Deliberately omit every model-supplied definition field. run_tool resolves
+    # the existing task by the already-validated ID and therefore preserves
+    # kind/title/detail/success_metric/priority; only the terminal verdict is
+    # writable by the model.
+    return {
+        "task_id": mission.task_id,
+        "status": status,
+        "result": str(args.get("result") or "")[:8000],
+    }, None
+
+
+def _halt_stalled_mission(
+    db: Session,
+    *,
+    mission: AgentMission | None,
+    work_item: AgentWorkItem | None,
+    run_id: int,
+    sequence: int,
+    reason: str,
+) -> AgentWorkItem | None:
+    """Checkpoint and rotate a target before ending a no-progress run."""
+
+    if mission is None or work_item is None:
+        return work_item
+    halt_sequence = sequence + 1
+    result = {
+        "error": "no_progress_limit_reached",
+        "detail": reason,
+    }
+    try:
+        db.add(AgentRunStep(
+            run_id=run_id,
+            sequence=halt_sequence,
+            phase="orchestrate",
+            tool="orchestrator_no_progress",
+            outcome="blocked",
+            score_delta=0,
+            detail=_step_detail_json(
+                {"work_item_id": work_item.id},
+                result,
+                {"material_change": False, "new_evidence": 0},
+            ),
+        ))
+        stalled_item, _ = checkpoint_after_tool(
+            db,
+            mission=mission,
+            work_item=work_item,
+            run_id=run_id,
+            sequence=halt_sequence,
+            tool="orchestrator_no_progress",
+            args={"work_item_id": work_item.id},
+            result=result,
+            outcome="blocked",
+            new_evidence_count=0,
+            material_change=False,
+        )
+        next_item = rotate_blocked_work_item(
+            db,
+            mission=mission,
+            current=stalled_item,
+            run_id=run_id,
+            reason=reason,
+            activate_next=False,
+            commit=False,
+        )
+        progress = json.loads(mission.progress or "{}")
+        if not isinstance(progress, dict):
+            progress = {}
+        progress.update({
+            "active_work_item_id": None,
+            "resume_work_item_id": next_item.id if next_item is not None else None,
+            "last_checkpoint_sequence": halt_sequence,
+            "last_outcome": "blocked",
+            "pause_reason": reason[:1000],
+            "retry_condition": "새 근거 또는 12시간 냉각 후 다음 대상으로 재개",
+        })
+        mission.status = "paused"
+        mission.progress = json.dumps(progress, ensure_ascii=False)
+        mission.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    # The completed run remains attributed to the target it actually handled;
+    # the ready sibling is only a future resume cursor.
+    return stalled_item
 
 
 def _mission_has_no_executable_target(
@@ -1601,6 +1765,8 @@ def run_agent(
     action_sequence = 0
     current_score = 0.0
     context_compactions = 0
+    data_integrity_place_reads: set[int] = set()
+    data_integrity_list_task_calls = 0
     try:
         for _ in range(steps_limit):
             steps += 1
@@ -1827,9 +1993,23 @@ def run_agent(
                     )
                     continue
                 if no_progress_actions >= 18:
+                    stall_reason = (
+                        f"연속 {no_progress_actions}회 성과 변화가 없고 모델이 "
+                        "추가 행동 없이 종료를 요청함"
+                    )
+                    active_work_item = _halt_stalled_mission(
+                        db,
+                        mission=active_mission,
+                        work_item=active_work_item,
+                        run_id=agent_run.id,
+                        sequence=action_sequence,
+                        reason=stall_reason,
+                    )
+                    if active_work_item is not None:
+                        agent_run.work_item_id = active_work_item.id
                     final_text = (
                         f"연속 {no_progress_actions}회 성과 변화가 없어 안전 종료했습니다. "
-                        "미완료 항목은 에이전트 과제 백로그에서 다음 실행이 이어받습니다."
+                        "현재 대상은 차단 사유와 체크포인트를 남기고 회전했습니다."
                     )
                 break
 
@@ -1898,7 +2078,51 @@ def run_agent(
                     and name not in MUTATION_TOOLS
                     and not is_new_evidence_followup
                 )
-                target_mismatch = _active_target_mismatch(name, args, active_work_item)
+                target_mismatch = _active_target_mismatch(
+                    name,
+                    args,
+                    active_work_item,
+                    mission_kind=active_mission.kind if active_mission is not None else "",
+                )
+                agent_task_mismatch = _active_agent_task_mismatch(
+                    name, args, active_mission
+                )
+                projected_task_args, task_projection_error = (
+                    _project_data_integrity_task_result_args(
+                        name,
+                        args,
+                        active_mission,
+                        (
+                            db.get(AgentTask, active_mission.task_id)
+                            if active_mission is not None
+                            and active_mission.kind == "data_integrity"
+                            and active_mission.task_id is not None
+                            and name == "upsert_agent_task"
+                            else None
+                        ),
+                    )
+                )
+                data_integrity_get_place_id = None
+                if (
+                    active_mission is not None
+                    and active_mission.kind == "data_integrity"
+                    and name == "get_place"
+                    and args.get("place_id") is not None
+                ):
+                    try:
+                        data_integrity_get_place_id = int(args["place_id"])
+                    except (TypeError, ValueError):
+                        data_integrity_get_place_id = None
+                repeated_data_integrity_place_read = bool(
+                    data_integrity_get_place_id is not None
+                    and data_integrity_get_place_id in data_integrity_place_reads
+                )
+                data_integrity_task_list_exhausted = bool(
+                    active_mission is not None
+                    and active_mission.kind == "data_integrity"
+                    and name == "list_agent_tasks"
+                    and data_integrity_list_task_calls >= DATA_INTEGRITY_LIST_TASKS_LIMIT
+                )
                 integrity_scope_violation = bool(
                     active_mission is not None
                     and active_mission.kind == "data_integrity"
@@ -1915,6 +2139,32 @@ def run_agent(
                             f"'{name}' 호출은 실행하지 않았습니다."
                         ),
                         "allowed_tools": sorted(DATA_INTEGRITY_TOOLS),
+                    }
+                elif agent_task_mismatch is not None:
+                    result = agent_task_mismatch
+                elif task_projection_error is not None:
+                    result = task_projection_error
+                elif repeated_data_integrity_place_read:
+                    result = {
+                        "error": "duplicate_data_integrity_place_read",
+                        "detail": (
+                            f"장소 #{data_integrity_get_place_id}의 get_place 결과는 이번 감사에서 이미 "
+                            "성공적으로 읽었습니다. 같은 조회를 반복하지 말고 기존 관찰을 사용해 "
+                            f"현재 과제 task_id={active_mission.task_id if active_mission else None}의 "
+                            "result를 upsert_agent_task로 기록하세요."
+                        ),
+                        "place_id": data_integrity_get_place_id,
+                    }
+                elif data_integrity_task_list_exhausted:
+                    result = {
+                        "error": "data_integrity_task_list_budget_exhausted",
+                        "detail": (
+                            f"list_agent_tasks는 data_integrity 감사에서 최대 "
+                            f"{DATA_INTEGRITY_LIST_TASKS_LIMIT}회만 허용됩니다. 이미 확인한 활성 task_id를 "
+                            "사용해 감사 결과를 기록하세요."
+                        ),
+                        "limit": DATA_INTEGRITY_LIST_TASKS_LIMIT,
+                        "active_task_id": active_mission.task_id if active_mission else None,
                     }
                 elif argument_error:
                     malformed_attempt = malformed_tool_failures.get(name, 0) + 1
@@ -1984,7 +2234,13 @@ def run_agent(
                         image_searches_by_place[image_place_id] = (
                             image_searches_by_place.get(image_place_id, 0) + 1
                         )
-                    tool_args = args
+                    tool_args = (
+                        projected_task_args
+                        if active_mission is not None
+                        and active_mission.kind == "data_integrity"
+                        and name == "upsert_agent_task"
+                        else args
+                    )
                     if name in {
                         "verify_place",
                         "upsert_place_insights",
@@ -2013,7 +2269,17 @@ def run_agent(
                             tool_args = {**tool_args, "_coordinate_evidence": coordinate_evidence}
                             result = run_tool(db, name, tool_args, city_id=city_id)
                     else:
-                        result = run_tool(db, name, tool_args, city_id=city_id)
+                        result = run_tool(
+                            db,
+                            name,
+                            tool_args,
+                            city_id=city_id,
+                            server_pure_read=bool(
+                                active_mission is not None
+                                and active_mission.kind == "data_integrity"
+                                and name == "list_agent_tasks"
+                            ),
+                        )
                     if (
                         name == "fetch_page"
                         and isinstance(result, dict)
@@ -2054,6 +2320,15 @@ def run_agent(
                     if normalized_query:
                         recent_search_queries.add(normalized_query)
                 error = isinstance(result, dict) and bool(result.get("error"))
+                if (
+                    not error
+                    and active_mission is not None
+                    and active_mission.kind == "data_integrity"
+                ):
+                    if name == "get_place" and data_integrity_get_place_id is not None:
+                        data_integrity_place_reads.add(data_integrity_get_place_id)
+                    elif name == "list_agent_tasks":
+                        data_integrity_list_task_calls += 1
                 if not error:
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
                 material_change = _is_material_change(name, result)
@@ -2258,9 +2533,22 @@ def run_agent(
                 )
                 break
             if no_progress_actions >= 18 and steps >= 20:
+                stall_reason = (
+                    f"연속 {no_progress_actions}개 행동에서 새 근거·데이터·정제가 생기지 않음"
+                )
+                active_work_item = _halt_stalled_mission(
+                    db,
+                    mission=active_mission,
+                    work_item=active_work_item,
+                    run_id=agent_run.id,
+                    sequence=action_sequence,
+                    reason=stall_reason,
+                )
+                if active_work_item is not None:
+                    agent_run.work_item_id = active_work_item.id
                 final_text = (
                     f"연속 {no_progress_actions}개 행동에서 새 근거·데이터·정제가 생기지 않아 종료했습니다. "
-                    "남은 과제는 다음 성과 기반 실행이 이어받습니다."
+                    "현재 대상은 차단 사유와 체크포인트를 남기고 회전했습니다."
                 )
                 break
     except Exception as exc:
