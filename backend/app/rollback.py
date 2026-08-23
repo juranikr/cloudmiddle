@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from app.events import log_place_event
+from app.events import log_place_event, place_event_city_clause
 from app.models import (
     Marker,
     MarkerCategory,
@@ -96,9 +96,7 @@ def list_agent_actions(
         PlaceEvent.action.in_(list(ROLLBACKABLE_ACTIONS)),
     )
     if city_id is not None:
-        query = query.join(Marker, Marker.id == PlaceEvent.place_id).filter(
-            Marker.city_id == city_id
-        )
+        query = query.filter(place_event_city_clause(city_id))
     return (
         query.order_by(PlaceEvent.created_at.desc())
         .limit(max(1, min(limit, 200)))
@@ -122,6 +120,9 @@ def rollback_event(
     data = _payload(ev)
     action = ev.action
     place_id = ev.place_id
+    city_id = ev.city_id
+    if city_id is None and place_id is not None:
+        city_id = db.query(Marker.city_id).filter(Marker.id == place_id).scalar()
     detail = ""
 
     if action == PlaceEventAction.merge:
@@ -145,6 +146,7 @@ def rollback_event(
     rb = log_place_event(
         db,
         place_id=place_id,
+        city_id=city_id,
         user=admin,
         action=PlaceEventAction.rollback,
         summary=f"관리자 롤백: {ev.summary}"[:500],

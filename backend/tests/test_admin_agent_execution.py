@@ -39,6 +39,7 @@ class AdminAgentExecutionTests(unittest.TestCase):
                     "started_at": None,
                     "finished_at": None,
                     "result": None,
+                    "results_by_city": {},
                     "execution_arn": None,
                     "backend": "local",
                     "city_id": None,
@@ -177,6 +178,81 @@ class AdminAgentExecutionTests(unittest.TestCase):
         self.assertEqual(status.result.city_id, 2)
         self.assertIsNone(status.result.run_id)
         self.assertIn("요청 도시 #2의 결과가 없습니다", status.result.message)
+
+    def test_completed_multi_city_results_remain_exact_when_poll_city_changes(self) -> None:
+        stopped = datetime(2026, 8, 23, 8, 6, tzinfo=timezone.utc)
+        with admin_api._agent_run_lock:
+            admin_api._agent_run_state.update(
+                {
+                    "running": True,
+                    "started_at": datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc),
+                    "finished_at": None,
+                    "result": None,
+                    "results_by_city": {},
+                    "execution_arn": EXECUTION_ARN,
+                    "backend": "step_functions",
+                    "city_id": 2,
+                    "city_ids": [1, 2],
+                }
+            )
+        client = Mock()
+        client.list_executions.return_value = {"executions": []}
+        client.describe_execution.return_value = {
+            "status": "SUCCEEDED",
+            "stopDate": stopped,
+            "input": json.dumps({"city_ids": [1, 2], "autonomous_research": True}),
+            "output": json.dumps(
+                [
+                    {
+                        "cities": [
+                            {
+                                "city_id": 1,
+                                "run_id": 141,
+                                "ok": True,
+                                "status": "completed",
+                                "steps": 11,
+                                "message": "지난 완료",
+                            },
+                            {
+                                "city_id": 2,
+                                "run_id": 142,
+                                "ok": True,
+                                "status": "partial",
+                                "steps": 19,
+                                "message": "선양 부분 완료",
+                            },
+                        ]
+                    }
+                ]
+            ),
+        }
+
+        with (
+            patch.object(admin_api.settings, "agent_state_machine_arn", STATE_MACHINE_ARN),
+            patch.object(admin_api, "_step_functions_client", return_value=client),
+        ):
+            shenyang = admin_api.admin_agent_run_status(
+                city_id=2,
+                admin=SimpleNamespace(id=1),
+            )
+            jinan = admin_api.admin_agent_run_status(
+                city_id=1,
+                admin=SimpleNamespace(id=1),
+            )
+
+        self.assertFalse(shenyang.running)
+        self.assertEqual(shenyang.city_id, 2)
+        self.assertIsNotNone(shenyang.result)
+        self.assertEqual(shenyang.result.city_id, 2)
+        self.assertEqual(shenyang.result.run_id, 142)
+        self.assertEqual(jinan.city_id, 1)
+        self.assertIsNotNone(jinan.result)
+        self.assertEqual(jinan.result.city_id, 1)
+        self.assertEqual(jinan.result.run_id, 141)
+        self.assertEqual(
+            set(admin_api._agent_run_state["results_by_city"]),
+            {1, 2},
+        )
 
     def test_unset_arn_keeps_local_background_fallback(self) -> None:
         with (

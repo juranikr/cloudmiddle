@@ -91,6 +91,7 @@ class AdminStatusOut(BaseModel):
     zones_active: int = 0
     events_total: int
     events_unread: int
+    events_unattributed: int = 0
     appeals_open: int
     users_total: int
     unread_work_items: int
@@ -117,6 +118,10 @@ def admin_status(
     admin: User = Depends(get_admin_user),
 ) -> AdminStatusOut:
     events_unread = db.query(PlaceEvent).filter(PlaceEvent.groq_read_at.is_(None)).count()
+    events_unattributed = db.query(PlaceEvent).filter(
+        PlaceEvent.groq_read_at.is_(None),
+        PlaceEvent.city_id.is_(None),
+    ).count()
     appeals_open = (
         db.query(PlaceAppeal)
         .filter(PlaceAppeal.status == PlaceAppealStatus.open, PlaceAppeal.groq_read_at.is_(None))
@@ -137,6 +142,7 @@ def admin_status(
         zones_active=db.query(Marker).filter(Marker.merged_into_id.is_(None), Marker.shape == "polygon").count(),
         events_total=db.query(PlaceEvent).count(),
         events_unread=events_unread,
+        events_unattributed=events_unattributed,
         appeals_open=appeals_open,
         users_total=db.query(User).count(),
         unread_work_items=count_unread(db),
@@ -170,6 +176,7 @@ _agent_run_state: dict[str, Any] = {
     "started_at": None,
     "finished_at": None,
     "result": None,
+    "results_by_city": {},
     "execution_arn": None,
     "backend": "local",
     "city_id": None,
@@ -235,6 +242,31 @@ def _find_sfn_city_result(value: Any, city_id: int) -> Optional[dict[str, Any]]:
     return None
 
 
+def _sfn_result_city_ids(value: Any) -> set[int]:
+    """Collect every explicit city id from a compact Map result payload."""
+
+    if isinstance(value, str):
+        try:
+            return _sfn_result_city_ids(json.loads(value))
+        except (json.JSONDecodeError, TypeError):
+            return set()
+    if isinstance(value, list):
+        city_ids: set[int] = set()
+        for item in value:
+            city_ids.update(_sfn_result_city_ids(item))
+        return city_ids
+    if not isinstance(value, dict):
+        return set()
+    city_ids: set[int] = set()
+    parsed_city_id = _safe_int(value.get("city_id"))
+    if parsed_city_id > 0:
+        city_ids.add(parsed_city_id)
+    for nested in value.values():
+        if isinstance(nested, (dict, list, str)):
+            city_ids.update(_sfn_result_city_ids(nested))
+    return city_ids
+
+
 def _sfn_result_response(
     description: dict[str, Any],
     *,
@@ -294,7 +326,13 @@ def _sync_sfn_execution_locked(client: Any | None = None) -> None:
     execution_arn = _agent_run_state.get("execution_arn")
     if not execution_arn or _agent_run_state.get("backend") != "step_functions":
         return
-    if not _agent_run_state.get("running") and _agent_run_state.get("result") is not None:
+    if (
+        not _agent_run_state.get("running")
+        and (
+            _agent_run_state.get("results_by_city")
+            or _agent_run_state.get("result") is not None
+        )
+    ):
         return
     try:
         description = (client or _step_functions_client()).describe_execution(
@@ -308,19 +346,35 @@ def _sync_sfn_execution_locked(client: Any | None = None) -> None:
     _agent_run_state["started_at"] = description.get("startDate") or _agent_run_state.get(
         "started_at"
     )
-    execution_cities = sorted(_execution_city_ids(description))
+    execution_cities = sorted(
+        _execution_city_ids(description)
+        | _sfn_result_city_ids(description.get("output") or description.get("cause"))
+    )
     if execution_cities:
         _agent_run_state["city_ids"] = execution_cities
     if description.get("status") == "RUNNING":
         _agent_run_state["running"] = True
         return
 
-    city_id = int(_agent_run_state.get("city_id") or 1)
+    current_city_id = int(_agent_run_state.get("city_id") or 1)
+    known_city_ids = {
+        _safe_int(value)
+        for value in (_agent_run_state.get("city_ids") or [])
+        if _safe_int(value) > 0
+    }
+    known_city_ids.update(execution_cities)
+    known_city_ids.add(current_city_id)
+    results_by_city = {
+        city_id: _sfn_result_response(description, city_id=city_id).model_dump()
+        for city_id in sorted(known_city_ids)
+    }
     _agent_run_state.update(
         {
             "running": False,
             "finished_at": description.get("stopDate") or datetime.now(timezone.utc),
-            "result": _sfn_result_response(description, city_id=city_id).model_dump(),
+            "result": results_by_city.get(current_city_id),
+            "results_by_city": results_by_city,
+            "city_ids": sorted(known_city_ids),
         }
     )
 
@@ -379,6 +433,7 @@ def _adopt_running_sfn_execution_locked(
                 "started_at": description.get("startDate") or item.get("startDate") or datetime.now(timezone.utc),
                 "finished_at": None,
                 "result": None,
+                "results_by_city": {},
                 "execution_arn": execution_arn,
                 "backend": "step_functions",
                 "city_id": selected_city_id,
@@ -415,9 +470,9 @@ def _agent_run_status(
                         _agent_run_state["city_id"] = city_id
                     _sync_sfn_execution_locked(client)
                 except _AgentWorkflowBusy:
-                    # Status is global for backward compatibility. If another
-                    # city is active, keep reporting that real execution rather
-                    # than manufacturing an idle result for the selected city.
+                    # Preserve the real global workflow guard, but the response
+                    # selection below still refuses to return another city's
+                    # completed payload for an explicitly requested city.
                     try:
                         _adopt_running_sfn_execution_locked(client)
                         _sync_sfn_execution_locked(client)
@@ -429,7 +484,33 @@ def _agent_run_status(
                     pass
             else:
                 _sync_sfn_execution_locked()
-        result = _agent_run_state["result"]
+        requested_city_id = _safe_int(city_id) or None
+        selected_city_id = requested_city_id or _safe_int(
+            _agent_run_state.get("city_id")
+        ) or None
+        raw_results_by_city = _agent_run_state.get("results_by_city")
+        results_by_city = (
+            raw_results_by_city if isinstance(raw_results_by_city, dict) else {}
+        )
+        result = results_by_city.get(selected_city_id) if selected_city_id else None
+        if result is None:
+            # Read compatibility for a local/in-flight state written before the
+            # per-city cache existed. Even here, an explicit city can only see
+            # a payload whose own city_id matches it.
+            legacy_result = _agent_run_state.get("result")
+            if isinstance(legacy_result, dict) and (
+                selected_city_id is None
+                or _safe_int(legacy_result.get("city_id")) == selected_city_id
+            ):
+                result = legacy_result
+        known_city_ids = {
+            _safe_int(value)
+            for value in (_agent_run_state.get("city_ids") or [])
+            if _safe_int(value) > 0
+        }
+        if selected_city_id in known_city_ids or selected_city_id in results_by_city:
+            _agent_run_state["city_id"] = selected_city_id
+            _agent_run_state["result"] = result
         reporting: dict[str, Any] = {}
         if isinstance(result, dict):
             run_id = _safe_int(result.get("run_id"))
@@ -440,7 +521,7 @@ def _agent_run_status(
             )
         return AgentRunStatusOut(
             running=bool(_agent_run_state["running"]),
-            city_id=_safe_int(_agent_run_state.get("city_id")) or None,
+            city_id=selected_city_id,
             started_at=_agent_run_state["started_at"],
             finished_at=_agent_run_state["finished_at"],
             result=AgentRunResponse(**result) if result else None,
@@ -488,9 +569,7 @@ _TRAVELER_VISIBLE_CHANGE_TOOLS = frozenset({
     "merge_places",
     "undo_merge",
     "update_place_fields",
-    "update_place_context",
     "upsert_place_insights",
-    "verify_place",
     "attach_image_from_url",
     "assign_place_zone",
     "assign_place_chain",
@@ -568,7 +647,8 @@ def _agent_run_reporting(*, status: str, metrics: dict[str, Any]) -> dict[str, A
     A green ``completed`` process state only says the worker exited normally.
     This report tells an operator whether that execution changed a traveler-
     visible record, created an approval proposal, proved that no change was
-    appropriate, deferred a cursor, or produced no useful result.
+    appropriate, acknowledged deterministic queue history, deferred a cursor,
+    or produced no useful result.
     """
 
     if not isinstance(metrics, dict):
@@ -610,13 +690,20 @@ def _agent_run_reporting(*, status: str, metrics: dict[str, Any]) -> dict[str, A
         for item in dispositions
         if isinstance(item, dict)
     } if isinstance(dispositions, list) else set()
+    queue_acknowledged = bool(
+        metrics.get("outcome") == "queue_acknowledged"
+        or metrics.get("lane") == "deterministic_queue_ack"
+    )
     deferred_or_blocked = bool(
         metrics.get("outcome") in {"deferred", "already_running"}
         or metrics.get("lane") == "discovery_deferred"
+        or metrics.get("scoped_terminal_reason") in {
+            "audited_blocked",
+            "failed_approaches_exhausted",
+        }
         or str(continuity.get("status") or "") in {"paused", "blocked"}
         or bool(continuity.get("blocked_reason"))
         or "blocked" in disposition_statuses
-        or _safe_int(metrics.get("no_progress_actions")) > 0
     )
     audited_no_change = bool(
         disposition_statuses & _AUDITED_NO_CHANGE_DISPOSITIONS
@@ -637,6 +724,8 @@ def _agent_run_reporting(*, status: str, metrics: dict[str, Any]) -> dict[str, A
     normalized_status = str(status or "").lower()
     if normalized_status == "failed":
         outcome_category = "failed"
+    elif queue_acknowledged:
+        outcome_category = "queue_acknowledged"
     elif traveler_visible_changed:
         outcome_category = "traveler_visible_changed"
     elif proposal_created:
@@ -796,6 +885,7 @@ def _run_agent_background(city_id: int, research: bool) -> None:
         db.close()
     with _agent_run_lock:
         _agent_run_state["result"] = result
+        _agent_run_state["results_by_city"] = {city_id: result}
         _agent_run_state["finished_at"] = datetime.now(timezone.utc)
         _agent_run_state["running"] = False
 
@@ -828,6 +918,7 @@ def _start_sfn_execution_locked(city_id: int, *, research: bool) -> None:
                 "started_at": now,
                 "finished_at": datetime.now(timezone.utc),
                 "result": None,
+                "results_by_city": {},
                 "execution_arn": None,
                 "backend": "step_functions",
                 "city_id": city_id,
@@ -842,6 +933,7 @@ def _start_sfn_execution_locked(city_id: int, *, research: bool) -> None:
             "started_at": response.get("startDate") or now,
             "finished_at": None,
             "result": None,
+            "results_by_city": {},
             "execution_arn": execution_arn,
             "backend": "step_functions",
             "city_id": city_id,
@@ -895,6 +987,7 @@ def admin_run_agent(
                     "started_at": datetime.now(timezone.utc),
                     "finished_at": None,
                     "result": None,
+                    "results_by_city": {},
                     "execution_arn": None,
                     "backend": "local",
                     "city_id": body.city_id,

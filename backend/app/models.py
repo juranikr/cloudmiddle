@@ -215,6 +215,12 @@ class PlaceEvent(Base):
     __tablename__ = "place_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Keep the city independently from ``place_id``.  A marker can be deleted
+    # (the FK below is intentionally SET NULL), but its history must remain in
+    # the correct city's agent queue.
+    city_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("cities.id", ondelete="RESTRICT"), index=True, nullable=True
+    )
     place_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("markers.id", ondelete="SET NULL"), index=True, nullable=True
     )
@@ -236,6 +242,7 @@ class PlaceEvent(Base):
     groq_read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
+    city: Mapped[Optional[City]] = relationship()
     place: Mapped[Optional[Marker]] = relationship(back_populates="events")
 
 

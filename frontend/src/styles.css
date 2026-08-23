@@ -1381,6 +1381,25 @@ textarea {
   line-height: 1.6;
 }
 
+.admin__quarantine-warning {
+  display: grid;
+  gap: 4px;
+  padding: 11px 12px;
+  border: 1px solid #f59e0b;
+  border-radius: 12px;
+  background: #fffbeb;
+  color: #78350f;
+}
+
+.admin__quarantine-warning strong {
+  font-size: 0.86rem;
+}
+
+.admin__quarantine-warning span {
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
 .admin__info {
   margin: 0;
   padding: 12px;
@@ -1618,6 +1637,7 @@ textarea {
 .run-outcome--traveler_visible_changed { background: #dcfce7; color: #166534; }
 .run-outcome--proposal_created { background: #dbeafe; color: #1d4ed8; }
 .run-outcome--verified_or_waived_no_change { background: #ecfeff; color: #0e7490; }
+.run-outcome--queue_acknowledged { background: #ede9fe; color: #6d28d9; }
 .run-outcome--deferred_or_blocked { background: #fef3c7; color: #92400e; }
 .run-outcome--no_yield { background: #f1f5f9; color: #64748b; }
 .run-outcome--failed { background: #fee2e2; color: #991b1b; }

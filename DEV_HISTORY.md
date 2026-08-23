@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-23 (KST) — 수동 배치 실행 격리·성과 판정·후속 작업 연속성 보강
+최종 갱신: 2026-08-23 (KST) — 삭제 후에도 이어지는 도시별 이력·결정론적 큐 학습 보강
 
 ---
 
@@ -63,7 +63,7 @@
 - 장소는 **공유 모델**: 단일 소유자 없음, `place_contributors` + 로그인 사용자 전원 수정/삭제. **「내 마커」필터 제거**
 - 이력: `place_events` (create/update/delete/merge/image_*/context_*/agent_create/**rollback**) + `groq_read_at`
 - **Groq ReAct+tools** (`backend/app/agent/`): 도시별 미읽음 이벤트를 우선 처리하고, 실제 DB 변화·새 근거·측정 가능한 성과 공백을 기준으로 조사 전략을 조정. 수동 `POST /api/admin/agent/run`, 매일 3회 활성 도시별 실행
-  - `city_id`를 러너와 모든 장소 도구에 강제 전달해 제남/선양 큐·장소·지식·검색 이력이 섞이지 않음
+  - `city_id`를 러너와 모든 장소 도구에 강제 전달하고 `place_events.city_id`를 장소와 별도로 영구 보존해, 장소가 삭제되어도 제남/선양 큐·장소·지식·검색 이력이 섞이거나 사라지지 않음
   - 자동 생성·병합 비활성 상태에서도 `agent_proposals`에 근거·출처 URL·신뢰도를 저장하고 `/admin`에서 승인/거절
   - 도시/장소 지식 topic을 `city:{id}:...` / `place:{id}:...`로 분리해 같은 `research_strategy`가 덮어써지지 않음
   - `place_insights`로 위치 맥락·역사·방문 정보·현지 팁을 출처·확인일·신뢰도와 함께 구조화
@@ -74,6 +74,7 @@
   - 에이전트 변경은 `before` 스냅샷 저장 → 관리자 롤백 가능
   - `list_recent_rollbacks`: 롤백 교훈을 읽고 **같은 방향 수정 반복 금지**
   - 실행별 실제 DB 변화·새 근거·반복 호출·성과 점수·남은 공백을 `agent_runs`/`agent_run_steps`에 기록하고 관리자 UI에서 단계별 확인
+  - 시스템 교정·관리자 롤백·동일한 영속 ID 또는 제목+위치 스냅샷으로 같은 실체임이 입증된 생성→삭제 이력은 모델이 재검색하지 않고 검증된 `AgentLesson`/`AgentKnowledge`로 승격한 뒤 읽음 처리하며, 일반 사용자 요청은 그대로 모델 큐에 보존
   - 동일 조사 호출 차단, 새 근거 없는 행동 감지, 측정 가능한 후속 과제와 자동 공백 해소로 고정 스텝 대신 성과 기반 종료
   - 신규 장소 발굴은 별도 `candidate_discovery` 미션으로 주기적 시간을 보장하고, 실제 검색·본문/좌표 검증 뒤 `agent_proposals`를 만든 경우에만 완료
   - 사진·구역처럼 현재 해결 불가능한 결손은 `agent_quality_gap_dispositions`에 근거·조건 지문·냉각 시간을 남겨 같은 실패를 매 배치 반복하지 않고 조건이 바뀌면 자동 재개
@@ -166,6 +167,17 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 7) 히스토리 타임라인
+
+### 2026-08-23 — 삭제된 장소 이력 복구 + 정정 이력의 결정론적 학습
+- 운영 수동 run #136·#137과 정기 run #139를 추적한 결과, 선양의 시스템 정정 3건을 모델이 새 수정 요청으로 오해해 매번 19~24라운드 검색하면서도 `Partial`, 미읽음 `3→3`, 실제 변경 0건으로 끝나는 문제를 재현
+- `place_events.city_id` nullable FK/index를 추가하고 이벤트 생성 시 도시를 장소 ID와 별도로 보존. 기존 데이터는 현재 마커, 명시적 payload 도시/마커/이벤트 참조, 서로 겹치지 않는 도시 viewbox 좌표만으로 고정점 백필하며, 사용자·제목 같은 모호한 정황은 추론에 쓰지 않고 `NULL` 격리함
+- 장소 삭제로 `place_id=NULL`이 된 이력도 도시가 확인되면 원래 큐에서 조회·읽음 처리할 수 있게 변경. PostgreSQL insert trigger가 구버전 writer의 살아 있는 `place_id`를 보완하고, 도시를 끝내 확인할 수 없는 신규 이력은 거부하며 기존 미귀속 이력은 관리자 경고로 노출함
+- `actor=system + cleanup_version` 교정/아카이브, 명시적 관리자 롤백, 동일한 영속 장소/상관 ID 또는 양쪽의 같은 제목+좌표/주소 스냅샷으로 실체가 입증된 생성→삭제 순변화 0 쌍만 서버가 결정론적으로 처리. 제목·시간만 같은 체인점 이력과 일반 사용자 요청은 자동 승인하지 않음
+- 교정 원칙은 `AgentLesson(status=validated)`와 구조화 `AgentKnowledge`로 승격해 다음 배치가 실제로 검색·행동 정책에 재사용하고, 모델 호출 없는 처리도 `AgentRun(outcome=queue_acknowledged)`과 `이력 학습 · 큐 정리` 관리자 배지로 감사 가능하게 기록
+- 큐 승인·지식 승격·`AgentRun` 생성은 한 트랜잭션으로 묶고, 일부만 전처리된 상태에서 모델을 실행할 수 없으면 전부 롤백해 이력만 사라지는 간극을 제거. Step Functions 다중 도시 완료 결과도 도시별 캐시로 분리해 다른 도시 결과가 표시되지 않게 함
+- 실행 행 커밋 뒤 Groq/개인화/지식 검색/프롬프트 준비에서 예외가 나도 같은 `AgentRun`을 `failed`·종료시각·실패 단계/유형으로 닫아 영구 `running` 감사 이력이 남지 않게 함
+- 로컬 PostgreSQL 16에서 FK/고정점 마이그레이션과 insert trigger를 실측: 살아 있는 마커의 구버전 insert는 도시 자동 보완, 장소·도시가 모두 없는 신규 insert는 SQLSTATE `23502`, 기존 미귀속 레거시는 격리 유지
+- 검증: 백엔드 363개 테스트, 프런트 production build, Python compileall, Docker PostgreSQL 마이그레이션·컨테이너 health, 로컬 API health/login/cities를 포함한 `dev/predeploy.ps1` 전체 통과
 
 ### 2026-08-23 — 수동 배치 실행 격리 + 감사 가능한 성과·연속성
 - 관리자 수동 실행도 API 컨테이너 안의 background thread가 아니라 예약 배치와 같은 Step Functions/Fargate 경로로 통합하고, 도시별 실패 격리·AWS 실행 재연결·정확한 도시 결과 폴링을 추가

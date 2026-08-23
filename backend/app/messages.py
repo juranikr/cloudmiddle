@@ -131,6 +131,7 @@ def create_appeal(
     log_place_event(
         db,
         place_id=place_id,
+        city_id=place.city_id,
         user=user,
         action=PlaceEventAction.appeal,
         summary=f"이의신청: {body.strip()[:80]}",

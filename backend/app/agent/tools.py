@@ -29,6 +29,7 @@ from app.events import (
     log_place_event,
     mark_events_read,
     marker_field_snapshot,
+    place_event_city_clause,
     summary_for_changes,
 )
 from app.geocode import parse_viewbox, search_address
@@ -2225,9 +2226,8 @@ def run_tool(
         limit = int(args.get("limit") or 30)
         rows = (
             db.query(PlaceEvent)
-            .join(Marker, Marker.id == PlaceEvent.place_id)
             .filter(PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent")
-            .filter(Marker.city_id == city_id)
+            .filter(place_event_city_clause(city_id))
             .order_by(PlaceEvent.created_at.asc())
             .limit(max(1, min(limit, 100)))
             .all()
@@ -2251,11 +2251,10 @@ def run_tool(
         allowed = [
             row[0]
             for row in db.query(PlaceEvent.id)
-            .join(Marker, Marker.id == PlaceEvent.place_id)
-            .filter(PlaceEvent.id.in_(ids), Marker.city_id == city_id)
+            .filter(PlaceEvent.id.in_(ids), place_event_city_clause(city_id))
             .all()
         ]
-        n = mark_events_read(db, allowed)
+        n = mark_events_read(db, allowed, city_id=city_id)
         db.commit()
         return {"marked": n}
 
@@ -3553,11 +3552,10 @@ def run_tool(
         limit = int(args.get("limit") or 20)
         rows = (
             db.query(PlaceEvent)
-            .join(Marker, Marker.id == PlaceEvent.place_id)
             .filter(
                 PlaceEvent.action == PlaceEventAction.rollback,
                 PlaceEvent.groq_read_at.is_(None),
-                Marker.city_id == city_id,
+                place_event_city_clause(city_id),
             )
             .order_by(PlaceEvent.created_at.desc())
             .limit(max(1, min(limit, 50)))

@@ -82,6 +82,47 @@ class AgentRunOutcomeReportingTests(unittest.TestCase):
             "choose_alternative_source",
         )
 
+    def test_deterministic_queue_ack_has_its_own_outcome(self) -> None:
+        for metrics in (
+            {"outcome": "queue_acknowledged"},
+            {"lane": "deterministic_queue_ack", "delta": {"unread_cleared": 3}},
+        ):
+            with self.subTest(metrics=metrics):
+                report = _agent_run_reporting(status="completed", metrics=metrics)
+
+                self.assertEqual(report["outcome_category"], "queue_acknowledged")
+                self.assertEqual(report["material_change_count"], 0)
+
+    def test_no_progress_counter_alone_does_not_claim_a_durable_block(self) -> None:
+        report = _agent_run_reporting(
+            status="completed",
+            metrics={"no_progress_actions": 32},
+        )
+
+        self.assertEqual(report["outcome_category"], "no_yield")
+
+    def test_internal_context_write_is_not_labeled_traveler_visible(self) -> None:
+        report = _agent_run_reporting(
+            status="completed",
+            metrics={"material_changes": [{"tool": "update_place_context", "place_id": 96}]},
+        )
+
+        self.assertEqual(report["outcome_category"], "no_yield")
+
+    def test_verification_timestamp_is_reported_as_audit_not_visible_change(self) -> None:
+        report = _agent_run_reporting(
+            status="completed",
+            metrics={
+                "material_changes": [{"tool": "verify_place", "place_id": 96}],
+                "successful_tool_counts": {"verify_place": 1},
+            },
+        )
+
+        self.assertEqual(
+            report["outcome_category"],
+            "verified_or_waived_no_change",
+        )
+
     def test_normal_completion_without_audited_result_is_no_yield(self) -> None:
         report = _agent_run_reporting(
             status="completed",

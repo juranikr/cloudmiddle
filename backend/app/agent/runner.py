@@ -40,6 +40,7 @@ from app.agent.memory import (
     reconcile_work_items,
     retrieve_contextual_knowledge,
     rotate_blocked_work_item,
+    observe_lesson,
 )
 from app.models import (
     AgentCheckpoint,
@@ -58,11 +59,13 @@ from app.models import (
     PlaceAppeal,
     PlaceAppealStatus,
     PlaceEvent,
+    PlaceEventAction,
     PlaceImage,
     PlaceInsight,
 )
 from app.personalization import city_personalization_brief
-from app.knowledge import normalize_knowledge_metadata
+from app.knowledge import normalize_knowledge_metadata, upsert_knowledge
+from app.events import place_event_city_clause
 from app.place_identity import PlaceIdentityInput, same_place_candidate
 
 SYSTEM = """당신은 중국 지난(济南) 여행 공유 지도의 정리 에이전트입니다.
@@ -353,9 +356,7 @@ def count_unread(db: Session, city_id: int | None = None) -> int:
         PlaceAppeal.groq_read_at.is_(None),
     )
     if city_id is not None:
-        event_query = event_query.join(Marker, Marker.id == PlaceEvent.place_id).filter(
-            Marker.city_id == city_id
-        )
+        event_query = event_query.filter(place_event_city_clause(city_id))
         appeal_query = appeal_query.join(Marker, Marker.id == PlaceAppeal.place_id).filter(
             Marker.city_id == city_id
         )
@@ -367,9 +368,8 @@ def count_unread(db: Session, city_id: int | None = None) -> int:
 def _work_queue(db: Session, *, city_id: int, limit: int = 80) -> dict[str, Any]:
     events = (
         db.query(PlaceEvent)
-        .join(Marker, Marker.id == PlaceEvent.place_id)
         .filter(PlaceEvent.groq_read_at.is_(None), PlaceEvent.actor != "agent")
-        .filter(Marker.city_id == city_id)
+        .filter(place_event_city_clause(city_id))
         .order_by(PlaceEvent.created_at.asc())
         .limit(limit)
         .all()
@@ -421,6 +421,426 @@ def _queue_brief(queue: dict[str, Any]) -> str:
         },
         ensure_ascii=False,
     )[:6000]
+
+
+_AUTHORITATIVE_EVENT_KNOWLEDGE_FIELDS = (
+    "title",
+    "local_name",
+    "address",
+    "description",
+    "category",
+    "travel_role",
+    "lat",
+    "lng",
+)
+_NET_ZERO_PAIR_MAX_SECONDS = 10 * 60
+
+
+def _place_event_payload(event: PlaceEvent) -> dict[str, Any]:
+    try:
+        payload = json.loads(event.payload or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _place_event_action(event: PlaceEvent) -> str:
+    return event.action.value if isinstance(event.action, PlaceEventAction) else str(event.action or "")
+
+
+def _event_snapshot_title(event: PlaceEvent, payload: dict[str, Any]) -> str:
+    """Return a title from durable payload data, never from display summary."""
+
+    action = _place_event_action(event)
+    preferred = ("after", "before") if action == PlaceEventAction.create.value else ("before", "after")
+    for key in (*preferred, "marker", "snapshot", "place"):
+        value = payload.get(key)
+        if isinstance(value, dict) and isinstance(value.get("title"), str):
+            title = value["title"].strip()
+            if title:
+                return title
+    if isinstance(payload.get("title"), str) and payload["title"].strip():
+        return payload["title"].strip()
+    return ""
+
+
+def _normalized_exact_title(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def _event_target_is_gone(db: Session, event: PlaceEvent) -> bool:
+    return event.place_id is None or db.get(Marker, int(event.place_id)) is None
+
+
+def _event_entity_references(event: PlaceEvent, payload: dict[str, Any]) -> set[str]:
+    """Extract only durable entity/correlation identifiers from an event."""
+
+    refs: set[str] = set()
+    if event.place_id is not None:
+        refs.add(f"place:{int(event.place_id)}")
+    containers = [payload]
+    containers.extend(
+        value
+        for key in ("before", "after", "marker", "snapshot", "place")
+        if isinstance((value := payload.get(key)), dict)
+    )
+    for index, container in enumerate(containers):
+        keys = ("place_id", "marker_id", "entity_id", "id") if index else (
+            "place_id",
+            "marker_id",
+            "entity_id",
+        )
+        for key in keys:
+            value = container.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                refs.add(f"place:{value}")
+            elif isinstance(value, str) and value.strip().isdigit():
+                refs.add(f"place:{int(value.strip())}")
+    for key in (
+        "correlation_id",
+        "operation_id",
+        "client_mutation_id",
+        "event_group_id",
+    ):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            refs.add(f"correlation:{key}:{value[:300]}")
+    return refs
+
+
+def _event_entity_snapshot(event: PlaceEvent, payload: dict[str, Any]) -> dict[str, Any] | None:
+    action = _place_event_action(event)
+    preferred = ("after", "before") if action == PlaceEventAction.create.value else ("before", "after")
+    for key in (*preferred, "marker", "snapshot", "place"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    # Some older events stored the marker snapshot directly in payload. It is
+    # still a snapshot only when it contains identity plus location evidence.
+    if payload.get("title") and (
+        payload.get("address")
+        or (payload.get("lat") is not None and payload.get("lng") is not None)
+    ):
+        return payload
+    return None
+
+
+def _snapshot_coordinate(snapshot: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        lat = float(snapshot["lat"])
+        lng = float(snapshot["lng"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None
+    return lat, lng
+
+
+def _normalized_exact_address(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _same_entity_proof(
+    created: PlaceEvent,
+    deleted: PlaceEvent,
+) -> str | None:
+    created_payload = _place_event_payload(created)
+    deleted_payload = _place_event_payload(deleted)
+    shared_refs = _event_entity_references(created, created_payload) & _event_entity_references(
+        deleted,
+        deleted_payload,
+    )
+    if shared_refs:
+        return f"shared_durable_reference:{sorted(shared_refs)[0]}"
+
+    created_snapshot = _event_entity_snapshot(created, created_payload)
+    deleted_snapshot = _event_entity_snapshot(deleted, deleted_payload)
+    if created_snapshot is None or deleted_snapshot is None:
+        return None
+    created_title = _normalized_exact_title(str(created_snapshot.get("title") or ""))
+    deleted_title = _normalized_exact_title(str(deleted_snapshot.get("title") or ""))
+    if len(created_title) < 3 or created_title != deleted_title:
+        return None
+
+    created_coords = _snapshot_coordinate(created_snapshot)
+    deleted_coords = _snapshot_coordinate(deleted_snapshot)
+    if created_coords is not None and deleted_coords is not None:
+        if (
+            abs(created_coords[0] - deleted_coords[0]) <= 0.000001
+            and abs(created_coords[1] - deleted_coords[1]) <= 0.000001
+        ):
+            return "matching_title_and_coordinates"
+    created_address = _normalized_exact_address(created_snapshot.get("address"))
+    deleted_address = _normalized_exact_address(deleted_snapshot.get("address"))
+    if len(created_address) >= 5 and created_address == deleted_address:
+        return "matching_title_and_address"
+    return None
+
+
+def _event_time_distance_seconds(first: PlaceEvent, second: PlaceEvent) -> float:
+    if first.created_at is None or second.created_at is None:
+        return float("inf")
+    first_at = first.created_at
+    second_at = second.created_at
+    if first_at.tzinfo is None:
+        first_at = first_at.replace(tzinfo=timezone.utc)
+    if second_at.tzinfo is None:
+        second_at = second_at.replace(tzinfo=timezone.utc)
+    return abs((second_at - first_at).total_seconds())
+
+
+def _is_authoritative_system_event(event: PlaceEvent, payload: dict[str, Any]) -> bool:
+    return bool(event.actor == "system" and str(payload.get("cleanup_version") or "").strip())
+
+
+def _is_explicit_admin_rollback(event: PlaceEvent, payload: dict[str, Any]) -> bool:
+    return bool(
+        _place_event_action(event) == PlaceEventAction.rollback.value
+        and str(payload.get("lesson") or "").strip()
+        and payload.get("rolled_back_event_id") is not None
+    )
+
+
+def _is_archive_metadata_event(event: PlaceEvent, payload: dict[str, Any]) -> bool:
+    """Archive snapshots are audit evidence, not model work or KB prose."""
+
+    return bool(
+        _is_authoritative_system_event(event, payload)
+        and _place_event_action(event) == PlaceEventAction.context_update.value
+        and not str(payload.get("lesson") or "").strip()
+    )
+
+
+def _authoritative_correction_principle(event: PlaceEvent, payload: dict[str, Any]) -> str:
+    explicit = str(payload.get("lesson") or "").strip()
+    if explicit:
+        return explicit[:2000]
+
+    changes = payload.get("changes")
+    rendered_changes: list[str] = []
+    if isinstance(changes, list):
+        for item in changes[:8]:
+            if not isinstance(item, dict) or not str(item.get("field") or "").strip():
+                continue
+            after = str(item.get("after") or "").strip()
+            rendered_changes.append(f"{item['field']}: {after[:240]}")
+    if not rendered_changes:
+        after = payload.get("after")
+        if isinstance(after, dict):
+            rendered_changes = [
+                f"{key}: {str(after[key]).strip()[:240]}"
+                for key in _AUTHORITATIVE_EVENT_KNOWLEDGE_FIELDS
+                if after.get(key) not in (None, "")
+            ][:8]
+    summary = (event.summary or "시스템 데이터 교정").strip()[:500]
+    if rendered_changes:
+        return f"{summary}. 확정된 교정 상태: " + "; ".join(rendered_changes)
+    return f"{summary}. 이 시스템 교정 결과를 새 근거 없이 되돌리지 않는다."
+
+
+def _source_refs_from_event(event: PlaceEvent, payload: dict[str, Any]) -> list[str]:
+    refs = [f"place_event:{event.id}"]
+    raw_urls = payload.get("source_urls")
+    if isinstance(raw_urls, list):
+        refs.extend(str(value).strip()[:1000] for value in raw_urls if str(value).strip())
+    source_url = str(payload.get("source_url") or "").strip()
+    if source_url:
+        refs.append(source_url[:1000])
+    return list(dict.fromkeys(refs))[:30]
+
+
+def _promote_authoritative_event_knowledge(
+    db: Session,
+    *,
+    event: PlaceEvent,
+    payload: dict[str, Any],
+    city_id: int,
+    principle: str,
+    category: str,
+) -> tuple[int, int]:
+    """Persist a trusted correction both as retrievable knowledge and a lesson."""
+
+    identity = f"{city_id}|{event.place_id}|{category}|{principle}"
+    fingerprint = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+    evidence_refs = _source_refs_from_event(event, payload)
+    place_id = (
+        int(event.place_id)
+        if event.place_id is not None and db.get(Marker, int(event.place_id)) is not None
+        else None
+    )
+    lesson = observe_lesson(
+        db,
+        key=f"authoritative-{category}:{fingerprint}",
+        city_id=city_id,
+        category="data_quality",
+        trigger=(event.summary or f"place event #{event.id}")[:1000],
+        action=principle[:3000],
+        expected_effect="검증된 교정 결과의 재오염과 삭제된 배치의 자동 부활을 방지한다.",
+        evidence_ref=f"place_event:{event.id}",
+        applicability={
+            "authority": category,
+            "event_action": _place_event_action(event),
+            "place_id": place_id,
+        },
+        successful=True,
+    )
+    # Admin/system corrections are direct outcome evidence, not speculative
+    # model observations, so they can be retrieved immediately.
+    lesson.status = "validated"
+    lesson.confidence = max(float(lesson.confidence or 0), 0.95)
+    lesson.place_id = place_id
+    knowledge = upsert_knowledge(
+        db,
+        topic=f"authoritative_{category}_{fingerprint}",
+        title=(event.summary or "관리자가 확정한 데이터 교정")[:200],
+        content=principle[:12000],
+        scope="place" if place_id is not None else "city",
+        city_id=city_id,
+        place_id=place_id,
+        category="quality",
+        summary=principle[:1000],
+        principles=[principle[:500]],
+        next_actions=["새롭고 더 강한 근거가 없으면 이 확정 상태를 되돌리거나 같은 스냅샷을 부활시키지 않는다."],
+        applicability={
+            "authority": category,
+            "event_action": _place_event_action(event),
+            "place_id": place_id,
+        },
+        source_refs=evidence_refs,
+        evidence_count=len(evidence_refs),
+        quality_score=0.98,
+    )
+    return int(lesson.id), int(knowledge.id)
+
+
+def _net_zero_create_delete_pairs(
+    db: Session,
+    events: list[PlaceEvent],
+) -> list[tuple[PlaceEvent, PlaceEvent, str, str]]:
+    pairs: list[tuple[PlaceEvent, PlaceEvent, str, str]] = []
+    for created, deleted in zip(events, events[1:]):
+        if (
+            created.actor != "user"
+            or deleted.actor != "user"
+            or created.user_id is None
+            or created.user_id != deleted.user_id
+            or _place_event_action(created) != PlaceEventAction.create.value
+            or _place_event_action(deleted) != PlaceEventAction.delete.value
+            or not _event_target_is_gone(db, created)
+            or not _event_target_is_gone(db, deleted)
+            or _event_time_distance_seconds(created, deleted) > _NET_ZERO_PAIR_MAX_SECONDS
+        ):
+            continue
+        proof = _same_entity_proof(created, deleted)
+        if proof is None:
+            continue
+        created_title = _event_snapshot_title(created, _place_event_payload(created))
+        deleted_title = _event_snapshot_title(deleted, _place_event_payload(deleted))
+        title = created_title or deleted_title or "삭제된 장소"
+        pairs.append((created, deleted, title.strip(), proof))
+    return pairs
+
+
+def _acknowledge_authoritative_queue_events(db: Session, *, city_id: int) -> dict[str, Any]:
+    """Deterministically consume audit facts that do not require model judgment.
+
+    Ordinary user creates, deletes and updates remain in the queue. The only
+    user-authored exceptions are explicit admin rollback records and an exact,
+    adjacent create->delete pair whose target has already disappeared.
+    """
+
+    rows = (
+        db.query(PlaceEvent)
+        .filter(
+            place_event_city_clause(city_id),
+            PlaceEvent.groq_read_at.is_(None),
+            PlaceEvent.actor != "agent",
+        )
+        .order_by(PlaceEvent.created_at.asc(), PlaceEvent.id.asc())
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    acknowledged_ids: set[int] = set()
+    lesson_ids: list[int] = []
+    knowledge_ids: list[int] = []
+    archive_event_ids: list[int] = []
+    rollback_event_ids: list[int] = []
+    correction_event_ids: list[int] = []
+    net_zero_pairs: list[dict[str, Any]] = []
+
+    for event in rows:
+        payload = _place_event_payload(event)
+        if _is_archive_metadata_event(event, payload):
+            archive_event_ids.append(int(event.id))
+            acknowledged_ids.add(int(event.id))
+            continue
+        if not (
+            _is_authoritative_system_event(event, payload)
+            or _is_explicit_admin_rollback(event, payload)
+        ):
+            continue
+        category = "admin_rollback" if _is_explicit_admin_rollback(event, payload) else "system_correction"
+        principle = _authoritative_correction_principle(event, payload)
+        lesson_id, knowledge_id = _promote_authoritative_event_knowledge(
+            db,
+            event=event,
+            payload=payload,
+            city_id=city_id,
+            principle=principle,
+            category=category,
+        )
+        lesson_ids.append(lesson_id)
+        knowledge_ids.append(knowledge_id)
+        acknowledged_ids.add(int(event.id))
+        if category == "admin_rollback":
+            rollback_event_ids.append(int(event.id))
+        else:
+            correction_event_ids.append(int(event.id))
+
+    # Adjacency is evaluated against the original ordered queue. Removing a
+    # system event first must not make two unrelated user actions look paired.
+    for created, deleted, title, proof in _net_zero_create_delete_pairs(db, rows):
+        if created.id in acknowledged_ids or deleted.id in acknowledged_ids:
+            continue
+        synthetic_payload = {
+            "lesson": (
+                f"사용자가 '{title}' 배치를 추가 직후 삭제했다. 동일한 제목과 위치 스냅샷을 "
+                "자동으로 되살리지 말고 새 사용자 요청과 검증된 좌표가 있을 때만 다시 검토한다."
+            )
+        }
+        lesson_id, knowledge_id = _promote_authoritative_event_knowledge(
+            db,
+            event=deleted,
+            payload=synthetic_payload,
+            city_id=city_id,
+            principle=synthetic_payload["lesson"],
+            category="user_net_zero_delete",
+        )
+        lesson_ids.append(lesson_id)
+        knowledge_ids.append(knowledge_id)
+        acknowledged_ids.update((int(created.id), int(deleted.id)))
+        net_zero_pairs.append({
+            "create_event_id": int(created.id),
+            "delete_event_id": int(deleted.id),
+            "title": title[:200],
+            "same_entity_proof": proof,
+        })
+
+    for event in rows:
+        if int(event.id) in acknowledged_ids:
+            event.groq_read_at = now
+    if acknowledged_ids:
+        db.flush()
+    return {
+        "acknowledged_event_ids": sorted(acknowledged_ids),
+        "acknowledged_event_count": len(acknowledged_ids),
+        "promoted_lesson_ids": sorted(set(lesson_ids)),
+        "promoted_knowledge_ids": sorted(set(knowledge_ids)),
+        "system_correction_event_ids": correction_event_ids,
+        "archive_metadata_event_ids": archive_event_ids,
+        "admin_rollback_event_ids": rollback_event_ids,
+        "net_zero_create_delete_pairs": net_zero_pairs,
+    }
 
 
 def _marker_quality_gaps(marker: Marker) -> list[str]:
@@ -3755,6 +4175,167 @@ def _release_agent_city_lock(connection: Any, *, city_id: int) -> None:
         connection.close()
 
 
+def _record_deterministic_queue_ack_run(
+    db: Session,
+    *,
+    city: City,
+    unread_before: int,
+    preprocessing: dict[str, Any],
+    started_at: datetime,
+) -> dict[str, Any]:
+    """Persist a real run even when trusted queue facts need no model call."""
+
+    unread_after = count_unread(db, city.id)
+    performance_after = _performance_snapshot(db, city.id)
+    performance_before = dict(performance_after)
+    performance_before["unread"] = unread_before
+    performance_delta = _performance_delta(performance_before, performance_after)
+    acknowledged = int(preprocessing.get("acknowledged_event_count") or 0)
+    corrections = len(preprocessing.get("system_correction_event_ids") or [])
+    archives = len(preprocessing.get("archive_metadata_event_ids") or [])
+    rollbacks = len(preprocessing.get("admin_rollback_event_ids") or [])
+    net_zero = len(preprocessing.get("net_zero_create_delete_pairs") or [])
+    score = _performance_score(
+        performance_delta,
+        {"acknowledge_authoritative_events": acknowledged},
+    )
+    summary = (
+        f"모델 호출 없이 신뢰 가능한 큐 이력 {acknowledged}건을 정리했습니다. "
+        f"시스템 교정 {corrections}건, 보존 아카이브 {archives}건, "
+        f"관리자 롤백 {rollbacks}건, 추가 후 삭제된 순변화 0 쌍 {net_zero}건. "
+        f"미읽음 {unread_before}→{unread_after}."
+    )
+    finished_at = datetime.now(timezone.utc)
+    run = AgentRun(
+        city_id=city.id,
+        mode="queue",
+        status="completed",
+        objective="신뢰 가능한 시스템 교정·관리자 롤백·순변화 0 이력을 장기 지식으로 승격하고 큐에서 승인 처리",
+        score=score,
+        metrics=json.dumps(
+            {
+                "before": performance_before,
+                "after": performance_after,
+                "delta": performance_delta,
+                "lane": "deterministic_queue_ack",
+                "outcome": "queue_acknowledged",
+                "tool_counts": {"acknowledge_authoritative_events": acknowledged},
+                "successful_tool_counts": {"acknowledge_authoritative_events": acknowledged},
+                "material_changes": [],
+                "material_change_count": 0,
+                "queue_events_cleared": acknowledged,
+                "queue_preprocessing": preprocessing,
+                "duration_seconds": round((finished_at - started_at).total_seconds(), 1),
+            },
+            ensure_ascii=False,
+        ),
+        summary=summary,
+        finished_at=finished_at,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return {
+        "ok": True,
+        "status": "completed",
+        "steps": 0,
+        "message": summary,
+        "unread_before": unread_before,
+        "unread_after": unread_after,
+        "tool_counts": {"acknowledge_authoritative_events": acknowledged},
+        "score": score,
+        "performance": performance_delta,
+        "remaining_gaps": [],
+        "run_id": run.id,
+        "city_id": city.id,
+        "outcome": "queue_acknowledged",
+        "acknowledged_event_count": acknowledged,
+        "queue_preprocessing": preprocessing,
+    }
+
+
+def _finalize_unhandled_agent_run_failure(
+    db: Session,
+    *,
+    city_id: int,
+    run_id_floor: int,
+    error: Exception,
+) -> dict[str, Any] | None:
+    """Finish a run that escaped before the normal execution error boundary.
+
+    Queue preprocessing is committed together with the initial ``AgentRun``.
+    Preparation (SDK construction, memory retrieval and prompt assembly) happens
+    after that commit, so an unexpected setup failure must turn that same audit
+    row terminal instead of leaving it permanently ``running``.
+    """
+
+    db.rollback()
+    run = (
+        db.query(AgentRun)
+        .filter(
+            AgentRun.city_id == city_id,
+            AgentRun.id > run_id_floor,
+            AgentRun.status == "running",
+        )
+        .order_by(AgentRun.id.desc())
+        .first()
+    )
+    if run is None:
+        return None
+
+    try:
+        metrics = json.loads(run.metrics or "{}")
+    except (TypeError, json.JSONDecodeError):
+        metrics = {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    failure_phase = str(metrics.get("lifecycle_phase") or "preparation")
+    detail = f"{type(error).__name__}: {error}"[:1500]
+    preprocessing = metrics.get("queue_preprocessing")
+    if not isinstance(preprocessing, dict):
+        preprocessing = {}
+    acknowledged = int(preprocessing.get("acknowledged_event_count") or 0)
+    unread_before = int(metrics.get("queue_unread_before") or 0)
+    unread_after = count_unread(db, city_id)
+    finished_at = datetime.now(timezone.utc)
+    started_at = run.started_at or finished_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    metrics.update(
+        {
+            "lifecycle_phase": "failed",
+            "failure_phase": failure_phase,
+            "failure_type": type(error).__name__,
+            "material_changes": [],
+            "material_change_count": 0,
+            "duration_seconds": round(
+                (finished_at - started_at).total_seconds(), 1
+            ),
+        }
+    )
+    run.status = "failed"
+    run.score = 0
+    run.summary = f"에이전트 {failure_phase} 단계 실패: {detail}"[:4000]
+    run.metrics = json.dumps(metrics, ensure_ascii=False)
+    run.finished_at = finished_at
+    db.commit()
+    return {
+        "ok": False,
+        "status": "failed",
+        "steps": 0,
+        "message": run.summary,
+        "unread_before": unread_before,
+        "unread_after": unread_after,
+        "tool_counts": {},
+        "city_id": city_id,
+        "run_id": run.id,
+        "score": 0,
+        "acknowledged_event_count": acknowledged,
+        "queue_preprocessing": preprocessing,
+        "outcome": f"{failure_phase}_failed",
+    }
+
+
 def run_agent(
     db: Session,
     *,
@@ -3791,12 +4372,35 @@ def run_agent(
             "outcome": "already_running",
         }
     try:
-        return _run_agent_impl(
-            db,
-            city_id=city_id,
-            max_steps=max_steps,
-            autonomous_research=autonomous_research,
-        )
+        latest_run = db.query(AgentRun.id).order_by(AgentRun.id.desc()).first()
+        try:
+            run_id_floor = int(latest_run[0]) if latest_run is not None else 0
+        except (TypeError, ValueError, IndexError, KeyError):
+            # Keep lock release and the original error path reliable for an
+            # unusual/partially mocked session that cannot provide a scalar
+            # run floor. The finalizer still filters by city and running state.
+            run_id_floor = 0
+        try:
+            return _run_agent_impl(
+                db,
+                city_id=city_id,
+                max_steps=max_steps,
+                autonomous_research=autonomous_research,
+            )
+        except Exception as exc:
+            try:
+                failure = _finalize_unhandled_agent_run_failure(
+                    db,
+                    city_id=city_id,
+                    run_id_floor=run_id_floor,
+                    error=exc,
+                )
+            except Exception:
+                db.rollback()
+                raise exc
+            if failure is not None:
+                return failure
+            raise
     finally:
         if lock_connection is not None:
             _release_agent_city_lock(lock_connection, city_id=city_id)
@@ -3809,6 +4413,7 @@ def _run_agent_impl(
     max_steps: int | None = None,
     autonomous_research: bool | None = None,
 ) -> dict[str, Any]:
+    batch_started_at = datetime.now(timezone.utc)
     city = db.query(City).filter(City.id == city_id, City.status == "active").first()
     if city is None:
         return {
@@ -3825,18 +4430,72 @@ def _run_agent_impl(
         if autonomous_research is None
         else autonomous_research
     )
+    unread_before = count_unread(db, city_id)
+    queue_preprocessing: dict[str, Any] = {
+        "acknowledged_event_ids": [],
+        "acknowledged_event_count": 0,
+        "promoted_lesson_ids": [],
+        "promoted_knowledge_ids": [],
+        "system_correction_event_ids": [],
+        "archive_metadata_event_ids": [],
+        "admin_rollback_event_ids": [],
+        "net_zero_create_delete_pairs": [],
+    }
+    if unread_before > 0:
+        queue_preprocessing = _acknowledge_authoritative_queue_events(
+            db,
+            city_id=city_id,
+        )
+        if queue_preprocessing["acknowledged_event_count"]:
+            if count_unread(db, city_id) == 0:
+                # The acknowledgement, promoted knowledge and AgentRun are
+                # committed together inside this function. There is no gap in
+                # which a queue item can disappear without an auditable run.
+                return _record_deterministic_queue_ack_run(
+                    db,
+                    city=city,
+                    unread_before=unread_before,
+                    preprocessing=queue_preprocessing,
+                    started_at=batch_started_at,
+                )
     if not settings.groq_api_key:
+        attempted_preprocessing = queue_preprocessing
+        if attempted_preprocessing["acknowledged_event_count"]:
+            # A partial queue needs the model for the remaining user work. Do
+            # not consume the deterministic subset unless the regular queue
+            # AgentRun can be created in the same transaction.
+            db.rollback()
+            queue_preprocessing = {
+                "acknowledged_event_ids": [],
+                "acknowledged_event_count": 0,
+                "promoted_lesson_ids": [],
+                "promoted_knowledge_ids": [],
+                "system_correction_event_ids": [],
+                "archive_metadata_event_ids": [],
+                "admin_rollback_event_ids": [],
+                "net_zero_create_delete_pairs": [],
+                "rolled_back": True,
+                "attempted_acknowledged_event_ids": attempted_preprocessing[
+                    "acknowledged_event_ids"
+                ],
+            }
         return {
             "ok": False,
             "status": "failed",
             "steps": 0,
             "message": "GROQ_API_KEY 미설정",
-            "unread_before": count_unread(db, city_id),
+            "unread_before": unread_before,
             "unread_after": count_unread(db, city_id),
             "city_id": city_id,
+            "acknowledged_event_count": queue_preprocessing["acknowledged_event_count"],
+            "queue_preprocessing": queue_preprocessing,
         }
 
-    unread_before = count_unread(db, city_id)
+    queue_unread_before = count_unread(db, city_id)
+    # Keep the lane bound to the queue when deterministic preprocessing clears
+    # only part of the original input. A queue-triggered run must never use the
+    # remaining token budget for autonomous research, even if the model clears
+    # the last ordinary event later in this same invocation.
     queue_mode = unread_before > 0
     autonomous_mode = bool(allow_research and not queue_mode)
     if not queue_mode and not allow_research:
@@ -3853,7 +4512,7 @@ def _run_agent_impl(
     queue = _work_queue(db, city_id=city_id) if queue_mode else {
         "events": [], "appeals": [], "event_ids": [], "appeal_ids": [], "total": 0,
     }
-    personalization_hint = city_personalization_brief(db, city_id=city_id)[:7000]
+    personalization_hint = ""
     quality_task_ids_before = (
         _sync_quality_tasks(db, city_id=city_id) if autonomous_mode else []
     )
@@ -4096,15 +4755,12 @@ def _run_agent_impl(
             )
         )
 
-    from groq import Groq
-
-    client = Groq(api_key=settings.groq_api_key)
     model = settings.groq_model or "openai/gpt-oss-120b"
     # 종료는 아래 성과 게이트/정체 판단으로 결정한다. 이 값은 비정상 무한루프만 막는 안전 상한이다.
     steps_limit = max_steps or (
         max(40, settings.agent_max_steps)
         if autonomous_mode
-        else max(100, 64 + unread_before * 4)
+        else max(100, 64 + queue_unread_before * 4)
     )
     performance_before = _performance_snapshot(db, city_id)
     agent_run = AgentRun(
@@ -4128,11 +4784,22 @@ def _run_agent_impl(
             "before": performance_before,
             "lane": selected_lane,
             "discovery_reserved": discovery_reserved,
+            "queue_unread_before": unread_before,
+            "queue_model_unread_before": queue_unread_before,
+            "queue_preprocessing": queue_preprocessing,
+            "lifecycle_phase": "preparation",
         }, ensure_ascii=False),
     )
     db.add(agent_run)
+    # In queue mode this is also the first commit for deterministic partial
+    # preprocessing, atomically pairing its acknowledgements/KB writes with the
+    # regular running AgentRun audit row.
     db.commit()
     db.refresh(agent_run)
+    from groq import Groq
+
+    client = Groq(api_key=settings.groq_api_key)
+    personalization_hint = city_personalization_brief(db, city_id=city_id)[:7000]
     normalize_knowledge_metadata(db, city_id=city_id)
     learn_from_recent_runs(db, city_id=city_id)
     retrieved_knowledge = retrieve_contextual_knowledge(
@@ -4205,7 +4872,7 @@ def _run_agent_impl(
     else:
         user_msg = (
             f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
-            f"미읽음 작업 {unread_before}건 — 아래 큐를 전원 처리하기 전에는 종료·웹조사 금지.\n"
+            f"미읽음 작업 {queue_unread_before}건 — 아래 큐를 전원 처리하기 전에는 종료·웹조사 금지.\n"
             f"작업 큐 JSON: {_queue_brief(queue)}\n"
             f"현재 상황에 맞게 검색된 지식·검증된 교훈: {kb_hint}\n"
             f"이전 실행에서 이어받은 작업 체크포인트: {continuity_hint}\n"
@@ -4386,6 +5053,12 @@ def _run_agent_impl(
             else ""
         )
     )
+    preparation_metrics = json.loads(agent_run.metrics or "{}")
+    if not isinstance(preparation_metrics, dict):
+        preparation_metrics = {}
+    preparation_metrics["lifecycle_phase"] = "execution"
+    agent_run.metrics = json.dumps(preparation_metrics, ensure_ascii=False)
+    db.commit()
     try:
         for _ in range(steps_limit):
             steps += 1
@@ -6150,6 +6823,9 @@ def _run_agent_impl(
                         "before": performance_before,
                         "lane": selected_lane,
                         "discovery_reserved": discovery_reserved,
+                        "queue_unread_before": unread_before,
+                        "queue_model_unread_before": queue_unread_before,
+                        "queue_preprocessing": queue_preprocessing,
                         "tool_counts": tool_counts,
                         "successful_tool_counts": successful_tool_counts,
                         "material_changes": _persistable_material_changes(
@@ -6171,6 +6847,7 @@ def _run_agent_impl(
                             else failed_run.work_item_id
                         ),
                         "next_work_item_id": next_work_item_id,
+                        "scoped_terminal_reason": scoped_terminal_reason,
                         "continuity": (
                             next_continuity
                             if scoped_quality_mode and next_continuity is not None
@@ -6204,6 +6881,8 @@ def _run_agent_impl(
             "run_id": agent_run.id,
             "score": current_score,
             "model_recovery_attempts": model_recovery_attempts,
+            "acknowledged_event_count": queue_preprocessing["acknowledged_event_count"],
+            "queue_preprocessing": queue_preprocessing,
         }
 
     unread_after = count_unread(db, city_id)
@@ -6235,6 +6914,11 @@ def _run_agent_impl(
     if tool_counts:
         stats = ", ".join(f"{t}×{c}" for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]))
         summary = f"{summary}\n[작업 통계] {stats}"
+    if queue_preprocessing["acknowledged_event_count"]:
+        summary = (
+            f"{summary}\n[결정론적 큐 정리] 신뢰 가능한 교정·롤백·순변화 0 이력 "
+            f"{queue_preprocessing['acknowledged_event_count']}건 승인 처리"
+        )
     if queue_mode and unread_after > 0:
         summary = (
             f"미처리 {unread_after}건 잔존 (시작 {unread_before}건, steps={steps}). "
@@ -6278,6 +6962,9 @@ def _run_agent_impl(
                 "delta": performance_delta,
                 "lane": selected_lane,
                 "discovery_reserved": discovery_reserved,
+                "queue_unread_before": unread_before,
+                "queue_model_unread_before": queue_unread_before,
+                "queue_preprocessing": queue_preprocessing,
                 "tool_counts": tool_counts,
                 "successful_tool_counts": successful_tool_counts,
                 "material_changes": _persistable_material_changes(
@@ -6304,6 +6991,7 @@ def _run_agent_impl(
                     else active_work_item.id if active_work_item is not None else None
                 ),
                 "next_work_item_id": next_work_item_id,
+                "scoped_terminal_reason": scoped_terminal_reason,
                 "continuity": (
                     next_continuity
                     if scoped_quality_mode and next_continuity is not None
@@ -6366,4 +7054,6 @@ def _run_agent_impl(
         "model_recovery_attempts": model_recovery_attempts,
         "run_id": agent_run.id,
         "city_id": city_id,
+        "acknowledged_event_count": queue_preprocessing["acknowledged_event_count"],
+        "queue_preprocessing": queue_preprocessing,
     }

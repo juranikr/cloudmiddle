@@ -292,6 +292,7 @@ class PlaceEventChange(BaseModel):
 
 class PlaceEventOut(BaseModel):
     id: int
+    city_id: Optional[int] = None
     place_id: Optional[int] = None
     user_id: Optional[int] = None
     actor_name: str = ""

@@ -40,6 +40,7 @@ const OUTCOME_LABEL: Record<AdminAgentOutcomeCategory, string> = {
   traveler_visible_changed: "여행자 화면 변경",
   proposal_created: "승인 제안 생성",
   verified_or_waived_no_change: "검증 완료 · 변경 불필요",
+  queue_acknowledged: "이력 학습 · 큐 정리",
   deferred_or_blocked: "조건 대기 · 차단",
   no_yield: "성과 없음",
   failed: "실행 실패",
@@ -369,26 +370,37 @@ export default function AdminPage() {
           </label>
         </div>
         {status ? (
-          <ul className="admin__stats">
-            <li>
-              Groq: {status.groq_configured ? "설정됨" : "미설정"} ({status.groq_model})
-            </li>
-            <li>
-              Brave Place: {status.brave_place_configured ? "발견용 연결됨" : "미설정"}
-              {status.brave_storage_rights ? " · 저장 권한 있음" : " · 발견 전용 · 응답 데이터 비보존"}
-            </li>
-            <li>활성 장소: {status.markers_active}</li>
-            <li>관광 구역: {status.zones_active ?? 0}</li>
-            <li>
-              미읽음 이력: {status.events_unread} / 전체 {status.events_total}
-            </li>
-            <li>열린 이의: {status.appeals_open}</li>
-            <li>작업 대기(이력+이의): {status.unread_work_items}</li>
-            <li>지식 주제: {status.knowledge_topics ?? 0}</li>
-            <li>에이전트 추천 장소: {status.agent_suggested_places ?? 0}</li>
-            <li>승인 대기 제안: {status.proposals_pending ?? 0}</li>
-            <li>조건 변경까지 보류한 품질 결손: {status.quality_gaps_suppressed ?? 0}</li>
-          </ul>
+          <>
+            <ul className="admin__stats">
+              <li>
+                Groq: {status.groq_configured ? "설정됨" : "미설정"} ({status.groq_model})
+              </li>
+              <li>
+                Brave Place: {status.brave_place_configured ? "발견용 연결됨" : "미설정"}
+                {status.brave_storage_rights ? " · 저장 권한 있음" : " · 발견 전용 · 응답 데이터 비보존"}
+              </li>
+              <li>활성 장소: {status.markers_active}</li>
+              <li>관광 구역: {status.zones_active ?? 0}</li>
+              <li>
+                미읽음 이력: {status.events_unread} / 전체 {status.events_total}
+              </li>
+              <li>열린 이의: {status.appeals_open}</li>
+              <li>작업 대기(이력+이의): {status.unread_work_items}</li>
+              <li>지식 주제: {status.knowledge_topics ?? 0}</li>
+              <li>에이전트 추천 장소: {status.agent_suggested_places ?? 0}</li>
+              <li>승인 대기 제안: {status.proposals_pending ?? 0}</li>
+              <li>조건 변경까지 보류한 품질 결손: {status.quality_gaps_suppressed ?? 0}</li>
+            </ul>
+            {(status.events_unattributed ?? 0) > 0 ? (
+              <aside className="admin__quarantine-warning" role="alert">
+                <strong>도시 미귀속 격리 이력 {status.events_unattributed}건</strong>
+                <span>
+                  아직 city_id가 없어 도시별 에이전트가 안전하게 처리할 수 없는 미읽음 과거 이력입니다.
+                  자동 처리된 것으로 숨기지 않았으므로 관리자 확인·귀속이 필요합니다.
+                </span>
+              </aside>
+            ) : null}
+          </>
         ) : (
           <p className="panel__meta">불러오는 중…</p>
         )}

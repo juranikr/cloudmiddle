@@ -5463,6 +5463,7 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(run.work_item_id, initial_item.id)
         self.assertEqual(metrics["work_item_id"], initial_item.id)
         self.assertEqual(metrics["next_work_item_id"], sibling.id)
+        self.assertEqual(metrics["scoped_terminal_reason"], "material_change")
         self.assertEqual(metrics["continuity"]["work_item_id"], sibling.id)
         self.assertEqual(active_work_item_for_mission(self.db, mission).id, sibling.id)
         write_step = self.db.query(AgentRunStep).filter(

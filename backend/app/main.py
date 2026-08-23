@@ -508,10 +508,17 @@ def create_marker(
     log_place_event(
         db,
         place_id=marker.id,
+        city_id=marker.city_id,
         user=current_user,
         action=PlaceEventAction.create,
         summary=f"장소 추가: {marker.title}",
-        payload={"category": marker.category.value, "lat": lat, "lng": lng},
+        payload={
+            "place_id": marker.id,
+            "category": marker.category.value,
+            "lat": lat,
+            "lng": lng,
+            "after": marker_field_snapshot(marker),
+        },
     )
     db.commit()
     marker = _load_place(db, marker.id)
@@ -730,6 +737,7 @@ def list_marker_events(
         out.append(
             PlaceEventOut(
                 id=e.id,
+                city_id=e.city_id,
                 place_id=e.place_id,
                 user_id=e.user_id,
                 actor_name=actor_name,
@@ -794,6 +802,7 @@ def update_marker(
     log_place_event(
         db,
         place_id=marker.id,
+        city_id=marker.city_id,
         user=current_user,
         action=PlaceEventAction.update,
         summary=summary_for_changes("장소 수정", changes) if changes else f"장소 수정: {marker.title}",
@@ -819,13 +828,19 @@ def delete_marker(
     marker = db.query(Marker).filter(Marker.id == marker_id, Marker.merged_into_id.is_(None)).first()
     if marker is None:
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    before = marker_field_snapshot(marker)
     log_place_event(
         db,
         place_id=marker.id,
+        city_id=marker.city_id,
         user=current_user,
         action=PlaceEventAction.delete,
         summary=f"장소 삭제: {marker.title}",
-        payload={"title": marker.title},
+        payload={
+            "place_id": marker.id,
+            "title": marker.title,
+            "before": before,
+        },
     )
     if marker.shape == MarkerShape.polygon:
         db.query(Marker).filter(Marker.zone_id == marker.id).update(
@@ -867,6 +882,7 @@ def presign_image(
     log_place_event(
         db,
         place_id=marker_id,
+        city_id=marker.city_id,
         user=current_user,
         action=PlaceEventAction.image_add,
         summary="이미지 추가",
@@ -901,6 +917,7 @@ def reorder_images(
     log_place_event(
         db,
         place_id=marker_id,
+        city_id=marker.city_id,
         user=current_user,
         action=PlaceEventAction.image_reorder,
         summary="이미지 순서 변경",

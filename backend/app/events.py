@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.models import Marker, PlaceContributor, PlaceEvent, PlaceEventAction, User
@@ -48,6 +49,7 @@ def ensure_contributor(db: Session, place_id: int, user_id: int) -> None:
 
 def marker_field_snapshot(m: Marker) -> dict[str, Any]:
     return {
+        "city_id": m.city_id,
         "title": m.title,
         "description": m.description or "",
         "category": m.category.value if m.category else "other",
@@ -131,6 +133,7 @@ def log_place_event(
     db: Session,
     *,
     place_id: Optional[int],
+    city_id: Optional[int] = None,
     user: Optional[User],
     action: PlaceEventAction,
     summary: str,
@@ -138,25 +141,74 @@ def log_place_event(
     actor: str = "user",
 ) -> PlaceEvent:
     now = datetime.now(timezone.utc)
+    resolved_city_id = city_id
+    if resolved_city_id is None and place_id is not None:
+        resolved_city_id = (
+            db.query(Marker.city_id).filter(Marker.id == place_id).scalar()
+        )
+
+    payload_data = dict(payload or {})
+    if place_id is not None:
+        # The FK is SET NULL when a marker is deleted. Keep the immutable
+        # identity inside the audit payload so create/delete pairs can be
+        # correlated without guessing from a chain title.
+        payload_data.setdefault("place_id", place_id)
+    if resolved_city_id is None:
+        raw_payload_city_id = payload_data.get("city_id")
+        try:
+            resolved_city_id = (
+                int(raw_payload_city_id) if raw_payload_city_id is not None else None
+            )
+        except (TypeError, ValueError):
+            resolved_city_id = None
+    if resolved_city_id is not None:
+        # A redundant payload copy keeps exported/raw audit records
+        # self-describing even outside this database schema.
+        payload_data.setdefault("city_id", resolved_city_id)
+
     # Agent-authored events are already "known" to the agent — mark read immediately.
     event = PlaceEvent(
+        city_id=resolved_city_id,
         place_id=place_id,
         user_id=user.id if user else None,
         actor=actor,
         action=action,
         summary=summary[:500],
-        payload=json.dumps(payload or {}, ensure_ascii=False),
+        payload=json.dumps(payload_data, ensure_ascii=False),
         groq_read_at=now if actor == "agent" else None,
     )
     db.add(event)
     return event
 
 
-def mark_events_read(db: Session, event_ids: list[int]) -> int:
+def place_event_city_clause(city_id: int):
+    """City scope with a compatibility path for pre-migration rows.
+
+    New and migrated rows use ``PlaceEvent.city_id``.  The marker relationship
+    is consulted only while a legacy row is still unattributed.
+    """
+
+    return or_(
+        PlaceEvent.city_id == city_id,
+        and_(
+            PlaceEvent.city_id.is_(None),
+            PlaceEvent.place.has(Marker.city_id == city_id),
+        ),
+    )
+
+
+def mark_events_read(
+    db: Session,
+    event_ids: list[int],
+    *,
+    city_id: Optional[int] = None,
+) -> int:
     if not event_ids:
         return 0
     now = datetime.now(timezone.utc)
     q = db.query(PlaceEvent).filter(PlaceEvent.id.in_(event_ids), PlaceEvent.groq_read_at.is_(None))
+    if city_id is not None:
+        q = q.filter(place_event_city_clause(city_id))
     count = 0
     for ev in q.all():
         ev.groq_read_at = now

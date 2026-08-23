@@ -59,6 +59,7 @@ export interface AdminStatus {
   zones_active?: number;
   events_total: number;
   events_unread: number;
+  events_unattributed: number;
   appeals_open: number;
   users_total: number;
   unread_work_items: number;
@@ -256,6 +257,7 @@ export type AdminAgentOutcomeCategory =
   | "traveler_visible_changed"
   | "proposal_created"
   | "verified_or_waived_no_change"
+  | "queue_acknowledged"
   | "deferred_or_blocked"
   | "no_yield"
   | "failed";

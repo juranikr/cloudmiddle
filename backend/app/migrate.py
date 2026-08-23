@@ -1,6 +1,240 @@
+from __future__ import annotations
+
+import json
+from typing import Any, Iterable
+
 from sqlalchemy import inspect, text
+from sqlalchemy.engine import Connection
 
 from app.db import engine
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _mapping_nodes(value: Any) -> Iterable[dict[str, Any]]:
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            yield item
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+_PLACE_EVENT_CITY_TRIGGER_FUNCTION_SQL = """
+CREATE OR REPLACE FUNCTION cloudmiddle_fill_place_event_city_id()
+RETURNS trigger AS $$
+BEGIN
+  IF NEW.city_id IS NULL AND NEW.place_id IS NOT NULL THEN
+    SELECT city_id INTO NEW.city_id
+    FROM markers
+    WHERE id = NEW.place_id;
+  END IF;
+
+  IF NEW.city_id IS NULL THEN
+    RAISE EXCEPTION
+      'place_events.city_id is required for every new event; pass city_id when no live place exists'
+      USING ERRCODE = '23502', TABLE = 'place_events', COLUMN = 'city_id';
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql
+"""
+
+_PLACE_EVENT_CITY_TRIGGER_SQL = """
+CREATE TRIGGER trg_place_events_fill_city_id
+BEFORE INSERT ON place_events
+FOR EACH ROW
+EXECUTE FUNCTION cloudmiddle_fill_place_event_city_id()
+"""
+
+
+def _install_postgres_place_event_city_trigger(conn: Connection) -> None:
+    """Bridge rolling deployments, then fail closed for unattributed events.
+
+    This is intentionally INSERT-only. Existing legacy NULL rows stay available
+    for quarantine/manual repair, while old application tasks that still omit
+    ``city_id`` can be attributed from their live ``place_id``.
+    """
+
+    conn.execute(text(_PLACE_EVENT_CITY_TRIGGER_FUNCTION_SQL))
+    conn.execute(
+        text(
+            "DROP TRIGGER IF EXISTS trg_place_events_fill_city_id ON place_events"
+        )
+    )
+    conn.execute(text(_PLACE_EVENT_CITY_TRIGGER_SQL))
+
+
+def _backfill_place_event_city_ids(
+    conn: Connection,
+    *,
+    tables: set[str],
+) -> None:
+    """Recover durable city ownership for legacy place events.
+
+    Most rows still point at a marker and are handled in SQL.  Deleted-place
+    rows require audit-data recovery: explicit payload city, a referenced live
+    marker/event, or coordinates that fall inside exactly one city viewbox.
+    Titles and users are deliberately excluded because chain names recur across
+    cities. Ambiguous rows stay NULL as a quarantine signal.
+    """
+
+    if "place_events" not in tables or "cities" not in tables:
+        return
+
+    if "markers" in tables:
+        conn.execute(
+            text(
+                """
+                UPDATE place_events
+                SET city_id = (
+                  SELECT m.city_id FROM markers m WHERE m.id = place_events.place_id
+                )
+                WHERE city_id IS NULL
+                  AND place_id IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM markers m WHERE m.id = place_events.place_id
+                  )
+                """
+            )
+        )
+
+    if conn.execute(
+        text("SELECT 1 FROM place_events WHERE city_id IS NULL LIMIT 1")
+    ).first() is None:
+        return
+
+    city_rows = conn.execute(
+        text("SELECT id, search_viewbox FROM cities")
+    ).mappings().all()
+    valid_city_ids = {int(row["id"]) for row in city_rows}
+    city_bounds: list[tuple[int, float, float, float, float]] = []
+    for row in city_rows:
+        try:
+            parts = [float(item.strip()) for item in str(row["search_viewbox"] or "").split(",")]
+            if len(parts) != 4:
+                continue
+            west, first_lat, east, second_lat = parts
+            city_bounds.append(
+                (
+                    int(row["id"]),
+                    min(west, east),
+                    max(west, east),
+                    min(first_lat, second_lat),
+                    max(first_lat, second_lat),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+
+    marker_cities: dict[int, int] = {}
+    if "markers" in tables:
+        marker_cities = {
+            int(row["id"]): int(row["city_id"])
+            for row in conn.execute(
+                text("SELECT id, city_id FROM markers WHERE city_id IS NOT NULL")
+            ).mappings()
+        }
+
+    rows = list(
+        conn.execute(
+            text(
+                """
+                SELECT id, city_id, place_id, user_id, summary, payload, created_at
+                FROM place_events
+                ORDER BY created_at ASC, id ASC
+                """
+            )
+        ).mappings()
+    )
+    event_cities = {
+        int(row["id"]): int(row["city_id"])
+        for row in rows
+        if row["city_id"] is not None
+    }
+    parsed_payloads = {int(row["id"]): _json_object(row["payload"]) for row in rows}
+
+    def coordinate_city(payload: dict[str, Any]) -> int | None:
+        matches: set[int] = set()
+        for node in _mapping_nodes(payload):
+            if "lat" not in node or "lng" not in node:
+                continue
+            try:
+                lat = float(node["lat"])
+                lng = float(node["lng"])
+            except (TypeError, ValueError):
+                continue
+            for city_id, west, east, south, north in city_bounds:
+                if west <= lng <= east and south <= lat <= north:
+                    matches.add(city_id)
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    def infer_city(row: Any) -> int | None:
+        payload = parsed_payloads[int(row["id"])]
+        for node in _mapping_nodes(payload):
+            city_id = _positive_int(node.get("city_id"))
+            if city_id in valid_city_ids:
+                return city_id
+
+        place_id = _positive_int(row["place_id"])
+        if place_id in marker_cities:
+            return marker_cities[place_id]
+        for node in _mapping_nodes(payload):
+            for key in ("place_id", "source_id", "target_id"):
+                marker_id = _positive_int(node.get(key))
+                if marker_id in marker_cities:
+                    return marker_cities[marker_id]
+
+        for node in _mapping_nodes(payload):
+            referenced_event_id = _positive_int(node.get("rolled_back_event_id"))
+            if referenced_event_id in event_cities:
+                return event_cities[referenced_event_id]
+
+        from_coordinates = coordinate_city(payload)
+        if from_coordinates is not None:
+            return from_coordinates
+        return None
+
+    unresolved = [row for row in rows if row["city_id"] is None]
+    # References can form short chains (rollback -> merge -> marker), so repeat
+    # until a pass cannot attribute anything else.
+    while unresolved:
+        changed = False
+        still_unresolved = []
+        for row in unresolved:
+            city_id = infer_city(row)
+            if city_id is None:
+                still_unresolved.append(row)
+                continue
+            event_id = int(row["id"])
+            conn.execute(
+                text("UPDATE place_events SET city_id = :city_id WHERE id = :event_id"),
+                {"city_id": city_id, "event_id": event_id},
+            )
+            event_cities[event_id] = city_id
+            changed = True
+        if not changed:
+            break
+        unresolved = still_unresolved
 
 
 def ensure_schema() -> None:
@@ -233,6 +467,27 @@ def ensure_schema() -> None:
         # 기여자 백필: 기존 markers.user_id → place_contributors
         tables_now = set(inspect(engine).get_table_names())
 
+        if "place_events" in tables_now and "cities" in tables_now:
+            event_cols = {
+                c["name"] for c in inspect(engine).get_columns("place_events")
+            }
+            if "city_id" not in event_cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE place_events ADD COLUMN city_id INTEGER "
+                        "REFERENCES cities(id) ON DELETE RESTRICT"
+                    )
+                )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_place_events_city_id "
+                    "ON place_events (city_id)"
+                )
+            )
+            _backfill_place_event_city_ids(conn, tables=tables_now)
+            if engine.dialect.name == "postgresql":
+                _install_postgres_place_event_city_trigger(conn)
+
         # Legacy personal DAY/slot rows become entries in one city-shared,
         # publishable itinerary document. Existing day/slot values are retained
         # as migration hints until a collaborator chooses a real date/time.
@@ -384,8 +639,9 @@ def ensure_schema() -> None:
             conn.execute(
                 text(
                     """
-                    INSERT INTO place_events (place_id, user_id, actor, action, summary, payload, groq_read_at, created_at)
+                    INSERT INTO place_events (city_id, place_id, user_id, actor, action, summary, payload, groq_read_at, created_at)
                     SELECT
+                      m.city_id,
                       m.id,
                       m.user_id,
                       'system',
