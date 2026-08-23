@@ -178,6 +178,10 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 - 실행 행 커밋 뒤 Groq/개인화/지식 검색/프롬프트 준비에서 예외가 나도 같은 `AgentRun`을 `failed`·종료시각·실패 단계/유형으로 닫아 영구 `running` 감사 이력이 남지 않게 함
 - 로컬 PostgreSQL 16에서 FK/고정점 마이그레이션과 insert trigger를 실측: 살아 있는 마커의 구버전 insert는 도시 자동 보완, 장소·도시가 모두 없는 신규 insert는 SQLSTATE `23502`, 기존 미귀속 레거시는 격리 유지
 - 검증: 백엔드 363개 테스트, 프런트 production build, Python compileall, Docker PostgreSQL 마이그레이션·컨테이너 health, 로컬 API health/login/cities를 포함한 `dev/predeploy.ps1` 전체 통과
+- 운영 배포: commit `0596a21`, GitHub Actions `32639692558` 성공, ECS task definition `tourmiddle-dev-api:6` steady state 및 `/api/health` 정상
+- 운영 데이터 정리: 잘못 배치 후 삭제된 만신호텔 이력 #360·#361을 정식 장소 #110에 연결해 읽음 폐기하고 교정 #440 기록. 장소 #96의 실제 description에서 근거 없는 정확 주소·일률 영업시간을 제거하고 교정 #441 기록
+- 연속 실행 실측: 선양 run #142가 기존 교정 #436~#438과 신규 감사 #440~#441을 모델 호출 없이 `5→0`, `completed`, `queue_acknowledged`, score 40으로 승격; 지난 run #143도 관리자 롤백 #439를 `1→0`, score 8로 학습
+- 이어진 선양 run #144는 빈 큐에서 품질 미션을 재개해 `zone_catalog_disposition`, `completed`, score 4와 재시도 커서를 남겼고, run #145는 모든 후보 프런티어의 12시간 냉각을 확인해 모델 호출 없이 `deferred`로 종료. 운영 미읽음 이력/열린 이의 0건, 영구 `running` run 0건, 교정 lesson/knowledge 각 5건 생성 확인
 
 ### 2026-08-23 — 수동 배치 실행 격리 + 감사 가능한 성과·연속성
 - 관리자 수동 실행도 API 컨테이너 안의 background thread가 아니라 예약 배치와 같은 Step Functions/Fargate 경로로 통합하고, 도시별 실패 격리·AWS 실행 재연결·정확한 도시 결과 폴링을 추가
