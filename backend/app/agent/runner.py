@@ -1698,9 +1698,11 @@ def _is_material_change(name: str, result: Any) -> bool:
     # the run's "actual changes" list.
     if name == "upsert_agent_task":
         return False
-    # A duplicate proposal returns the existing proposal_id for traceability,
-    # but proposal_created=False is an explicit no-op and must win over that ID.
-    if name == "propose_place" and result.get("proposal_created") is False:
+    # Proposal-backed tools can return the existing proposal_id for
+    # traceability, but proposal_created=False is an explicit no-op and must
+    # win over that ID regardless of which mutation tool entered the safe
+    # proposal fallback.
+    if result.get("proposal_created") is False:
         return False
     if result.get("proposal_id") is not None:
         return True

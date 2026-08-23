@@ -3807,6 +3807,10 @@ class AgentCityScopeTests(unittest.TestCase):
             "propose_place",
             {"ok": True, "proposal_created": False, "proposal_id": 91},
         ))
+        self.assertFalse(_is_material_change(
+            "create_place",
+            {"ok": True, "proposal_created": False, "proposal_id": 91},
+        ))
         self.assertTrue(_is_material_change(
             "propose_place",
             {"ok": True, "proposal_created": True, "proposal_id": 91},
