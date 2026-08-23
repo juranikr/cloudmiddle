@@ -232,6 +232,16 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 
 ## 10) 세션 로그 (최신 위)
 
+### 2026-08-23 — Brave 다중 검색 운영 배포 + 5회 연속성 검증
+- `7a37676`으로 도시별 검색 프로필·Brave 발견 전용 레인·품질 결손 disposition·관리자 발굴 퍼널을 배포하고, 운영 실측에서 발견한 중복 제안 fallback 성과 오판까지 `56d0b64`로 추가 보정
+- 백엔드 285개 테스트, 프런트 production build, compileall/diff check, Docker PostgreSQL 로컬 health·로그인·도시 조회 스모크 통과
+- Terraform은 무관한 외부 RDS SG 드리프트를 제외한 targeted plan(`2 add / 3 change / 2 destroy`)만 적용. API task definition `:5`, agent `:4`, Step Functions·IAM 연결 갱신; Actions `32621233807`, `32622527639` 모두 성공
+- 운영 수동 Step Functions 5회 모두 `SUCCEEDED`; DB run #121~#129에 failed/running 잔류 0, mission run 전부 step별 checkpoint 보유
+- 발견 레인 연속성 실측: 지난 #121→#127은 mission #23/work #111, 선양 #122→#128은 mission #24/work #112를 그대로 재개. 사이에 두 번의 품질 레인을 공정하게 실행한 뒤 보류 체크포인트로 복귀
+- 운영 성과: 승인 대기 신규 제안 #32 `民生大街 (민생대가)` 1건(기존 marker 의미 중복 0), 장소 insight 4건, context update 이벤트 6건, 선양 구역 결손 waiver 1건. 직접 신규 marker는 승인 전이므로 0건
+- 보존·안정성 감사: Brave 구조 필드/후보 ID·파생 수치의 step/checkpoint/task/run/proposal/CloudWatch 누출 0, Brave 좌표 제안 0, pending proposal-key 중복 0, 에이전트 403·`output_parse_failed`·Traceback·run failure 0
+- 운영에서 제안 #32 생성 직후 `create_place` fallback이 같은 제안을 재사용하면서 성과를 2건으로 세던 흔적을 확인. 모든 `proposal_created=false`를 도구명과 무관하게 무성과로 처리하고 회귀 테스트 후 재배포
+
 ### 2026-08-14 — 운영 복제 기반 로컬 통합 테스트 + 에이전트 실행 모드 격리
 - Docker Compose를 `127.0.0.1:18000` 앱 + `127.0.0.1:55432/cloudmiddle_local` PostgreSQL로 구성하고 화면/API에 `LOCAL INTEGRATION · DB local` 표식 추가
 - `APP_DB_MODE=local|production_readonly` 안전 경계 추가: 로컬 DB 이름·호스트·포트 검증, 운영 진단은 libpq/transaction read-only + 로그인 외 HTTP 쓰기 503 + startup migration/seed 생략
