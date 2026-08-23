@@ -151,6 +151,27 @@ class NewPlaceAssessmentTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("coordinate_not_grounded", result.details["errors"])
 
+    def test_coordinate_evidence_without_storage_grant_fails_closed(self) -> None:
+        result = assess_new_place(
+            {
+                "title": "鹿鸣春饭店 (루밍춘 식당)",
+                "lat": 41.78658,
+                "lng": 123.41080,
+                "coordinate_source": "nominatim",
+            },
+            city_viewbox=SHENYANG_VIEWBOX,
+            coordinate_evidence={
+                "title": "鹿鸣春饭店",
+                "lat": 41.78658,
+                "lng": 123.41080,
+                "source": "nominatim",
+                # storage_allowed is intentionally absent.
+            },
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("coordinate_storage_not_allowed", result.details["errors"])
+
     def test_bad_branch_address_is_rejected_against_coordinate_evidence(self) -> None:
         result = assess_new_place(
             {

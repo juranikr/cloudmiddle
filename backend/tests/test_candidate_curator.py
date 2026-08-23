@@ -47,6 +47,17 @@ def _fetch(title, url, lat, lng, *, address="", branch=""):
 
 
 class GroundedCandidatePacketTests(unittest.TestCase):
+    def test_coordinate_without_explicit_storage_grant_is_not_promoted(self):
+        row = _fetch(
+            "임시 후보", "https://example.test/transient", 41.8012, 123.4521,
+            address="中街路1号", branch="中街店",
+        )
+        row["result"]["coordinate_candidates"][0].pop("storage_allowed")
+
+        packets = grounded_candidate_packets([row], city_name="沈阳")
+
+        self.assertEqual(packets, [])
+
     def test_unsigned_locked_candidate_is_not_promoted_to_coordinate_evidence(self):
         locked = {
             "title": "喜茶(中街店)",
@@ -74,6 +85,7 @@ class GroundedCandidatePacketTests(unittest.TestCase):
             "coordinate_source_url": "https://surl.amap.com/trusted",
             "source_urls": ["https://surl.amap.com/trusted"],
             "confidence": 0.98,
+            "storage_allowed": True,
         })
 
         packets = grounded_candidate_packets([], city_name="沈阳", locked_candidates=[locked])

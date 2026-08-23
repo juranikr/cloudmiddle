@@ -93,6 +93,7 @@ class TravelChatRoutingTests(unittest.TestCase):
         self.assertEqual(candidate["lat"], 41.8011621)
         self.assertEqual(candidate["coordinate_source"], "amap_share")
         self.assertEqual(candidate["coordinate_attestation"]["version"], 1)
+        self.assertTrue(candidate["coordinate_attestation"]["evidence"]["storage_allowed"])
 
     def test_unsigned_legacy_candidate_cannot_supply_coordinates(self) -> None:
         locked = {
@@ -263,6 +264,36 @@ class TravelChatRoutingTests(unittest.TestCase):
             _supporting_sources(answer, tools),
             ["https://m.dianping.com/shop/example"],
         )
+
+    def test_chat_geocode_without_explicit_storage_grant_is_not_grounded(self) -> None:
+        answer = "중제 근처의 绿波廊SPA会馆（中街店） 주소는 小什字街66号입니다."
+        tools = [{
+            "name": "web_search",
+            "args": {"query": "沈阳 中街 按摩店"},
+            "result": {"results": [{
+                "title": "绿波廊SPA会馆（中街店）地址",
+                "href": "https://example.test/spa",
+                "body": "地址：小什字街66号",
+                "quality": 0.9,
+            }]},
+        }, {
+            "name": "geocode_place",
+            "args": {"query": "沈阳 绿波廊SPA会馆 中街店"},
+            "result": {"results": [{
+                "display_name": "绿波廊SPA会馆",
+                "lat": 41.801,
+                "lng": 123.46,
+                # storage_allowed is intentionally absent.
+            }]},
+        }]
+
+        candidates = _extract_grounded_candidates(answer, tools, message="중제 마사지샵을 찾아줘")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["status"], "location_needed")
+        self.assertIsNone(candidates[0]["lat"])
+        self.assertIsNone(candidates[0]["lng"])
+        self.assertNotIn("coordinate_attestation", candidates[0])
 
     def test_short_followup_binds_latest_structured_candidate(self) -> None:
         candidate = {

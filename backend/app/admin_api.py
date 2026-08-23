@@ -20,6 +20,7 @@ from app.models import (
     AgentKnowledge,
     AgentMission,
     AgentProposal,
+    AgentQualityGapDisposition,
     AgentRun,
     AgentRunStep,
     AgentTask,
@@ -82,6 +83,9 @@ class AdminStatusOut(BaseModel):
     admin_email: str
     groq_configured: bool
     groq_model: str
+    brave_place_configured: bool = False
+    brave_storage_rights: bool = False
+    quality_gaps_suppressed: int = 0
     markers_active: int
     zones_active: int = 0
     events_total: int
@@ -121,6 +125,13 @@ def admin_status(
         admin_email=admin.email,
         groq_configured=bool(settings.groq_api_key),
         groq_model=settings.groq_model,
+        brave_place_configured=bool(
+            settings.brave_place_enabled and settings.brave_search_api_key
+        ),
+        brave_storage_rights=bool(settings.brave_search_storage_rights),
+        quality_gaps_suppressed=db.query(AgentQualityGapDisposition).filter(
+            AgentQualityGapDisposition.status.in_(("blocked", "source_exhausted", "waived"))
+        ).count(),
         markers_active=db.query(Marker).filter(Marker.merged_into_id.is_(None), Marker.shape == "point").count(),
         zones_active=db.query(Marker).filter(Marker.merged_into_id.is_(None), Marker.shape == "polygon").count(),
         events_total=db.query(PlaceEvent).count(),
@@ -190,6 +201,64 @@ class AgentRunStepOut(BaseModel):
     score_delta: float
     detail: dict[str, Any]
     created_at: datetime
+
+
+def _agent_discovery_funnel(steps: list[AgentRunStep]) -> dict[str, int]:
+    """Summarize the traveler-visible discovery funnel from inspectable steps.
+
+    Search volume alone previously made an unproductive run look busy.  Keep the
+    stages separate so the admin can see exactly where a candidate stopped.
+    """
+
+    funnel = {
+        "search_calls": 0,
+        "place_discovery_calls": 0,
+        "raw_hits": 0,
+        "exposed_hits": 0,
+        "validated_pages": 0,
+        "geocode_calls": 0,
+        "geocode_candidates": 0,
+        "proposal_attempts": 0,
+        "proposals_created": 0,
+    }
+    for step in steps:
+        try:
+            detail = json.loads(step.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(detail, dict):
+            continue
+        result = detail.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        if step.tool == "web_search":
+            funnel["search_calls"] += 1
+            # A call-level flag is enough to diagnose whether the discovery
+            # lane ran.  Never reconstruct or retain Brave result counts: the
+            # standard Search plan permits only transient response handling.
+            if any(
+                isinstance(attempt, dict)
+                and attempt.get("provider") == "brave_place"
+                and attempt.get("status") == "transient_discarded"
+                for attempt in (result.get("provider_attempts") or [])
+            ):
+                funnel["place_discovery_calls"] += 1
+            try:
+                funnel["raw_hits"] += int(result.get("raw_results_count") or 0)
+            except (TypeError, ValueError):
+                pass
+            funnel["exposed_hits"] += len(result.get("results") or [])
+        elif step.tool == "fetch_page":
+            if not result.get("error") and (result.get("text") or result.get("coordinate_candidates")):
+                funnel["validated_pages"] += 1
+        elif step.tool == "geocode_place":
+            funnel["geocode_calls"] += 1
+            funnel["geocode_candidates"] += len(result.get("results") or [])
+        elif step.tool == "propose_place":
+            funnel["proposal_attempts"] += 1
+            if result.get("proposal_created"):
+                funnel["proposals_created"] += 1
+    return funnel
 
 
 class AgentTaskOut(BaseModel):
@@ -313,6 +382,9 @@ def admin_agent_runs(
             metrics = json.loads(row.metrics or "{}")
         except json.JSONDecodeError:
             metrics = {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        metrics["discovery_funnel"] = _agent_discovery_funnel(list(row.steps or []))
         output.append(AgentRunHistoryOut(
             id=row.id, city_id=row.city_id, mode=row.mode, status=row.status,
             objective=row.objective, score=row.score, metrics=metrics, summary=row.summary,

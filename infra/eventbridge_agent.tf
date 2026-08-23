@@ -25,6 +25,8 @@ resource "aws_ecs_task_definition" "agent" {
         { name = "S3_PUBLIC_BASE_URL", value = "https://${aws_cloudfront_distribution.images.domain_name}" },
         { name = "AGENT_AUTONOMOUS_RESEARCH", value = "true" },
         { name = "AGENT_MAX_STEPS", value = "180" },
+        { name = "BRAVE_PLACE_ENABLED", value = "true" },
+        { name = "BRAVE_SEARCH_STORAGE_RIGHTS", value = "false" },
       ]
       secrets = [
         { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.app.arn}:DATABASE_URL::" },
@@ -32,6 +34,7 @@ resource "aws_ecs_task_definition" "agent" {
         { name = "GROQ_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_API_KEY::" },
         { name = "GROQ_MODEL", valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_MODEL::" },
         { name = "ARCGIS_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:ARCGIS_API_KEY::" },
+        { name = "BRAVE_SEARCH_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:BRAVE_SEARCH_API_KEY::" },
       ]
       logConfiguration = {
         logDriver = "awslogs"

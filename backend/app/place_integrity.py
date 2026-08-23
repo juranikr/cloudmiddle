@@ -432,7 +432,7 @@ def assess_new_place(
     details["proposed_address"] = proposed_address
 
     if coordinate_evidence:
-        if coordinate_evidence.get("storage_allowed") is False:
+        if coordinate_evidence.get("storage_allowed") is not True:
             errors.append("coordinate_storage_not_allowed")
         evidence_lat = _float_coordinate(coordinate_evidence, "lat")
         evidence_lng = _float_coordinate(coordinate_evidence, "lng")

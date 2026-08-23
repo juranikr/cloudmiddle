@@ -5,20 +5,24 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.agent.tools import TOOLS, is_useful_fetched_page, run_tool
+from app.agent.tools import TOOLS, _containing_zone, is_useful_fetched_page, run_tool
 from app.agent.model_recovery import classify_failure, make_recovery_plan
 from app.config import settings
 from app.agent.memory import (
     CORRECTIVE_POLICY_GUARD_ERRORS,
+    QUALITY_GAPS_BY_TASK_KIND,
     checkpoint_after_tool,
     active_work_item_for_mission,
     ensure_mission_for_task,
     evaluate_knowledge_uses,
+    filter_actionable_quality_gaps,
     finish_model_recovery_attempt,
     finalize_mission,
     learn_from_recent_runs,
@@ -222,6 +226,102 @@ def _research_themes(city: City) -> str:
             "현지 쇼핑·카페·휴식, 교통/예약 실용정보를 우선한다. 고궁·박물관은 이미 충분하면 추가하지 않는다"
         )
     return f"{city.name_local} 대표 명소·현지 음식·역사·교통·야간 동선"
+
+
+def _tool_contract_line(tool_names: set[str] | frozenset[str]) -> str:
+    """Render the provider-visible tool contract from the actual whitelist."""
+
+    return ", ".join(sorted(tool_names))
+
+
+def _candidate_discovery_system(
+    city: City,
+    mission: AgentMission,
+    work_item: AgentWorkItem,
+) -> str:
+    """Narrow system contract for a proposal-only place discovery slice."""
+
+    available = _tool_contract_line(CANDIDATE_DISCOVERY_TOOLS)
+    return (
+        "당신은 여행 지도 신규 장소 후보 발굴 에이전트입니다. "
+        f"범위는 city_id={city.id}, {city.name_ko}({city.name_local}), "
+        f"mission_id={mission.id}, task_id={mission.task_id}, work_item_id={work_item.id}입니다.\n"
+        "이번 실행은 사용자 작업 큐나 기존 장소 품질 보강이 아니라, 현재 지도에 없는 여행 가치가 높은 "
+        "장소를 근거 기반 승인 제안으로 만드는 독립된 시간 조각입니다. 다른 도시를 다루지 마세요.\n"
+        f"사용 가능한 도구는 정확히 다음뿐입니다: {available}. "
+        "이 목록 밖 기능을 요구하거나 호출하지 말고, 현재 요청에 실제로 광고된 스키마를 따르세요.\n"
+        "먼저 내부 목록과 조사 이력으로 중복 및 부족한 여행 역할을 확인한 뒤, 새 검색 결과의 본문을 읽고 "
+        "정확한 상호·지점·주소가 같은 후보만 좌표 검증하세요. 좌표와 장소 정체성이 같은 실행에서 검증된 "
+        "후보만 propose_place로 관리자 승인 대기에 남길 수 있습니다. 즉시 장소를 생성하는 기능은 없으며 "
+        "추측 좌표, 다른 지점, 검색 요약만으로는 제안하지 마세요.\n"
+        "propose_place가 제안을 실제 생성하면 서버가 과제와 미션을 자동 완료합니다. completed를 직접 "
+        "선언하지 마세요. 서로 다른 출처 축을 실제 조사했지만 안전한 제안이 불가능할 때만 현재 task_id를 "
+        "upsert_agent_task(status=blocked)로 종료하세요. 조사 도구 실행 없이 차단할 수 없으며 후보 자체를 "
+        "과제로 대신 적는 것은 성과가 아닙니다."
+    )
+
+
+def _scoped_quality_system(
+    city: City,
+    mission: AgentMission,
+    work_item: AgentWorkItem,
+    *,
+    tool_names: set[str] | frozenset[str],
+) -> str:
+    """Give quality missions only obligations their advertised tools can meet."""
+
+    available = _tool_contract_line(tool_names)
+    place_scope = (
+        f"활성 place_id={work_item.place_id} ({work_item.title})만 처리하세요. "
+        if work_item.place_id is not None
+        else f"활성 작업 {work_item.target_key} ({work_item.title})만 처리하세요. "
+    )
+    return (
+        "당신은 여행 지도에서 하나의 지속 품질 미션을 이어서 처리하는 에이전트입니다. "
+        f"범위는 city_id={city.id}, {city.name_ko}({city.name_local}), "
+        f"mission_id={mission.id}, task_id={mission.task_id}, work_item_id={work_item.id}입니다.\n"
+        f"{place_scope}사용자 작업 큐, 신규 장소 발굴, 다른 품질 미션으로 전환하지 마세요.\n"
+        f"사용 가능한 도구는 정확히 다음뿐입니다: {available}. "
+        "이 목록 밖 기능을 요구하거나 호출하지 말고, 현재 요청에 실제로 광고된 스키마를 따르세요.\n"
+        "저장된 체크포인트와 기존 근거를 먼저 재사용하고, 같은 검색이나 실패한 출처를 반복하지 마세요. "
+        "현재 성공조건을 만족시키는 가장 작은 안전한 행동을 수행한 뒤 상태를 다시 확인하세요. 완료할 수 "
+        "없으면 확인한 차단 원인과 다음 재시도 조건을 현재 task_id에 기록하세요."
+    )
+
+
+def _scoped_mission_user_message(
+    city: City,
+    mission: AgentMission,
+    work_item: AgentWorkItem,
+    *,
+    continuity_hint: str,
+    personalization_hint: str = "",
+) -> str:
+    """Build a user message whose named tools match the scoped system contract."""
+
+    if mission.kind == CANDIDATE_DISCOVERY_KIND:
+        return (
+            f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
+            f"신규 장소 발굴 목표: {mission.objective}\n"
+            f"성공조건: {mission.success_metric}\n"
+            f"이전 체크포인트: {continuity_hint}\n"
+            "list_places와 list_research_history, list_agent_tasks로 기존 장소·과거 검색·현재 과제를 먼저 "
+            "확인하세요. 부족한 여행 역할 하나를 고르고 web_search의 새 결과를 fetch_page로 검증한 뒤, "
+            "기존 장소와 중복되지 않는 정확한 지점만 geocode_place로 좌표를 확인해 propose_place로 승인 "
+            "제안을 남기세요. 제안 성공은 서버가 자동 완료합니다. 실패한 경우에만 현재 실행의 조사 근거가 "
+            "생긴 뒤 현재 task_id를 upsert_agent_task(status=blocked)로 마무리하세요.\n"
+            "사용자 행동 기반 참고 신호(확정 취향으로 과장하지 말 것):\n"
+            f"{personalization_hint or '[]'}"
+        )
+    return (
+        f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
+        f"현재 품질 미션: {mission.objective}\n"
+        f"성공조건: {mission.success_metric}\n"
+        f"활성 대상: {work_item.target_key}, place_id={work_item.place_id}, title={work_item.title}.\n"
+        f"이전 체크포인트: {continuity_hint}\n"
+        "활성 대상 하나의 현재 결손만 처리하고 실제 상태로 성공조건을 확인하세요. 완료 또는 차단 결과는 "
+        "현재 task_id에만 기록하고, 다른 장소나 미션으로 전환하지 마세요."
+    )
 
 
 def count_unread(db: Session, city_id: int | None = None) -> int:
@@ -477,6 +577,25 @@ DATA_INTEGRITY_TOOLS = frozenset({
 })
 DATA_INTEGRITY_TASK_RESULT_STATUSES = frozenset({"completed", "blocked"})
 
+CANDIDATE_DISCOVERY_KIND = "candidate_discovery"
+# Two quality/resume runs for every guaranteed discovery run. Discovery may run
+# more often when there is no executable non-discovery work, but a large quality
+# backlog can never push it out of the schedule indefinitely.
+CANDIDATE_DISCOVERY_INTERVAL = 3
+CANDIDATE_DISCOVERY_TOOLS = frozenset({
+    "list_knowledge",
+    "list_agent_tasks",
+    "list_zones",
+    "list_places",
+    "list_research_history",
+    "get_place",
+    "web_search",
+    "fetch_page",
+    "geocode_place",
+    "propose_place",
+    "upsert_agent_task",
+})
+
 MODEL_OUTPUT_FAILURE_MARKERS = {
     "output_parse_failed": ("output_parse_failed", "parsing failed"),
     "tool_schema_failed": ("tool_use_failed", "failed to parse tool call", "tool call validation failed"),
@@ -495,6 +614,7 @@ RECOVERY_TOOLS_BY_TASK = {
         "upsert_place_insights", "verify_place", "list_zones", "assign_place_zone",
         "search_place_images", "attach_image_from_url", "upsert_agent_task",
     },
+    CANDIDATE_DISCOVERY_KIND: CANDIDATE_DISCOVERY_TOOLS,
     "data_integrity": DATA_INTEGRITY_TOOLS,
 }
 
@@ -510,6 +630,120 @@ def _filtered_tools(tool_names: list[str] | set[str] | None) -> list[dict[str, A
         return TOOLS
     filtered = [tool for tool in TOOLS if tool["function"]["name"] in selected]
     return filtered or TOOLS
+
+
+def _candidate_discovery_tools(
+    *,
+    task_id: int,
+    tool_names: list[str] | set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Advertise the narrow task terminal shape the runtime actually accepts."""
+
+    tools = copy.deepcopy(_filtered_tools(tool_names or CANDIDATE_DISCOVERY_TOOLS))
+    for tool in tools:
+        if tool.get("function", {}).get("name") != "upsert_agent_task":
+            continue
+        tool["function"]["description"] = (
+            "Block the current candidate-discovery slice only after this run has a "
+            "successful web_search plus either a useful fetch_page or an explicitly "
+            "storable non-Brave geocode_place result. Successful propose_place calls "
+            "are completed automatically by the server."
+        )
+        tool["function"]["parameters"] = {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer", "enum": [task_id]},
+                "status": {"type": "string", "enum": ["blocked"]},
+                "result": {
+                    "type": "string",
+                    "description": (
+                        "Explain the searched source axis, its independent verification, "
+                        "and the retry condition. "
+                        "The server stores only its own audited terminal summary."
+                    ),
+                },
+            },
+            "required": ["task_id", "status", "result"],
+            "additionalProperties": False,
+        }
+        break
+    return tools
+
+
+def _candidate_discovery_research_refs(db: Session, *, run_id: int) -> list[str]:
+    """Return a complete current-run evidence pair for a blocked slice.
+
+    A search result alone is only a lead, while a fetch/geocode result without a
+    search does not prove that the discovery lane explored a new source axis.
+    Keep the terminal guard server-owned: one successful web search *and* one
+    useful independently retainable verification must both exist in this run.
+    """
+
+    rows = (
+        db.query(AgentRunStep)
+        .filter(
+            AgentRunStep.run_id == run_id,
+            AgentRunStep.tool.in_(("web_search", "fetch_page", "geocode_place")),
+        )
+        .order_by(AgentRunStep.sequence.asc())
+        .all()
+    )
+    search_refs: list[str] = []
+    verification_refs: list[str] = []
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(detail, dict):
+            continue
+        result = detail.get("result")
+        progress = detail.get("progress")
+        progress = progress if isinstance(progress, dict) else {}
+        if not isinstance(result, dict) or result.get("error"):
+            continue
+        ref = f"run:{run_id}:step:{row.sequence}"
+        if row.tool == "web_search":
+            # A provider returning a well-formed result set (including an empty
+            # set) is a completed search observation. Guard/policy failures are
+            # represented by ``error`` above and never qualify.
+            if progress.get("discovery_search_ok") is True or isinstance(result.get("results"), list):
+                search_refs.append(ref)
+            continue
+        if row.tool == "fetch_page":
+            # Long pages are compacted in AgentRunStep. In that representation
+            # ``outcome=ok`` is the server-owned proof that _new_evidence_keys
+            # accepted a useful, not-previously-visited page before compaction.
+            compacted_useful_page = bool(
+                detail.get("truncated") is True
+                and row.outcome == "ok"
+                and (result.get("url") or result.get("title"))
+            )
+            if (
+                progress.get("discovery_verification_ok") is True
+                or is_useful_fetched_page(result)
+                or compacted_useful_page
+            ):
+                verification_refs.append(ref)
+            continue
+        if row.tool == "geocode_place":
+            if progress.get("discovery_verification_ok") is True:
+                verification_refs.append(ref)
+                continue
+            candidates = result.get("results")
+            if not isinstance(candidates, list):
+                continue
+            independently_storable = any(
+                isinstance(candidate, dict)
+                and candidate.get("storage_allowed") is True
+                and not str(candidate.get("source") or "").casefold().startswith("brave")
+                for candidate in candidates
+            )
+            if independently_storable:
+                verification_refs.append(ref)
+    if not search_refs or not verification_refs:
+        return []
+    return [*search_refs[:10], *verification_refs[:10]]
 
 
 def _data_integrity_evidence_refs(
@@ -909,10 +1143,12 @@ def _model_recovery_plan(
         force_compaction = True
         recent_round_limit = 2
         max_chars = 28_000
-        minimal = {next_tool, "get_place", "upsert_agent_task"}
-        if task_kind == "quality_images":
-            minimal.update({"search_place_images", "attach_image_from_url"})
-        tool_names.intersection_update(name for name in minimal if name)
+        # Scoped mission prompts are generated from their complete advertised
+        # contract. Keeping that same bounded contract is safer than silently
+        # removing a required next-stage tool during provider parse recovery.
+        if task_kind not in RECOVERY_TOOLS_BY_TASK or task_kind == "data_integrity":
+            minimal = {next_tool, "get_place", "upsert_agent_task"}
+            tool_names.intersection_update(name for name in minimal if name)
 
     return {
         "failure_kind": failure_kind,
@@ -946,6 +1182,188 @@ def _should_rotate_exhausted_image_target(
         and work_item.place_id is not None
         and image_searches_by_place.get(int(work_item.place_id), 0) >= 3
     )
+
+
+def _auditable_run_step_refs(
+    db: Session,
+    *,
+    run_id: int,
+    place_id: int,
+    tools: set[str],
+    successful_only: bool = False,
+) -> list[str]:
+    """Return stable refs for exact-target tool observations in this run."""
+
+    refs: list[str] = []
+    rows = (
+        db.query(AgentRunStep)
+        .filter(
+            AgentRunStep.run_id == run_id,
+            AgentRunStep.tool.in_(tools),
+        )
+        .order_by(AgentRunStep.sequence.asc())
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        args = detail.get("args") if isinstance(detail, dict) else None
+        result = detail.get("result") if isinstance(detail, dict) else None
+        try:
+            exact_target = isinstance(args, dict) and int(args.get("place_id")) == place_id
+        except (TypeError, ValueError):
+            exact_target = False
+        if not exact_target:
+            continue
+        if successful_only and isinstance(result, dict) and result.get("error"):
+            continue
+        refs.append(f"run:{run_id}:step:{row.sequence}")
+    return refs
+
+
+def _image_search_audit(
+    db: Session,
+    *,
+    run_id: int,
+    place_id: int,
+) -> dict[str, list[str]]:
+    """Classify exact-target image searches without trusting model narration."""
+
+    audit: dict[str, list[str]] = {
+        "all": [],
+        "clean_empty": [],
+        "provider_failure": [],
+        "with_candidates": [],
+    }
+    rows = (
+        db.query(AgentRunStep)
+        .filter(
+            AgentRunStep.run_id == run_id,
+            AgentRunStep.tool == "search_place_images",
+        )
+        .order_by(AgentRunStep.sequence.asc())
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+            args = detail.get("args") if isinstance(detail, dict) else None
+            result = detail.get("result") if isinstance(detail, dict) else None
+            exact = isinstance(args, dict) and int(args.get("place_id")) == place_id
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not exact:
+            continue
+        # The runtime budget permits only three executed exact-target searches.
+        # Ignore a later policy-guard step from legacy/replayed runs so it cannot
+        # turn three clean observations into an apparent provider failure.
+        if len(audit["all"]) >= 3:
+            continue
+        ref = f"run:{run_id}:step:{row.sequence}"
+        audit["all"].append(ref)
+        result_rows = result.get("results") if isinstance(result, dict) else None
+        if isinstance(result_rows, list) and result_rows:
+            audit["with_candidates"].append(ref)
+        elif (
+            isinstance(result, dict)
+            and isinstance(result_rows, list)
+            and not result_rows
+            and not result.get("error")
+            and not (result.get("warnings") or [])
+        ):
+            audit["clean_empty"].append(ref)
+        else:
+            # Warning-only partial outages and malformed payloads are not clean
+            # evidence of source exhaustion.
+            audit["provider_failure"].append(ref)
+    return audit
+
+
+def _zone_catalog_geometry_valid(rows: Any) -> bool:
+    """Confirm that every advertised zone has a usable polygon geometry.
+
+    An empty catalogue is a valid observed state. A non-empty catalogue with a
+    truncated or malformed polygon is not evidence that a place lies outside
+    every zone, so it must never create a durable waiver.
+    """
+
+    if not isinstance(rows, list):
+        return False
+    seen_ids: set[int] = set()
+    for row in rows:
+        raw_id = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(raw_id, int) or isinstance(raw_id, bool) or raw_id <= 0 or raw_id in seen_ids:
+            return False
+        seen_ids.add(raw_id)
+        polygon = row.get("polygon") if isinstance(row, dict) else None
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            return False
+        vertices: list[tuple[float, float]] = []
+        try:
+            for point in polygon:
+                if not isinstance(point, dict):
+                    return False
+                lat = float(point["lat"])
+                lng = float(point["lng"])
+                if not math.isfinite(lat) or not math.isfinite(lng):
+                    return False
+                vertices.append((lat, lng))
+        except (KeyError, TypeError, ValueError):
+            return False
+        # Three repeated/collinear vertices do not form a usable polygon.
+        twice_area = sum(
+            x1 * y2 - x2 * y1
+            for (y1, x1), (y2, x2) in zip(vertices, vertices[1:] + vertices[:1])
+        )
+        if abs(twice_area) <= 1e-12:
+            return False
+    return True
+
+
+def _zone_catalog_audit(
+    db: Session,
+    *,
+    city_id: int,
+    lat: float,
+    lng: float,
+    observed_rows: Any | None = None,
+) -> dict[str, Any]:
+    """Audit the full DB catalogue before closing one zone gap."""
+
+    zones = (
+        db.query(Marker)
+        .filter(
+            Marker.city_id == city_id,
+            Marker.shape == MarkerShape.polygon,
+            Marker.merged_into_id.is_(None),
+        )
+        .order_by(Marker.id.asc())
+        .all()
+    )
+    server_rows: list[dict[str, Any]] = []
+    for zone in zones:
+        try:
+            polygon = json.loads(zone.polygon or "[]")
+        except (TypeError, json.JSONDecodeError):
+            polygon = None
+        server_rows.append({"id": zone.id, "polygon": polygon})
+    if not _zone_catalog_geometry_valid(server_rows):
+        return {"valid": False, "reason": "server_zone_geometry_invalid"}
+    if observed_rows is not None:
+        if not _zone_catalog_geometry_valid(observed_rows):
+            return {"valid": False, "reason": "observed_zone_catalog_invalid"}
+        observed_ids = {int(row["id"]) for row in observed_rows}
+        server_ids = {int(row["id"]) for row in server_rows}
+        if observed_ids != server_ids:
+            return {"valid": False, "reason": "observed_zone_catalog_incomplete"}
+    containing = _containing_zone(db, city_id=city_id, lat=lat, lng=lng)
+    return {
+        "valid": True,
+        "contains": containing is not None,
+        "containing_zone_id": containing.id if containing is not None else None,
+    }
 MUTATION_TOOLS = {
     "propose_place",
     "create_place",
@@ -1035,7 +1453,11 @@ def _active_agent_task_mismatch(
 ) -> dict[str, Any] | None:
     """Keep a data-integrity audit from creating or editing another task."""
 
-    if mission is None or mission.kind != "data_integrity" or name != "upsert_agent_task":
+    if (
+        mission is None
+        or mission.kind not in {"data_integrity", CANDIDATE_DISCOVERY_KIND}
+        or name != "upsert_agent_task"
+    ):
         return None
     active_task_id = mission.task_id
     raw_task_id = args.get("task_id")
@@ -1051,7 +1473,7 @@ def _active_agent_task_mismatch(
         "error_class": "policy_guard",
         "guard_disposition": "retry",
         "detail": (
-            "data_integrity 과제는 현재 활성 과제의 결과만 기록할 수 있습니다. "
+            "전용 미션은 현재 활성 과제의 결과만 기록할 수 있습니다. "
             f"task_id={active_task_id}를 명시해 다시 호출하세요. task_id 누락, 새 과제 생성, "
             "다른 과제 수정은 실행하지 않습니다."
         ),
@@ -1105,6 +1527,76 @@ def _project_data_integrity_task_result_args(
         "task_id": mission.task_id,
         "status": status,
         "result": str(args.get("result") or "")[:8000],
+    }, None
+
+
+def _project_candidate_discovery_task_result_args(
+    name: str,
+    args: dict[str, Any],
+    mission: AgentMission | None,
+    task: AgentTask | None,
+    *,
+    run_id: int,
+    transient_provider_seen: bool,
+    research_evidence_refs: list[str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Limit discovery bookkeeping to its existing server-owned task."""
+
+    if mission is None or mission.kind != CANDIDATE_DISCOVERY_KIND or name != "upsert_agent_task":
+        return args, None
+    if (
+        task is None
+        or task.id != mission.task_id
+        or task.city_id != mission.city_id
+        or task.kind != CANDIDATE_DISCOVERY_KIND
+    ):
+        return {}, {
+            "error": "active_agent_task_not_writable",
+            "detail": "서버가 현재 신규 장소 발굴 과제를 확인하지 못해 결과를 기록하지 않았습니다.",
+            "active_task_id": mission.task_id,
+        }
+    status = str(args.get("status") or "").strip().lower()
+    if status == "completed":
+        return {}, {
+            "error": "candidate_discovery_completion_server_controlled",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": (
+                "신규 장소 발굴 완료는 propose_place가 승인 제안을 실제 생성한 뒤 서버가 자동 기록합니다. "
+                "모델의 완료 선언만으로 과제를 종료하지 않습니다."
+            ),
+        }
+    if status != "blocked":
+        return {}, {
+            "error": "invalid_candidate_discovery_task_status",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": "발굴 과제는 감사 가능한 조사 후 blocked로만 직접 종료할 수 있습니다.",
+        }
+    if not research_evidence_refs:
+        return {}, {
+            "error": "candidate_discovery_research_evidence_required",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": (
+                "현재 실행에서 성공한 web_search와 독립 검증 근거의 조합을 확인하지 못했습니다. "
+                "유효한 fetch_page 본문 또는 storage_allowed=true인 비-Brave geocode_place 결과까지 "
+                "확보한 뒤 blocked를 다시 기록하세요."
+            ),
+        }
+    retention_note = (
+        " Brave Place transient 원문·파생 자유서술은 보존하지 않았습니다."
+        if transient_provider_seen
+        else ""
+    )
+    result_text = (
+        f"실행 #{run_id}: 현재 실행의 조사 근거 {', '.join(research_evidence_refs)}를 확인하고 "
+        f"신규 장소 발굴 조각을 blocked로 종료했습니다.{retention_note}"
+    )[:8000]
+    return {
+        "task_id": task.id,
+        "status": "blocked",
+        "result": result_text,
     }, None
 
 
@@ -1206,6 +1698,10 @@ def _is_material_change(name: str, result: Any) -> bool:
     # the run's "actual changes" list.
     if name == "upsert_agent_task":
         return False
+    # A duplicate proposal returns the existing proposal_id for traceability,
+    # but proposal_created=False is an explicit no-op and must win over that ID.
+    if name == "propose_place" and result.get("proposal_created") is False:
+        return False
     if result.get("proposal_id") is not None:
         return True
     # A mutation tool can successfully execute without changing a row.  When it
@@ -1249,7 +1745,11 @@ def _new_evidence_keys(name: str, result: Any, seen: set[str]) -> set[str]:
             candidates.add(f"page:{result.get('url') or result.get('title')}")
     elif name == "geocode_place":
         for item in result.get("results") or []:
-            if not isinstance(item, dict):
+            if (
+                not isinstance(item, dict)
+                or item.get("storage_allowed") is not True
+                or item.get("source") == "brave_place"
+            ):
                 continue
             external = str(item.get("external_id") or "")
             if external:
@@ -1287,7 +1787,11 @@ def _evidence_handoff_items(name: str, result: Any, new_keys: set[str]) -> list[
         items.append(f"본문 | {title[:100]} | {url} | {body[:240]}")
     elif name == "geocode_place":
         for item in (result.get("results") or [])[:3]:
-            if isinstance(item, dict):
+            if (
+                isinstance(item, dict)
+                and item.get("storage_allowed") is True
+                and item.get("source") != "brave_place"
+            ):
                 items.append(
                     "좌표 | "
                     f"{str(item.get('name') or item.get('display_name') or '')[:100]} | "
@@ -1339,6 +1843,196 @@ def _matching_coordinate_evidence(
     return dict(min(matches, key=lambda item: item[0])[1]) if matches else None
 
 
+def _compact_evidence_text(value: Any) -> str:
+    return re.sub(
+        r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+",
+        "",
+        str(value or "").casefold(),
+    )
+
+
+def _page_supports_coordinate_evidence(
+    page: dict[str, Any],
+    coordinate_evidence: dict[str, Any],
+) -> bool:
+    """Bind a fetched public page to the independently geocoded POI."""
+
+    try:
+        evidence_lat = float(coordinate_evidence["lat"])
+        evidence_lng = float(coordinate_evidence["lng"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    for row in page.get("coordinate_candidates") or []:
+        if (
+            not isinstance(row, dict)
+            or row.get("storage_allowed") is not True
+            or str(row.get("source") or "").casefold().startswith("brave")
+        ):
+            continue
+        try:
+            if (
+                abs(float(row["lat"]) - evidence_lat) <= 0.002
+                and abs(float(row["lng"]) - evidence_lng) <= 0.002
+            ):
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    identity = str(
+        coordinate_evidence.get("title")
+        or coordinate_evidence.get("display_name")
+        or ""
+    ).split(",", 1)[0]
+    identity_key = _compact_evidence_text(identity)
+    page_key = _compact_evidence_text(
+        f"{page.get('title') or ''} {str(page.get('text') or '')[:2500]}"
+    )
+    if len(identity_key) >= 3 and identity_key in page_key:
+        return True
+    address_key = _compact_evidence_text(coordinate_evidence.get("address"))
+    return len(address_key) >= 5 and address_key in page_key
+
+
+def _canonical_transient_proposal_args(
+    coordinate_evidence: dict[str, Any],
+    verified_pages: list[dict[str, Any]],
+    transient_taint: "_TransientProviderTaint",
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Build a proposal using only independently retainable observations.
+
+    Once a no-retention candidate was visible to the model, free-form model
+    fields cannot be proven independent merely because they are paraphrased.
+    The server therefore rebuilds the entire durable proposal from a storable
+    non-Brave coordinate row and a separately fetched, matching public page.
+    """
+
+    coordinate_source = str(coordinate_evidence.get("source") or "").strip()
+    if (
+        coordinate_evidence.get("storage_allowed") is not True
+        or not coordinate_source
+        or coordinate_source.casefold().startswith("brave")
+    ):
+        return None, {
+            "error": "independent_coordinate_evidence_required",
+            "detail": "저장 가능한 비-Brave 좌표 근거가 없어 제안을 기록하지 않았습니다.",
+        }
+    display_name = str(
+        coordinate_evidence.get("title")
+        or coordinate_evidence.get("display_name")
+        or ""
+    ).strip()
+    local_name, separator, display_address = display_name.partition(",")
+    local_name = local_name.strip()
+    address = str(coordinate_evidence.get("address") or "").strip()
+    if not address and separator:
+        address = display_address.strip()
+    if not local_name or not address:
+        return None, {
+            "error": "independent_identity_address_required",
+            "detail": "독립 좌표 근거에 정확한 장소명과 주소가 모두 없어 제안을 기록하지 않았습니다.",
+        }
+
+    matched_pages = [
+        page
+        for page in verified_pages
+        if (
+            isinstance(page, dict)
+            and is_useful_fetched_page(page)
+            and str(page.get("url") or "").startswith(("http://", "https://"))
+            and not transient_taint.was_observed_transient(page.get("url"))
+            and _page_supports_coordinate_evidence(page, coordinate_evidence)
+        )
+    ]
+    if not matched_pages:
+        return None, {
+            "error": "independent_page_evidence_required",
+            "detail": "Brave 후보와 별개로 발견해 본문을 확인한 동일 장소 출처가 없어 제안을 기록하지 않았습니다.",
+        }
+
+    source_urls = list(dict.fromkeys(
+        str(page.get("url") or "").strip() for page in matched_pages
+    ))[:4]
+    primary_page = matched_pages[0]
+    evidence_text = " ".join((
+        display_name,
+        str(coordinate_evidence.get("type") or ""),
+        str(primary_page.get("title") or ""),
+        str(primary_page.get("text") or "")[:1200],
+    )).casefold()
+    category = "other"
+    category_label = "여행 장소"
+    travel_role = "general"
+    category_rules = (
+        (r"酒店|宾馆|旅馆|hotel|lodging", "lodging", "숙소", "rest"),
+        (r"餐厅|饭店|餐馆|restaurant|food", "restaurant", "음식점", "local_food"),
+        (r"咖啡|茶饮|奶茶|饮品|甜品|cafe|coffee|tea", "drink", "음료점", "snack"),
+        (r"地铁|车站|机场|transport|station", "transport", "교통 장소", "practical"),
+        (r"商场|市场|购物|mall|shopping", "shopping", "쇼핑 장소", "shopping"),
+        (r"博物馆|故宫|公园|景区|museum|park|attraction", "tourist", "관광지", "culture"),
+        (r"便利店|药店|超市|convenience|pharmacy", "convenience", "편의 장소", "practical"),
+    )
+    for pattern, candidate_category, label, role in category_rules:
+        if re.search(pattern, evidence_text, re.IGNORECASE):
+            category, category_label, travel_role = candidate_category, label, role
+            break
+    title = local_name[:150]
+    if not re.search(r"[\uac00-\ud7a3]", title):
+        title = f"{title} ({category_label})"[:200]
+    source_url = source_urls[0]
+    source_title = str(primary_page.get("title") or local_name).strip()[:300]
+    description = f"독립 출처로 확인한 {category_label}입니다. 주소: {address}"[:2000]
+    return {
+        "title": title,
+        "description": description,
+        "address": address[:300],
+        "category": category,
+        "travel_role": travel_role,
+        "lat": float(coordinate_evidence["lat"]),
+        "lng": float(coordinate_evidence["lng"]),
+        "context": "저장 가능한 독립 지오코딩과 공개 본문으로 재검증한 관리자 승인 대기 제안입니다.",
+        "coordinate_source": coordinate_source[:50],
+        "coordinate_external_id": str(coordinate_evidence.get("external_id") or "")[:200],
+        "coordinate_query": display_name[:300],
+        "coordinate_source_url": str(coordinate_evidence.get("source_url") or "")[:1000],
+        "coordinate_confidence": max(
+            0.0, min(float(coordinate_evidence.get("confidence") or 0.7), 1.0)
+        ),
+        "zone_id": None,
+        "chain_name_local": "",
+        "chain_name_ko": "",
+        "branch_name": str(coordinate_evidence.get("branch_name") or "")[:120],
+        "evidence": (
+            "저장 가능한 비-Brave 좌표 근거로 장소명·주소·위치를 확인하고, "
+            "별도 공개 페이지의 본문으로 동일 장소임을 교차 검증했습니다."
+        ),
+        "source_urls": source_urls,
+        "confidence": max(
+            0.0, min(float(coordinate_evidence.get("confidence") or 0.7), 0.95)
+        ),
+        "insights": [
+            {
+                "kind": "location",
+                "title": "위치 확인",
+                "content": f"독립 좌표 근거에서 주소를 {address}로 확인했습니다.",
+                "source_url": source_url,
+                "source_title": source_title,
+                "confidence": max(
+                    0.0, min(float(coordinate_evidence.get("confidence") or 0.7), 0.95)
+                ),
+            },
+            {
+                "kind": "visit",
+                "title": "방문 전 확인",
+                "content": "방문 전 운영시간과 입장·예약 조건을 연결된 출처에서 다시 확인하세요.",
+                "source_url": source_url,
+                "source_title": source_title,
+                "confidence": 0.7,
+            },
+        ],
+        "_validated_source_urls": source_urls,
+    }, None
+
+
 def _run_outcome_status(*, unread_after: int, gaps: list[str], material_change_count: int) -> str:
     """Run completion is distinct from whether the city's long-term backlog is empty."""
     if unread_after > 0:
@@ -1360,6 +2054,331 @@ def _material_change_summary(sequence: int, name: str, args: dict[str, Any], res
         "status": result.get("status"),
         "result": str(result.get("result") or result.get("detail") or "")[:300],
     }
+
+
+def _persistable_material_changes(
+    changes: list[dict[str, Any]],
+    transient_taint: "_TransientProviderTaint",
+) -> list[dict[str, Any]]:
+    if not transient_taint.candidate_count:
+        return transient_taint.redact(changes)
+    allowed = {"sequence", "tool", "place_id", "proposal_id", "task_id", "changed", "status"}
+    return [
+        {key: value for key, value in item.items() if key in allowed}
+        for item in changes
+    ]
+
+
+_TRANSIENT_REDACTION = "[BRAVE_TRANSIENT_REDACTED]"
+_TRANSIENT_QUERY_REDACTION = "[BRAVE_TRANSIENT_QUERY_DISCARDED]"
+
+
+class _TransientProviderTaint:
+    """Keep no-storage provider values inside one live model loop only.
+
+    Brave Place can be useful as a lead even when the plan grants no retention
+    rights.  Values are therefore tainted when exposed to the model and may be
+    promoted only when a storage-capable geocoder or a fetched public page
+    independently confirms the same value.  The registry itself is deliberately
+    run-local and is never serialized.
+    """
+
+    _CANDIDATE_STRING_FIELDS = {
+        "display_name", "address", "source_url", "transient_id", "external_id",
+    }
+    _COORDINATE_FIELDS = {"lat", "lng", "latitude", "longitude"}
+
+    def __init__(self) -> None:
+        self._strings: set[str] = set()
+        self._numbers: set[float] = set()
+        self._promoted_strings: set[str] = set()
+        self._promoted_numbers: set[float] = set()
+        self.candidate_count = 0
+
+    @staticmethod
+    def _normalized(value: Any) -> str:
+        return " ".join(str(value or "").casefold().split())
+
+    def observe_brave_candidates(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            return
+        for candidate in result.get("place_candidates") or []:
+            if not isinstance(candidate, dict) or candidate.get("storage_allowed") is True:
+                continue
+            self.candidate_count += 1
+            for field in self._CANDIDATE_STRING_FIELDS:
+                value = str(candidate.get(field) or "").strip()
+                if len(self._normalized(value)) >= 2:
+                    self._strings.add(value)
+            for value in candidate.get("categories") or []:
+                text = str(value or "").strip()
+                if len(self._normalized(text)) >= 3:
+                    self._strings.add(text)
+            for field in ("lat", "lng"):
+                try:
+                    self._numbers.add(float(candidate[field]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+    @staticmethod
+    def _storage_capable_rows(name: str, result: Any) -> list[dict[str, Any]]:
+        if not isinstance(result, dict) or result.get("error"):
+            return []
+        if name == "geocode_place":
+            return [
+                row for row in (result.get("results") or [])
+                if (
+                    isinstance(row, dict)
+                    and row.get("storage_allowed") is True
+                    and row.get("source") != "brave_place"
+                )
+            ]
+        if name == "fetch_page" and is_useful_fetched_page(result):
+            rows: list[dict[str, Any]] = [{
+                "url": result.get("url"),
+                "title": result.get("title"),
+                "text": result.get("text"),
+            }]
+            rows.extend(
+                row for row in (result.get("coordinate_candidates") or [])
+                if (
+                    isinstance(row, dict)
+                    and row.get("storage_allowed") is True
+                    and row.get("source") != "brave_place"
+                )
+            )
+            return rows
+        return []
+
+    @staticmethod
+    def _flatten_strings(value: Any) -> list[str]:
+        if isinstance(value, dict):
+            return [
+                item
+                for child in value.values()
+                for item in _TransientProviderTaint._flatten_strings(child)
+            ]
+        if isinstance(value, (list, tuple)):
+            return [
+                item
+                for child in value
+                for item in _TransientProviderTaint._flatten_strings(child)
+            ]
+        return [str(value)] if isinstance(value, str) and value else []
+
+    @staticmethod
+    def _coordinate_values(value: Any) -> list[float]:
+        output: list[float] = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in _TransientProviderTaint._COORDINATE_FIELDS:
+                    try:
+                        output.append(float(child))
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    output.extend(_TransientProviderTaint._coordinate_values(child))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                output.extend(_TransientProviderTaint._coordinate_values(child))
+        return output
+
+    def promote_independent_evidence(self, name: str, result: Any) -> None:
+        rows = self._storage_capable_rows(name, result)
+        if not rows:
+            return
+        canonical_text = self._normalized(" ".join(self._flatten_strings(rows)))
+        for value in self._strings:
+            normalized = self._normalized(value)
+            if normalized and normalized in canonical_text:
+                self._promoted_strings.add(value)
+        canonical_numbers = self._coordinate_values(rows)
+        for value in self._numbers:
+            if any(abs(value - observed) <= 0.00001 for observed in canonical_numbers):
+                self._promoted_numbers.add(value)
+
+    def _unverified_strings(self) -> list[str]:
+        return sorted(
+            self._strings - self._promoted_strings,
+            key=lambda value: len(value),
+            reverse=True,
+        )
+
+    def has_unverified(self) -> bool:
+        return bool(
+            self._strings - self._promoted_strings
+            or self._numbers - self._promoted_numbers
+        )
+
+    def was_observed_transient(self, value: Any) -> bool:
+        """True for exact provider values even after independent promotion."""
+
+        normalized = self._normalized(value)
+        return bool(normalized) and any(
+            normalized == self._normalized(candidate) for candidate in self._strings
+        )
+
+    def independently_validated_call(self, name: str, result: Any) -> bool:
+        return bool(self._storage_capable_rows(name, result))
+
+    def redact_text(self, value: Any) -> str:
+        text = str(value or "")
+        for candidate in self._unverified_strings():
+            text = re.sub(re.escape(candidate), _TRANSIENT_REDACTION, text, flags=re.IGNORECASE)
+        return text
+
+    def contains_unverified(self, value: Any, *, key: str = "") -> bool:
+        if isinstance(value, dict):
+            return any(
+                self.contains_unverified(child, key=str(child_key))
+                for child_key, child in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(self.contains_unverified(child, key=key) for child in value)
+        if isinstance(value, str):
+            lowered = value.casefold()
+            return any(candidate.casefold() in lowered for candidate in self._unverified_strings())
+        if key in self._COORDINATE_FIELDS and isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            return any(
+                abs(numeric - candidate) <= 0.00001
+                for candidate in self._numbers - self._promoted_numbers
+            )
+        return False
+
+    def redact(self, value: Any, *, key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {
+                child_key: self.redact(child, key=str(child_key))
+                for child_key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [self.redact(child, key=key) for child in value]
+        if isinstance(value, tuple):
+            return tuple(self.redact(child, key=key) for child in value)
+        if isinstance(value, str):
+            return self.redact_text(value)
+        if key in self._COORDINATE_FIELDS and isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if any(
+                abs(numeric - candidate) <= 0.00001
+                for candidate in self._numbers - self._promoted_numbers
+            ):
+                return _TRANSIENT_REDACTION
+        return value
+
+    def storage_safe_query(self, query: Any) -> str:
+        raw = str(query or "").strip()
+        # Once a transient lead has entered the live context, any later model
+        # query may be a paraphrase of it. Persist only an opaque duplicate key
+        # until an independent provider result validates that call.
+        if not self.has_unverified() and not self.contains_unverified(raw):
+            return raw
+        # A digest is still a durable derivative of provider data. Use one
+        # constant marker; exact duplicate detection remains run-local on the
+        # raw model arguments and never needs a persisted fingerprint.
+        return _TRANSIENT_QUERY_REDACTION
+
+    def safe_free_text(self, value: Any, *, purpose: str) -> str:
+        """Discard model prose after a transient lead entered its context.
+
+        Exact string scrubbing is useful defense in depth, but cannot prove a
+        paraphrase is independent. Server-authored operational text is the only
+        safe durable representation once Brave no-storage content was exposed.
+        """
+
+        if self.candidate_count:
+            return f"[{purpose}: Brave transient provider prose discarded]"
+        return self.redact_text(value)
+
+
+def _persistable_tool_result(
+    name: str,
+    result: Any,
+    *,
+    transient_taint: _TransientProviderTaint | None = None,
+    transient_input: bool = False,
+) -> Any:
+    """Strip provider payloads whose license permits transient use only.
+
+    The model may inspect Brave place candidates in the live tool round, but a
+    standard Search plan does not grant retention rights. Keep independently
+    obtained ordinary web results, but do not retain candidate content, counts,
+    provider errors, or identifiers derived from the transient response.
+    """
+
+    safe = result
+    if name == "web_search" and isinstance(result, dict):
+        candidates = result.get("place_candidates")
+        brave_attempt = any(
+            isinstance(item, dict) and item.get("provider") == "brave_place"
+            for item in (result.get("provider_attempts") or [])
+        )
+        if isinstance(candidates, list) or brave_attempt:
+            safe = dict(result)
+            safe.pop("place_candidates", None)
+            safe.pop("place_candidate_summary", None)
+            safe["provider_attempts"] = [
+                {"provider": "brave_place", "status": "transient_discarded"}
+                if isinstance(item, dict) and item.get("provider") == "brave_place"
+                else item
+                for item in (result.get("provider_attempts") or [])
+            ]
+        if transient_input:
+            safe = dict(safe)
+            safe.pop("backend_errors", None)
+            if safe.get("error") and not safe.get("results"):
+                safe = {
+                    "error": "independent_search_failed",
+                    "results": [],
+                    "provider_attempts": safe.get("provider_attempts", []),
+                }
+    if transient_input and name == "fetch_page" and transient_taint is not None:
+        # A successful fetch can be used in the live run to corroborate a lead,
+        # but its model-selected URL and page body are not written to run steps
+        # after no-retention provider context. The proposal projector below may
+        # retain only a separately discovered matching page.
+        safe = (
+            {
+                "validation_status": "independent_page_validated",
+                "text": "Server verified an independently retainable public page.",
+            }
+            if transient_taint.independently_validated_call(name, result)
+            else {"error": "independent_verification_failed"}
+        )
+    elif (
+        transient_input
+        and name == "geocode_place"
+        and transient_taint is not None
+        and not transient_taint.independently_validated_call(name, result)
+    ):
+        safe = {"error": "independent_verification_failed"}
+    return transient_taint.redact(safe) if transient_taint is not None else safe
+
+
+def _persistable_tool_args(
+    name: str,
+    args: dict[str, Any],
+    result: Any,
+    *,
+    transient_taint: _TransientProviderTaint,
+    transient_input: bool,
+    storage_safe_query: str = "",
+) -> dict[str, Any]:
+    """Project model arguments onto a retention-safe durable shape."""
+
+    if name == "web_search":
+        return {
+            "query": storage_safe_query or _TRANSIENT_QUERY_REDACTION,
+            "max_results": args.get("max_results"),
+        }
+    if transient_input and name == "geocode_place":
+        return {"query": _TRANSIENT_QUERY_REDACTION}
+    if transient_input and name == "fetch_page":
+        return {"url": _TRANSIENT_QUERY_REDACTION}
+    if transient_input and name not in {"propose_place", "upsert_agent_task"}:
+        return {"transient_input": "discarded"}
+    return transient_taint.redact(args)
 
 
 def _step_detail_json(
@@ -1488,6 +2507,11 @@ QUALITY_TASK_KINDS = {
     "quality_zones",
     "quality_verification",
 }
+QUALITY_SOURCE_REVISIONS = {
+    # Legal image sources currently available to persisted quality work.
+    # Brave place/photo payloads are discovery-only and intentionally absent.
+    "image": "wikimedia:v1|openverse:v1|manual-upload:v1",
+}
 
 
 def _quality_target_line(marker: Marker, gaps: list[str]) -> str:
@@ -1597,7 +2621,13 @@ def _sync_quality_tasks(
         )
         .all()
     )
-    gaps_by_id = {marker.id: _marker_quality_gaps(marker) for marker in points}
+    raw_gaps_by_id = {marker.id: _marker_quality_gaps(marker) for marker in points}
+    gaps_by_id = filter_actionable_quality_gaps(
+        db,
+        markers=points,
+        gaps_by_id=raw_gaps_by_id,
+        source_revisions=QUALITY_SOURCE_REVISIONS,
+    )
 
     def ranked(markers: list[Marker], limit: int) -> list[Marker]:
         return sorted(
@@ -1682,10 +2712,19 @@ def _sync_quality_tasks(
             if row is not None and row.status != "completed":
                 row.status = "completed"
                 row.completed_at = now
+                relevant_gaps = QUALITY_GAPS_BY_TASK_KIND.get(kind, frozenset())
+                physical_count = sum(
+                    1
+                    for marker in points
+                    if relevant_gaps & set(raw_gaps_by_id.get(marker.id, []))
+                )
+                prefix = f"실행 #{run_id}: " if run_id else ""
                 row.result = (
-                    f"실행 #{run_id}: 운영 DB 재측정 결과 해당 품질 결손이 없습니다."
-                    if run_id
-                    else "운영 DB 재측정 결과 해당 품질 결손이 없습니다."
+                    f"{prefix}운영 DB에는 물리적 결손 {physical_count}건이 남아 있으나 "
+                    "근거가 있는 terminal/cooldown disposition으로 현재 실행 대상에서 제외했습니다. "
+                    "장소·구역·공급자 조건이 바뀌면 자동 재개됩니다."
+                    if physical_count
+                    else f"{prefix}운영 DB 재측정 결과 해당 품질 결손이 없습니다."
                 )
             continue
 
@@ -1779,6 +2818,194 @@ def _ensure_gap_tasks(db: Session, *, city_id: int, run_id: int, gaps: list[str]
     return ids
 
 
+def _recent_autonomous_mission_kinds(
+    db: Session,
+    *,
+    city_id: int,
+    limit: int,
+) -> list[str]:
+    """Return recent scheduled lanes for one city, including legacy idle runs."""
+
+    rows = (
+        db.query(AgentRun)
+        .filter(
+            AgentRun.city_id == city_id,
+            AgentRun.mode.in_(("research", "idle")),
+        )
+        .order_by(AgentRun.id.desc())
+        .limit(max(1, limit))
+        .all()
+    )
+    kinds: list[str] = []
+    for row in rows:
+        mission = db.get(AgentMission, row.mission_id) if row.mission_id else None
+        kinds.append(mission.kind if mission is not None else "idle")
+    return kinds
+
+
+def _candidate_discovery_due(db: Session, *, city_id: int) -> bool:
+    """Guarantee one discovery slice in every configured autonomous window."""
+
+    recent = _recent_autonomous_mission_kinds(
+        db,
+        city_id=city_id,
+        limit=CANDIDATE_DISCOVERY_INTERVAL - 1,
+    )
+    return CANDIDATE_DISCOVERY_KIND not in recent
+
+
+def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask:
+    """Create or resume the single bounded discovery cycle for a city."""
+
+    task = (
+        db.query(AgentTask)
+        .filter(
+            AgentTask.city_id == city.id,
+            AgentTask.kind == CANDIDATE_DISCOVERY_KIND,
+            AgentTask.status.in_(("pending", "blocked")),
+        )
+        .order_by(AgentTask.id.desc())
+        .first()
+    )
+    if task is None:
+        task = AgentTask(
+            city_id=city.id,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title=f"자동 신규 장소 발굴: {city.name_ko}",
+            detail=(
+                f"{city.name_ko}({city.name_local})의 현재 지도와 조사 이력을 읽고, "
+                f"{_research_themes(city)} 중 부족한 여행 역할 하나를 선택하세요. "
+                "서로 다른 출처의 본문으로 정확한 상호·지점·주소를 확인하고 기존 장소와 중복되지 않는 "
+                "후보만 좌표 검증 후 관리자 승인 제안으로 남기세요. 안전한 후보가 없으면 조사한 출처 축과 "
+                "탈락 사유, 다음에 달라져야 할 재시도 조건을 기록하세요."
+            ),
+            success_metric=(
+                "중복·본문·좌표가 검증된 신규 장소 승인 제안 1건 이상 또는 서로 다른 출처 축을 "
+                "소진했다는 감사 가능한 차단 결과"
+            ),
+            priority=88,
+            status="pending",
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+    elif task.status == "blocked":
+        # Preserve the prior mission/work-item/checkpoint chain. A blocked
+        # discovery slice becomes executable only when the weighted scheduler
+        # reserves the next discovery turn and calls this helper again.
+        task.status = "pending"
+        task.completed_at = None
+        db.commit()
+        db.refresh(task)
+    return task
+
+
+def _fair_non_discovery_task(db: Session, *, city_id: int) -> AgentTask | None:
+    """Choose durable work by safety, fewest slices, then priority.
+
+    A recently paused mission keeps its cooldown. Once that expires it competes
+    on attempts, so an always-active high-priority quality dimension cannot
+    permanently prevent an older paused quality mission from resuming.
+    """
+
+    cooldown_cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
+    candidates = (
+        db.query(AgentTask)
+        .filter(
+            AgentTask.city_id == city_id,
+            AgentTask.status == "pending",
+            AgentTask.kind != CANDIDATE_DISCOVERY_KIND,
+        )
+        .all()
+    )
+    eligible: list[tuple[AgentTask, AgentMission | None]] = []
+    for task in candidates:
+        mission = (
+            db.query(AgentMission)
+            .filter(
+                AgentMission.city_id == city_id,
+                AgentMission.task_id == task.id,
+                AgentMission.status.in_(("active", "paused")),
+            )
+            .order_by(AgentMission.id.desc())
+            .first()
+        )
+        if mission is not None and mission.status == "paused":
+            # Let the database compare timestamps: SQLite test rows are naive
+            # while PostgreSQL production rows are timezone-aware.
+            cooling = db.query(AgentMission.id).filter(
+                AgentMission.id == mission.id,
+                AgentMission.updated_at > cooldown_cutoff,
+            ).first()
+            if cooling is not None:
+                continue
+        eligible.append((task, mission))
+    if not eligible:
+        return None
+
+    def fair_key(row: tuple[AgentTask, AgentMission | None]) -> tuple[Any, ...]:
+        task, mission = row
+        return (
+            0 if task.kind == "data_integrity" else 1,
+            int(task.attempts or 0),
+            int(mission.last_run_id or 0) if mission is not None else 0,
+            -int(task.priority or 0),
+            task.id,
+        )
+
+    return min(eligible, key=fair_key)[0]
+
+
+def _select_autonomous_task(
+    db: Session,
+    *,
+    city: City,
+) -> tuple[AgentTask, str, bool]:
+    """Select a safety-first lane while reserving periodic discovery capacity."""
+
+    non_discovery = _fair_non_discovery_task(db, city_id=city.id)
+    # Operational integrity is explicit safety work and remains ahead of the
+    # weighted research lanes. User events are handled before this function.
+    if non_discovery is not None and non_discovery.kind == "data_integrity":
+        return non_discovery, "data_integrity", False
+
+    recent_lanes = _recent_autonomous_mission_kinds(db, city_id=city.id, limit=1)
+    if non_discovery is not None and not recent_lanes:
+        first_mission = (
+            db.query(AgentMission)
+            .filter(
+                AgentMission.city_id == city.id,
+                AgentMission.task_id == non_discovery.id,
+                AgentMission.status.in_(("active", "paused")),
+            )
+            .order_by(AgentMission.id.desc())
+            .first()
+        )
+        if first_mission is None or first_mission.last_run_id is None:
+            # Give pre-existing durable work one initial checkpointed slice on
+            # upgrade. Its research run immediately makes discovery due next,
+            # preserving continuity without allowing backlog starvation.
+            return non_discovery, "quality_or_backlog", False
+
+    discovery_due = _candidate_discovery_due(db, city_id=city.id)
+    if discovery_due:
+        return (
+            _ensure_candidate_discovery_task(db, city=city),
+            CANDIDATE_DISCOVERY_KIND,
+            True,
+        )
+    if non_discovery is not None:
+        return non_discovery, "quality_or_backlog", False
+    # Avoid a no-op idle run when every quality target is cooling down. This is
+    # an opportunistic discovery slice; the periodic counter still lets a cooled
+    # quality mission win on the next non-due run once it becomes executable.
+    return (
+        _ensure_candidate_discovery_task(db, city=city),
+        CANDIDATE_DISCOVERY_KIND,
+        False,
+    )
+
+
 def run_agent(
     db: Session,
     *,
@@ -1837,65 +3064,42 @@ def run_agent(
     primary_task = None
     active_mission = None
     active_work_item = None
+    selected_lane = "queue" if queue_mode else "disabled"
+    discovery_reserved = False
     if autonomous_mode:
-        resumable_mission = (
+        # Repair any legacy task-first integrity completion before lane
+        # selection. Terminal audit cursors must never steal a later research
+        # slice merely because their old mission row still says active.
+        terminal_integrity_missions = (
             db.query(AgentMission)
             .join(AgentWorkItem, AgentWorkItem.mission_id == AgentMission.id)
             .filter(
                 AgentMission.city_id == city_id,
+                AgentMission.kind == "data_integrity",
                 AgentMission.status == "active",
                 AgentWorkItem.status.in_(("active", "ready")),
             )
-            .order_by(AgentMission.updated_at.desc(), AgentMission.id.desc())
-            .first()
+            .order_by(AgentMission.id.desc())
+            .all()
         )
-        if resumable_mission is not None:
-            primary_task = db.get(AgentTask, resumable_mission.task_id)
+        repaired_integrity = False
+        for resumable_mission in terminal_integrity_missions:
+            integrity_task = db.get(AgentTask, resumable_mission.task_id)
             if _complete_data_integrity_mission(
                 db,
                 mission=resumable_mission,
-                task=primary_task,
+                task=integrity_task,
             ):
-                # Repair legacy task-first commits before exposing any tools.
-                # The completed result is immutable and this mission must not
-                # be resumed merely to repeat its terminal write.
-                db.commit()
-                resumable_mission = None
-                primary_task = None
-        if resumable_mission is None:
-            candidates = (
-                db.query(AgentTask)
-                .filter(AgentTask.city_id == city_id, AgentTask.status == "pending")
-                .order_by(AgentTask.priority.desc(), AgentTask.created_at.asc())
-                .all()
-            )
-            cooldown_cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
-            for candidate in candidates:
-                paused = db.query(AgentMission).filter(
-                    AgentMission.city_id == city_id,
-                    AgentMission.task_id == candidate.id,
-                    AgentMission.status == "paused",
-                    AgentMission.updated_at > cooldown_cutoff,
-                ).first()
-                if paused is None:
-                    primary_task = candidate
-                    break
-        if primary_task is not None:
-            primary_task.attempts += 1
-            active_mission, active_work_item = ensure_mission_for_task(db, primary_task)
+                repaired_integrity = True
+        if repaired_integrity:
             db.commit()
-        elif unread_before == 0:
-            # Every durable mission is completed or intentionally cooling down.
-            # Starting a free-form research loop here loses the explicit cursor
-            # and tends to repeat broad searches without a measurable target.
-            # Record a normal idle cycle and let the next schedule re-evaluate
-            # cooldowns, new user events, and newly synchronized quality gaps.
+        if repaired_integrity and _fair_non_discovery_task(db, city_id=city_id) is None:
             performance = _performance_snapshot(db, city_id)
-            idle_run = AgentRun(
+            repair_run = AgentRun(
                 city_id=city_id,
                 mode="idle",
                 status="completed",
-                objective="No executable durable target; wait for retry conditions or new input.",
+                objective="Reconcile an immutable legacy integrity terminal cursor.",
                 score=0,
                 metrics=json.dumps({
                     "before": performance,
@@ -1904,36 +3108,53 @@ def run_agent(
                     "tool_counts": {},
                     "material_changes": [],
                     "material_change_count": 0,
-                    "idle_reason": "all_durable_targets_terminal_or_cooling_down",
+                    "lane": "integrity_repair",
+                    "idle_reason": "legacy_integrity_terminal_reconciled",
                     "quality_task_ids_before": quality_task_ids_before,
                 }, ensure_ascii=False),
-                summary=(
-                    "실행 가능한 지속 과제가 없습니다. 완료·차단 상태와 재시도 조건을 유지한 채 "
-                    "새 사용자 입력, 새 품질 공백 또는 냉각 시간 경과를 기다립니다."
-                ),
+                summary="완료된 무결성 과제의 지속 미션 상태를 모델 호출 없이 원자적으로 복구했습니다.",
                 finished_at=datetime.now(timezone.utc),
             )
-            db.add(idle_run)
+            db.add(repair_run)
             db.commit()
-            db.refresh(idle_run)
+            db.refresh(repair_run)
             return {
                 "ok": True,
                 "status": "completed",
                 "steps": 0,
-                "message": idle_run.summary,
+                "message": repair_run.summary,
                 "unread_before": 0,
                 "unread_after": 0,
                 "tool_counts": {},
                 "score": 0,
                 "performance": {},
                 "remaining_gaps": _research_gaps({}, {}, performance),
-                "run_id": idle_run.id,
+                "run_id": repair_run.id,
                 "city_id": city_id,
             }
+        primary_task, selected_lane, discovery_reserved = _select_autonomous_task(
+            db,
+            city=city,
+        )
+        primary_task.attempts += 1
+        active_mission, active_work_item = ensure_mission_for_task(db, primary_task)
+        db.commit()
     integrity_mode = bool(
         autonomous_mode
         and active_mission is not None
         and active_mission.kind == "data_integrity"
+        and active_work_item is not None
+    )
+    discovery_mode = bool(
+        autonomous_mode
+        and active_mission is not None
+        and active_mission.kind == CANDIDATE_DISCOVERY_KIND
+        and active_work_item is not None
+    )
+    scoped_quality_mode = bool(
+        autonomous_mode
+        and active_mission is not None
+        and active_mission.kind in QUALITY_TASK_KINDS
         and active_work_item is not None
     )
     integrity_evidence_refs: dict[str, str] = {}
@@ -2039,11 +3260,19 @@ def run_agent(
         objective=(
             f"{primary_task_hint}만 감사하고 종료"
             if integrity_mode
+            else f"{primary_task_hint} 신규 장소 승인 후보 발굴 조각 수행"
+            if discovery_mode
+            else f"{primary_task_hint} 현재 품질 미션의 활성 대상만 처리"
+            if scoped_quality_mode
             else f"{primary_task_hint} 완료 후 다음 성과 공백 진행"
             if autonomous_mode
             else "사용자 작업 큐 전원 처리"
         ),
-        metrics=json.dumps({"before": performance_before}, ensure_ascii=False),
+        metrics=json.dumps({
+            "before": performance_before,
+            "lane": selected_lane,
+            "discovery_reserved": discovery_reserved,
+        }, ensure_ascii=False),
     )
     db.add(agent_run)
     db.commit()
@@ -2186,6 +3415,14 @@ def run_agent(
             f"활성 대상: place_id={active_work_item.place_id}, title={active_work_item.title}.\n"
             f"{integrity_phase_instruction}"
         )
+    elif (discovery_mode or scoped_quality_mode) and active_mission is not None and active_work_item is not None:
+        user_msg = _scoped_mission_user_message(
+            city,
+            active_mission,
+            active_work_item,
+            continuity_hint=continuity_hint,
+            personalization_hint=personalization_hint if discovery_mode else "",
+        )
     elif autonomous_mode:
         user_msg += (
             "\n\n【사용자 행동 기반 개인화 관찰】\n"
@@ -2214,6 +3451,15 @@ def run_agent(
             corrective_result_only=integrity_corrective_resume,
         )
         if integrity_mode
+        else _candidate_discovery_system(city, active_mission, active_work_item)
+        if discovery_mode and active_mission is not None and active_work_item is not None
+        else _scoped_quality_system(
+            city,
+            active_mission,
+            active_work_item,
+            tool_names=RECOVERY_TOOLS_BY_TASK[active_mission.kind],
+        )
+        if scoped_quality_mode and active_mission is not None and active_work_item is not None
         else _system_for_city(city) + runtime_policy
     )
     messages: list[dict[str, Any]] = [
@@ -2221,6 +3467,7 @@ def run_agent(
         {"role": "user", "content": user_msg},
     ]
 
+    transient_taint = _TransientProviderTaint()
     steps = 0
     final_text = ""
     used_tools: set[str] = set()
@@ -2239,6 +3486,7 @@ def run_agent(
     evidence_keys: set[str] = set()
     validated_source_urls: set[str] = set()
     verified_coordinate_records: list[dict[str, Any]] = []
+    verified_page_records: list[dict[str, Any]] = []
     material_changes: list[dict[str, Any]] = []
     repeated_calls = 0
     image_searches_by_place: dict[int, int] = {}
@@ -2266,11 +3514,20 @@ def run_agent(
     current_score = 0.0
     context_compactions = 0
     data_integrity_place_reads: set[int] = set()
+    scoped_lane_terminal = False
     integrity_focus_hint = (
         f"mission_id={active_mission.id}, task_id={active_mission.task_id}, "
         f"place_id={active_work_item.place_id}, title={active_work_item.title}"
         if integrity_mode
-        else ""
+        else (
+            f"mission_id={active_mission.id}, task_id={active_mission.task_id}, "
+            f"target={active_work_item.target_key}, title={active_work_item.title}; "
+            "continue only this scoped mission with the currently advertised tools"
+            if (discovery_mode or scoped_quality_mode)
+            and active_mission is not None
+            and active_work_item is not None
+            else ""
+        )
     )
     try:
         for _ in range(steps_limit):
@@ -2336,6 +3593,13 @@ def run_agent(
                             evidence_details=corrective_evidence_refs,
                         )
                         if corrective_result_only
+                        else _candidate_discovery_tools(
+                            task_id=int(active_mission.task_id),
+                            tool_names=mission_tool_names,
+                        )
+                        if discovery_mode
+                        and active_mission is not None
+                        and active_mission.task_id is not None
                         else _filtered_tools(mission_tool_names)
                     ),
                     tool_choice="required" if corrective_result_only else "auto",
@@ -2345,6 +3609,10 @@ def run_agent(
             except Exception as exc:
                 # 모델이 스키마에 안 맞는 인자(null 등)를 생성한 경우: 사이클을 죽이지 않고 교정 재시도
                 detail = str(exc)
+                persistable_error_detail = transient_taint.safe_free_text(
+                    detail,
+                    purpose="model-output error",
+                )
                 failure_kind = _model_output_failure_kind(detail)
                 if pending_model_recovery is not None:
                     finish_model_recovery_attempt(
@@ -2409,7 +3677,7 @@ def run_agent(
                         score_delta=0,
                         detail=json.dumps({
                             "failure_kind": failure_kind,
-                            "error": detail[:1200],
+                            "error": persistable_error_detail[:1200],
                             "strategy": strategy,
                         }, ensure_ascii=False, default=str),
                     )
@@ -2422,7 +3690,7 @@ def run_agent(
                         run_id=agent_run.id,
                         sequence=action_sequence,
                         failure_kind=failure_kind,
-                        error=detail,
+                        error=persistable_error_detail,
                         attempt=model_recovery_attempts,
                         strategy=strategy,
                     )
@@ -2478,7 +3746,7 @@ def run_agent(
                             "content": (
                                 "직전 툴 호출이 스키마 검증에 실패했습니다. "
                                 + schema_retry_instruction
-                                + f"오류: {detail[:600]}"
+                                + f"오류: {persistable_error_detail[:600]}"
                             ),
                         }
                     )
@@ -2540,23 +3808,49 @@ def run_agent(
                     continue
                 if autonomous_mode:
                     _sync_quality_tasks(db, city_id=city_id, run_id=agent_run.id)
+                    if primary_task is not None:
+                        db.refresh(primary_task)
+                    if (
+                        (discovery_mode or scoped_quality_mode)
+                        and primary_task is not None
+                        and primary_task.status in {"completed", "blocked"}
+                    ):
+                        finalize_mission(
+                            db,
+                            mission=active_mission,
+                            task=primary_task,
+                            run_id=agent_run.id,
+                        )
+                        final_text = msg.content or (
+                            "현재 전용 미션의 성공조건 또는 감사 가능한 차단조건을 충족해 종료했습니다."
+                        )
+                        break
                 current_snapshot = _performance_snapshot(db, city_id)
                 current_delta = _performance_delta(performance_before, current_snapshot)
                 gaps = _research_gaps(current_delta, successful_tool_counts, current_snapshot) if autonomous_mode else []
                 current_score = _performance_score(current_delta, successful_tool_counts)
                 if gaps and progress_nudges < 8 and no_progress_actions < 18 and steps < steps_limit:
                     progress_nudges += 1
+                    scoped_progress = (
+                        "현재 미션과 활성 대상에서 벗어나지 말고, 현재 요청에 광고된 도구만 사용해 "
+                        "성공조건에 가장 가까운 행동을 수행하세요. 기존 체크포인트와 새 근거를 재사용하고, "
+                        "완료가 불가능하면 현재 task_id에 차단 원인과 달라져야 할 재시도 조건을 기록하세요."
+                        if discovery_mode or scoped_quality_mode
+                        else (
+                            "같은 검색을 반복하지 말고 list_agent_tasks를 다시 읽어 운영 DB가 생성한 "
+                            "정확한 장소 ID 단위 품질 백로그를 이어서 처리하세요. 신규 장소 후보는 "
+                            "geocode_place 직후 propose_place로 승인 대기에 저장하세요. 그 후보를 "
+                            "upsert_agent_task에 승인 제안으로 적는 것은 금지됩니다. 실패한 후속 조사만 "
+                            "지식 본문이 아니라 upsert_agent_task에 구체적으로 남기세요."
+                        )
+                    )
                     messages.append(
                         {
                             "role": "user",
                             "content": (
                                 f"성과 게이트가 아직 충족되지 않았습니다(현재 점수 {current_score}). "
                                 f"남은 결과: {', '.join(gaps)}. 스텝 수가 아니라 실제 결과를 만들고 다시 측정하세요. "
-                                "같은 검색을 반복하지 말고 list_agent_tasks를 다시 읽어 운영 DB가 생성한 "
-                                "정확한 장소 ID 단위 품질 백로그를 이어서 처리하세요. "
-                                "신규 장소 후보는 geocode_place 직후 propose_place로 승인 대기에 저장하세요. "
-                                "그 후보를 upsert_agent_task에 승인 제안으로 적는 것은 금지됩니다. "
-                                "실패한 후속 조사만 지식 본문이 아니라 upsert_agent_task에 구체적으로 남기세요."
+                                + scoped_progress
                             ),
                         }
                     )
@@ -2617,18 +3911,29 @@ def run_agent(
                     if not isinstance(args, dict):
                         raise ValueError("tool arguments must decode to an object")
                 except (json.JSONDecodeError, ValueError) as exc:
-                    raw_digest = hashlib.sha256(raw_args.encode("utf-8", errors="replace")).hexdigest()
                     argument_error = f"malformed_tool_arguments: {exc}"
-                    args = {
-                        "_malformed_arguments_sha256": raw_digest,
-                        "_malformed_arguments_preview": raw_args[:300],
-                    }
+                    if transient_taint.candidate_count:
+                        args = {"_malformed_arguments": "discarded_after_transient_provider_context"}
+                    else:
+                        raw_digest = hashlib.sha256(raw_args.encode("utf-8", errors="replace")).hexdigest()
+                        args = {
+                            "_malformed_arguments_sha256": raw_digest,
+                            "_malformed_arguments_preview": raw_args[:300],
+                        }
                 used_tools.add(name)
                 tool_counts[name] = tool_counts.get(name, 0) + 1
+                transient_input = transient_taint.candidate_count > 0
                 signature = _tool_signature(name, args)
                 repeated = name in EXPENSIVE_RESEARCH_TOOLS and signature in seen_expensive_calls
+                storage_safe_search_query = (
+                    transient_taint.storage_safe_query(args.get("query"))
+                    if name == "web_search"
+                    else ""
+                )
                 normalized_query = (
-                    _normalize_research_query(args.get("query")) if name == "web_search" else ""
+                    _normalize_research_query(args.get("query"))
+                    if name == "web_search"
+                    else ""
                 )
                 recent_search_repeat = bool(
                     normalized_query and normalized_query in recent_search_queries
@@ -2660,6 +3965,16 @@ def run_agent(
                     active_work_item,
                     mission_kind=active_mission.kind if active_mission is not None else "",
                 )
+                transient_mutation_violation = bool(
+                    not argument_error
+                    and name in MUTATION_TOOLS
+                    and transient_input
+                    # Discovery proposals are rebuilt from server-owned
+                    # independent evidence at execution time below. No model
+                    # field survives that projection, including paraphrases
+                    # that an exact taint matcher could never detect.
+                    and name not in {"propose_place", "upsert_agent_task"}
+                )
                 agent_task_mismatch = (
                     None
                     if argument_error
@@ -2682,6 +3997,26 @@ def run_agent(
                     if not argument_error
                     else (args, None)
                 )
+                if (
+                    not argument_error
+                    and active_mission is not None
+                    and active_mission.kind == CANDIDATE_DISCOVERY_KIND
+                    and name == "upsert_agent_task"
+                ):
+                    projected_task_args, task_projection_error = (
+                        _project_candidate_discovery_task_result_args(
+                            name,
+                            args,
+                            active_mission,
+                            primary_task,
+                            run_id=agent_run.id,
+                            transient_provider_seen=bool(transient_taint.candidate_count),
+                            research_evidence_refs=_candidate_discovery_research_refs(
+                                db,
+                                run_id=agent_run.id,
+                            ),
+                        )
+                    )
                 data_integrity_get_place_id = None
                 if (
                     active_mission is not None
@@ -2738,7 +4073,19 @@ def run_agent(
                     integrity_task_terminal_request and not corrective_result_only
                 )
                 malformed_attempt = 0
-                if corrective_scope_violation:
+                effective_tool_args = args
+                if transient_mutation_violation:
+                    result = {
+                        "error": "transient_provider_data_not_verified",
+                        "error_class": "policy_guard",
+                        "guard_disposition": "retry",
+                        "detail": (
+                            "Brave Place의 no-storage 후보 원문은 운영 DB에 기록할 수 없습니다. "
+                            "geocode_place의 저장 가능한 좌표 또는 fetch_page의 유효한 공개 본문으로 "
+                            "같은 사실을 독립 확인한 뒤 canonical 값만 다시 사용하세요."
+                        ),
+                    }
+                elif corrective_scope_violation:
                     result = {
                         "error": "tool_not_allowed_for_data_integrity",
                         "error_class": "policy_guard",
@@ -2836,7 +4183,10 @@ def run_agent(
                         "attempt": malformed_attempt,
                         "recovery_mode": plan.mode,
                         "allowed_tools": sorted(plan.allowed_tools),
-                        "signature": args["_malformed_arguments_sha256"],
+                        "signature": args.get(
+                            "_malformed_arguments_sha256",
+                            "discarded_after_transient_provider_context",
+                        ),
                     }
                 elif target_mismatch is not None:
                     result = target_mismatch
@@ -2847,9 +4197,9 @@ def run_agent(
                         "guard_disposition": "decide",
                         "detail": (
                             "실제 DB 변화 없이 조사 도구를 8회 사용했습니다. 추가 조회·검색을 중단하고 "
-                            "이미 확보한 근거만 사용해 장소 정보·인사이트·검증·사진·구역·체인 중 하나를 "
-                            "안전하게 갱신하세요. 근거가 부족하면 해당 장소의 차단 원인과 다음 검증 방법을 "
-                            "과제 result에 남기고 다른 정확한 대상의 저장 행동으로 전환하세요. 추측 저장은 금지합니다."
+                            "이미 확보한 근거만 사용해 현재 요청에 광고된 저장 도구 중 성공조건에 맞는 "
+                            "하나를 안전하게 실행하세요. 근거가 부족하면 현재 과제의 차단 원인과 다음 검증 "
+                            "방법을 task 결과에 남기세요. 추측 저장과 다른 대상으로의 전환은 금지합니다."
                         ),
                     }
                 elif recent_search_repeat:
@@ -2892,7 +4242,7 @@ def run_agent(
                     tool_args = (
                         projected_task_args
                         if active_mission is not None
-                        and active_mission.kind == "data_integrity"
+                        and active_mission.kind in {"data_integrity", CANDIDATE_DISCOVERY_KIND}
                         and name == "upsert_agent_task"
                         else args
                     )
@@ -2906,7 +4256,12 @@ def run_agent(
                             **args,
                             "_validated_source_urls": sorted(validated_source_urls),
                         }
+                    effective_tool_args = tool_args
                     if name == "propose_place":
+                        if transient_input:
+                            # Until the server projection below succeeds, no
+                            # model-authored proposal field is durable.
+                            effective_tool_args = {"transient_input": "discarded"}
                         coordinate_evidence = _matching_coordinate_evidence(
                             args,
                             verified_coordinate_records,
@@ -2921,8 +4276,21 @@ def run_agent(
                                 ),
                             }
                         else:
-                            tool_args = {**tool_args, "_coordinate_evidence": coordinate_evidence}
-                            result = run_tool(db, name, tool_args, city_id=city_id)
+                            projection_error = None
+                            if transient_input and discovery_mode:
+                                canonical_args, projection_error = _canonical_transient_proposal_args(
+                                    coordinate_evidence,
+                                    verified_page_records,
+                                    transient_taint,
+                                )
+                                if canonical_args is not None:
+                                    tool_args = canonical_args
+                            if projection_error is not None:
+                                result = projection_error
+                            else:
+                                tool_args = {**tool_args, "_coordinate_evidence": coordinate_evidence}
+                                effective_tool_args = tool_args
+                                result = run_tool(db, name, tool_args, city_id=city_id)
                     else:
                         result = run_tool(
                             db,
@@ -2936,10 +4304,22 @@ def run_agent(
                             ),
                             server_defer_commit=bool(
                                 active_mission is not None
-                                and active_mission.kind == "data_integrity"
+                                and active_mission.kind in {"data_integrity", CANDIDATE_DISCOVERY_KIND}
                                 and name == "upsert_agent_task"
                             ),
+                            server_allow_brave_places=(
+                                discovery_mode and name == "web_search"
+                            ),
+                            server_storage_query=(
+                                storage_safe_search_query if name == "web_search" else None
+                            ),
+                            server_record_web_visit=not (
+                                transient_input and name == "fetch_page"
+                            ),
                         )
+                    if name == "web_search":
+                        transient_taint.observe_brave_candidates(result)
+                    transient_taint.promote_independent_evidence(name, result)
                     if (
                         name == "fetch_page"
                         and isinstance(result, dict)
@@ -2948,6 +4328,20 @@ def run_agent(
                         and result.get("url")
                     ):
                         validated_source_urls.add(str(result["url"]))
+                        verified_page_records.append({
+                            "url": str(result.get("url") or "")[:1000],
+                            "title": str(result.get("title") or "")[:300],
+                            "text": str(result.get("text") or "")[:7000],
+                            "coordinate_candidates": [
+                                dict(row)
+                                for row in (result.get("coordinate_candidates") or [])
+                                if (
+                                    isinstance(row, dict)
+                                    and row.get("storage_allowed") is True
+                                    and not str(row.get("source") or "").casefold().startswith("brave")
+                                )
+                            ],
+                        })
                     if name in {"geocode_place", "fetch_page"} and isinstance(result, dict):
                         coordinate_rows = (
                             result.get("results") or []
@@ -2955,7 +4349,11 @@ def run_agent(
                             else result.get("coordinate_candidates") or []
                         )
                         for raw_coordinate in coordinate_rows:
-                            if not isinstance(raw_coordinate, dict) or raw_coordinate.get("storage_allowed") is False:
+                            if (
+                                not isinstance(raw_coordinate, dict)
+                                or raw_coordinate.get("storage_allowed") is not True
+                                or raw_coordinate.get("source") == "brave_place"
+                            ):
                                 continue
                             try:
                                 float(raw_coordinate["lat"])
@@ -2967,7 +4365,7 @@ def run_agent(
                                 "display_name": str(
                                     raw_coordinate.get("display_name")
                                     or result.get("title")
-                                    or args.get("query")
+                                    or (args.get("query") if not transient_input else "")
                                     or ""
                                 ),
                                 "source_url": str(
@@ -2976,6 +4374,8 @@ def run_agent(
                                     or ""
                                 ),
                             }
+                            if transient_taint.was_observed_transient(record["source_url"]):
+                                record["source_url"] = ""
                             verified_coordinate_records.append(record)
                     if normalized_query:
                         recent_search_queries.add(normalized_query)
@@ -3048,7 +4448,15 @@ def run_agent(
                 if not error:
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
                 material_change = _is_material_change(name, result)
-                new_evidence = _new_evidence_keys(name, result, evidence_keys)
+                # A follow-up fetch after transient provider exposure can help
+                # the live decision, but its model-selected URL/body must not
+                # flow into durable handoff state. Candidate-discovery terminal
+                # logic uses a separate server-owned verification flag.
+                new_evidence = (
+                    set()
+                    if transient_input and name == "fetch_page"
+                    else _new_evidence_keys(name, result, evidence_keys)
+                )
                 evidence_keys.update(new_evidence)
                 for handoff_item in _evidence_handoff_items(name, result, new_evidence):
                     if handoff_item not in evidence_handoff and len(evidence_handoff) < 12:
@@ -3091,6 +4499,44 @@ def run_agent(
                 else:
                     no_progress_actions += 1
                 action_sequence += 1
+                persistable_args = _persistable_tool_args(
+                    name,
+                    effective_tool_args,
+                    result,
+                    transient_taint=transient_taint,
+                    transient_input=transient_input,
+                    storage_safe_query=storage_safe_search_query,
+                )
+                persistable_result = _persistable_tool_result(
+                    name,
+                    result,
+                    transient_taint=transient_taint,
+                    transient_input=transient_input,
+                )
+                discovery_search_ok = bool(
+                    discovery_mode
+                    and name == "web_search"
+                    and isinstance(result, dict)
+                    and not result.get("error")
+                    and isinstance(result.get("results"), list)
+                )
+                discovery_verification_ok = bool(
+                    discovery_mode
+                    and isinstance(result, dict)
+                    and not result.get("error")
+                    and (
+                        (name == "fetch_page" and is_useful_fetched_page(result))
+                        or (
+                            name == "geocode_place"
+                            and any(
+                                isinstance(candidate, dict)
+                                and candidate.get("storage_allowed") is True
+                                and not str(candidate.get("source") or "").casefold().startswith("brave")
+                                for candidate in (result.get("results") or [])
+                            )
+                        )
+                    )
+                )
                 db.add(
                     AgentRunStep(
                         run_id=agent_run.id,
@@ -3100,13 +4546,15 @@ def run_agent(
                         outcome=outcome,
                         score_delta=score_delta,
                         detail=_step_detail_json(
-                            args,
-                            result,
+                            persistable_args,
+                            persistable_result,
                             {
                                 "material_change": material_change,
                                 "new_evidence": len(new_evidence),
                                 "score": current_score,
                                 "no_material_actions": no_material_actions,
+                                "discovery_search_ok": discovery_search_ok,
+                                "discovery_verification_ok": discovery_verification_ok,
                             },
                         ),
                     )
@@ -3119,12 +4567,41 @@ def run_agent(
                     run_id=agent_run.id,
                     sequence=action_sequence,
                     tool=name,
-                    args=args,
-                    result=result,
+                    args=persistable_args,
+                    result=persistable_result,
                     outcome=outcome,
                     new_evidence_count=len(new_evidence),
                     material_change=material_change,
                 )
+                discovery_task_terminal = False
+                if (
+                    discovery_mode
+                    and primary_task is not None
+                    and active_mission is not None
+                ):
+                    if (
+                        name == "propose_place"
+                        and not error
+                        and isinstance(result, dict)
+                        and result.get("proposal_created") is True
+                    ):
+                        primary_task.status = "completed"
+                        primary_task.completed_at = datetime.now(timezone.utc)
+                        primary_task.result = (
+                            f"실행 #{agent_run.id}: 검증된 신규 장소 승인 제안 "
+                            f"#{result.get('proposal_id')} 생성"
+                        )[:8000]
+                    if primary_task.status in {"completed", "blocked"}:
+                        finalize_mission(
+                            db,
+                            mission=active_mission,
+                            task=primary_task,
+                            run_id=agent_run.id,
+                            commit=False,
+                        )
+                        discovery_task_terminal = True
+                        scoped_lane_terminal = True
+                        active_work_item = None
                 if terminal_corrective_guard:
                     # The next round has one safe purpose: record an honest
                     # terminal verdict on this mission's own task. Re-exposing
@@ -3146,27 +4623,158 @@ def run_agent(
                 if canonical_active is not None:
                     active_work_item = canonical_active
                     agent_run.work_item_id = canonical_active.id
+                zone_assignment_outside_all = bool(
+                    active_mission is not None
+                    and active_mission.kind == "quality_zones"
+                    and active_work_item is not None
+                    and active_work_item.place_id is not None
+                    and name == "assign_place_zone"
+                    and isinstance(result, dict)
+                    and result.get("error") == "place_outside_zone_polygon"
+                    and result.get("suggested_zone_id") is None
+                )
+                zone_audit_requested = bool(
+                    active_mission is not None
+                    and active_mission.kind == "quality_zones"
+                    and active_work_item is not None
+                    and active_work_item.place_id is not None
+                    and (name == "list_zones" or zone_assignment_outside_all)
+                )
+                zone_audit: dict[str, Any] | None = None
+                if zone_audit_requested:
+                    target_place = db.get(Marker, int(active_work_item.place_id))
+                    if target_place is None:
+                        zone_audit = {"valid": False, "reason": "zone_target_missing"}
+                    else:
+                        zone_audit = _zone_catalog_audit(
+                            db,
+                            city_id=city_id,
+                            lat=float(target_place.lat),
+                            lng=float(target_place.lng),
+                            observed_rows=result if name == "list_zones" else None,
+                        )
+                zone_catalog_disposition = (
+                    "blocked"
+                    if zone_audit is not None and not zone_audit.get("valid")
+                    else "waived"
+                    if zone_audit is not None
+                    and zone_audit.get("valid")
+                    and not zone_audit.get("contains")
+                    else None
+                )
+                zone_catalog_exhausted = zone_catalog_disposition is not None
+                active_image_place_id = (
+                    int(active_work_item.place_id)
+                    if active_mission is not None
+                    and active_mission.kind == "quality_images"
+                    and active_work_item is not None
+                    and active_work_item.place_id is not None
+                    else None
+                )
+                image_attempt_count = (
+                    image_searches_by_place.get(active_image_place_id, 0)
+                    if active_image_place_id is not None
+                    else 0
+                )
+                image_audit = (
+                    _image_search_audit(
+                        db,
+                        run_id=agent_run.id,
+                        place_id=active_image_place_id,
+                    )
+                    if active_image_place_id is not None and image_attempt_count >= 3
+                    else {"all": [], "clean_empty": [], "provider_failure": [], "with_candidates": []}
+                )
+                image_terminal_disposition = None
+                if len(image_audit["all"]) >= 3 and not image_audit["with_candidates"]:
+                    if len(image_audit["clean_empty"]) == 3:
+                        image_terminal_disposition = "source_exhausted"
+                    elif image_audit["provider_failure"]:
+                        # One warning/error means the three-attempt sample did
+                        # not cleanly exhaust the source pool. Cool down instead
+                        # of making a durable source-exhausted claim.
+                        image_terminal_disposition = "blocked"
+                image_budget_terminal = bool(
+                    active_mission is not None
+                    and active_mission.kind == "quality_images"
+                    and active_work_item is not None
+                    and active_work_item.place_id is not None
+                    and image_attempt_count >= 3
+                    and image_terminal_disposition is not None
+                    and db.query(PlaceImage.id).filter(
+                        PlaceImage.place_id == int(active_work_item.place_id)
+                    ).first() is None
+                )
                 if material_change and not data_integrity_task_completed:
+                    if scoped_quality_mode:
+                        scoped_lane_terminal = True
                     active_work_item = reconcile_work_items(db, mission=active_mission)
                     if active_work_item is not None:
                         agent_run.work_item_id = active_work_item.id
                         continuity = mission_context(active_mission, active_work_item) if active_mission else continuity
-                elif _should_rotate_exhausted_image_target(
-                    mission=active_mission,
-                    work_item=active_work_item,
-                    target_mismatch=target_mismatch,
-                    image_searches_by_place=image_searches_by_place,
-                ) and not data_integrity_task_completed:
+                elif zone_catalog_exhausted and not data_integrity_task_completed:
+                    scoped_lane_terminal = True
                     previous_target = active_work_item.target_key
+                    zone_refs = [f"run:{agent_run.id}:step:{action_sequence}"]
+                    zone_reason = (
+                        "서버가 현재 장소 좌표를 도시의 최신 구역 폴리곤 전체와 대조했으며, 모든 구역 "
+                        "geometry가 유효하지만 포함하는 구역이 없어 이번 구역 결손을 면제합니다."
+                        if zone_catalog_disposition == "waived"
+                        else (
+                            "도시 구역 카탈로그에 누락·손상·퇴화 geometry가 있어 전체 불포함을 증명할 수 "
+                            "없습니다. 24시간 냉각 후 카탈로그를 다시 감사합니다."
+                        )
+                    )
                     active_work_item = rotate_blocked_work_item(
                         db,
                         mission=active_mission,
                         current=active_work_item,
                         run_id=agent_run.id,
-                        reason=(
-                            "Three image searches produced no attachable exact-subject image; "
-                            "the model then attempted a different target. Rotate instead of repeating drift."
-                        ),
+                        reason=zone_reason,
+                        quality_disposition=zone_catalog_disposition,
+                        quality_gap_kinds=["zone"],
+                        quality_evidence_refs=zone_refs,
+                    )
+                    if active_work_item is not None:
+                        agent_run.work_item_id = active_work_item.id
+                        continuity["rotation"] = {
+                            "from": previous_target,
+                            "to": active_work_item.target_key,
+                            "reason": (
+                                "current zone catalogue contains no matching polygon"
+                                if zone_catalog_disposition == "waived"
+                                else "zone catalogue geometry invalid"
+                            ),
+                        }
+                elif image_budget_terminal and not data_integrity_task_completed:
+                    scoped_lane_terminal = True
+                    previous_target = active_work_item.target_key
+                    image_refs = image_audit["all"]
+                    # Source exhaustion is a server-observed fact only when
+                    # three exact searches cleanly returned no candidates. A
+                    # provider outage is temporary and receives a cooldown.
+                    terminal_disposition = image_terminal_disposition
+                    terminal_reason = (
+                        "정확한 장소 사진 검색 3회가 모두 정상 완료됐지만 자유 라이선스 후보가 0건이라 "
+                        "현재 이미지 출처 집합을 소진한 것으로 기록합니다."
+                        if terminal_disposition == "source_exhausted"
+                        else (
+                            "세 번의 이미지 검색 표본 중 하나 이상에서 공급자 오류·경고가 발생해 "
+                            "24시간 냉각 후 재시도하도록 차단합니다."
+                        )
+                        if terminal_disposition == "blocked"
+                        else "이미지 결과를 서버가 분류하지 못해 차단했습니다."
+                    )
+                    active_work_item = rotate_blocked_work_item(
+                        db,
+                        mission=active_mission,
+                        current=active_work_item,
+                        run_id=agent_run.id,
+                        reason=terminal_reason,
+                        quality_disposition=terminal_disposition,
+                        quality_gap_kinds=["image"] if terminal_disposition else None,
+                        quality_evidence_refs=image_refs,
+                        quality_source_revision=QUALITY_SOURCE_REVISIONS["image"],
                     )
                     if active_work_item is not None:
                         agent_run.work_item_id = active_work_item.id
@@ -3175,7 +4783,7 @@ def run_agent(
                         continuity["rotation"] = {
                             "from": previous_target,
                             "to": active_work_item.target_key,
-                            "reason": "image search exhausted and next-target intent observed",
+                            "reason": "exact-subject image search budget exhausted",
                         }
                 elif (
                     not data_integrity_task_completed
@@ -3303,13 +4911,21 @@ def run_agent(
                 )
             if no_material_actions in {12, 18} and material_nudges < 2:
                 material_nudges += 1
+                scoped_material_instruction = (
+                    "현재 미션의 광고된 도구 중 성공조건을 만족시키는 저장 행동을 선택하세요. 근거가 "
+                    "부족하면 다른 대상으로 옮기지 말고 현재 task_id에 차단 원인과 재시도 조건을 기록하세요."
+                    if discovery_mode or scoped_quality_mode
+                    else (
+                        "지금까지 확보한 근거로 제안·인사이트·구역·체인·검증 중 하나를 완료하세요. "
+                        "근거가 부족하면 동일 검색을 변형해 반복하지 말고, 차단 원인과 다음 검증 방법을 "
+                        "측정 가능한 upsert_agent_task로 남긴 뒤 다른 목표로 이동하세요."
+                    )
+                )
                 messages.append({
                     "role": "user",
                     "content": (
                         f"최근 {no_material_actions}개 행동에서 실제 DB 변화가 없습니다. 조사 자체는 성과가 아닙니다. "
-                        "지금까지 확보한 근거로 제안·인사이트·구역·체인·검증 중 하나를 완료하세요. "
-                        "근거가 부족하면 동일 검색을 변형해 반복하지 말고, 차단 원인과 다음 검증 방법을 "
-                        "측정 가능한 upsert_agent_task로 남긴 뒤 다른 목표로 이동하세요."
+                        + scoped_material_instruction
                     ),
                 })
             if no_material_actions >= 24:
@@ -3350,7 +4966,7 @@ def run_agent(
             db.rollback()
         except Exception:
             pass
-        detail = str(exc)
+        detail = transient_taint.safe_free_text(str(exc), purpose="run failure detail")
         recoverable_model_failure = bool(
             terminal_model_failure_kind or _model_output_failure_kind(detail)
         )
@@ -3367,7 +4983,7 @@ def run_agent(
                 f"Groq model '{model}' blocked in project limits. "
                 "Enable it at https://console.groq.com/settings/project/limits "
                 "or change Secrets GROQ_MODEL. "
-                f"Detail: {exc}"
+                "Detail omitted by the provider-retention boundary."
             )
         try:
             unread_after = count_unread(db, city_id)
@@ -3383,9 +4999,14 @@ def run_agent(
                 failed_run.metrics = json.dumps(
                     {
                         "before": performance_before,
+                        "lane": selected_lane,
+                        "discovery_reserved": discovery_reserved,
                         "tool_counts": tool_counts,
                         "successful_tool_counts": successful_tool_counts,
-                        "material_changes": material_changes,
+                        "material_changes": _persistable_material_changes(
+                            material_changes,
+                            transient_taint,
+                        ),
                         "repeated_calls_blocked": repeated_calls,
                         "image_searches_by_place": image_searches_by_place,
                         "context_compactions": context_compactions,
@@ -3442,6 +5063,11 @@ def run_agent(
         gaps=gaps,
         material_change_count=len(material_changes),
     )
+    if (discovery_mode or scoped_quality_mode) and scoped_lane_terminal and outcome_unread == 0:
+        # City-wide gaps remain useful metrics, but cannot make an exact scoped
+        # target look partial after it reached a server-audited terminal state.
+        run_status = "completed"
+    final_text = transient_taint.safe_free_text(final_text, purpose="run summary")
     summary = final_text or "에이전트 사이클 완료"
     if tool_counts:
         stats = ", ".join(f"{t}×{c}" for t, c in sorted(tool_counts.items(), key=lambda x: -x[1]))
@@ -3485,9 +5111,14 @@ def run_agent(
                 "before": performance_before,
                 "after": performance_after,
                 "delta": performance_delta,
+                "lane": selected_lane,
+                "discovery_reserved": discovery_reserved,
                 "tool_counts": tool_counts,
                 "successful_tool_counts": successful_tool_counts,
-                "material_changes": material_changes,
+                "material_changes": _persistable_material_changes(
+                    material_changes,
+                    transient_taint,
+                ),
                 "material_change_count": len(material_changes),
                 "evidence_count": len(evidence_keys),
                 "evidence_handoff": evidence_handoff,

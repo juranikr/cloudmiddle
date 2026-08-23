@@ -7,10 +7,123 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Callable
 
 
 BRAVE_PLACE_URL = "https://api.search.brave.com/res/v1/local/place_search"
+
+
+_COUNTRY_PROFILES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {
+    # alpha-3, HTTP language preference, Wikidata languages, official host suffixes
+    "CN": ("CHN", ("zh-CN", "zh", "ko", "en"), ("zh", "en", "ko"), (".gov.cn",)),
+    "KR": ("KOR", ("ko", "en"), ("ko", "en"), (".go.kr",)),
+    "JP": ("JPN", ("ja", "en", "ko"), ("ja", "en", "ko"), (".go.jp",)),
+    "US": ("USA", ("en",), ("en",), (".gov",)),
+    "CA": ("CAN", ("en", "fr"), ("en", "fr"), (".gc.ca",)),
+    "GB": ("GBR", ("en",), ("en",), (".gov.uk",)),
+    "FR": ("FRA", ("fr", "en"), ("fr", "en"), (".gouv.fr",)),
+    "DE": ("DEU", ("de", "en"), ("de", "en"), (".bund.de",)),
+    "IT": ("ITA", ("it", "en"), ("it", "en"), (".gov.it",)),
+    "ES": ("ESP", ("es", "en"), ("es", "en"), (".gob.es",)),
+    "AU": ("AUS", ("en",), ("en",), (".gov.au",)),
+    "NZ": ("NZL", ("en",), ("en",), (".govt.nz",)),
+    "SG": ("SGP", ("en", "zh"), ("en", "zh"), (".gov.sg",)),
+    "TH": ("THA", ("th", "en"), ("th", "en"), (".go.th",)),
+    "VN": ("VNM", ("vi", "en"), ("vi", "en"), (".gov.vn",)),
+}
+
+_CITY_PROFILES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "jinan": (
+        ("济南", "济南市", "지난", "jinan"),
+        ("jinan.gov.cn", "jn.gov.cn", "shandong.gov.cn", "sd.gov.cn"),
+    ),
+    "shenyang": (
+        ("沈阳", "沈阳市", "선양", "심양", "shenyang"),
+        ("shenyang.gov.cn", "ln.gov.cn"),
+    ),
+}
+
+_CITY_RELEVANCE_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "jinan": (
+        ("宽厚里", "관후리", "kuanhouli"),
+        ("芙蓉街", "푸룽제", "furong street", "furongjie"),
+        ("泉城路", "취안청루", "quancheng road", "quanchenglu"),
+    ),
+    "shenyang": (("中街", "중제", "zhongjie"),),
+}
+
+
+def _normalized_country_code(value: str) -> str:
+    code = str(value or "").strip().upper()
+    return code if len(code) == 2 and code.isalpha() else "CN"
+
+
+def _dedupe_strings(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in values:
+        value = str(raw or "").strip()
+        key = value.casefold()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class SearchProviderProfile:
+    """Provider parameters and relevance hints derived from a destination city.
+
+    The profile contains no provider credentials and is safe to construct in API,
+    chat, and batch paths. Unknown countries remain usable: Brave/Nominatim receive
+    their ISO alpha-2 code, while ArcGIS simply omits an unsupported alpha-3 filter.
+    """
+
+    country_code: str
+    arcgis_country_code: str
+    language_tags: tuple[str, ...]
+    wikidata_languages: tuple[str, ...]
+    city_aliases: tuple[str, ...]
+    official_domains: tuple[str, ...]
+    official_host_suffixes: tuple[str, ...]
+    local_relevance_groups: tuple[tuple[str, ...], ...]
+
+
+def build_search_provider_profile(
+    *,
+    country_code: str = "CN",
+    city_slug: str = "",
+    city_name: str = "",
+    city_name_ko: str = "",
+) -> SearchProviderProfile:
+    """Build one normalized provider profile without hard-coding a single city path."""
+
+    alpha2 = _normalized_country_code(country_code)
+    alpha3, language_tags, wikidata_languages, official_suffixes = _COUNTRY_PROFILES.get(
+        alpha2,
+        ("", ("en",), ("en",), ()),
+    )
+    city_key = str(city_slug or "").strip().casefold()
+    known_aliases, official_domains = _CITY_PROFILES.get(city_key, ((), ()))
+    aliases = _dedupe_strings([
+        city_name,
+        city_name[:-1] if city_name.endswith("市") else "",
+        city_name_ko,
+        city_slug,
+        *known_aliases,
+    ])
+    return SearchProviderProfile(
+        country_code=alpha2,
+        arcgis_country_code=alpha3,
+        language_tags=language_tags,
+        wikidata_languages=wikidata_languages,
+        city_aliases=aliases,
+        official_domains=official_domains,
+        official_host_suffixes=official_suffixes,
+        local_relevance_groups=_CITY_RELEVANCE_GROUPS.get(city_key, ()),
+    )
 
 
 def _failure_kind(status: int) -> str:
@@ -32,6 +145,7 @@ def search_brave_places(
     count: int = 10,
     radius_m: float = 20_000,
     city_bounds: tuple[float, float, float, float] | None = None,
+    country_code: str = "CN",
     storage_allowed: bool = False,
     opener: Callable[..., Any] = urllib.request.urlopen,
     sleeper: Callable[[float], None] = time.sleep,
@@ -50,7 +164,7 @@ def search_brave_places(
         "longitude": float(longitude),
         "radius": max(0.0, float(radius_m)),
         "count": max(1, min(int(count), 100)),
-        "country": "CN",
+        "country": _normalized_country_code(country_code),
         "units": "metric",
         "safesearch": "strict",
         "spellcheck": "false",
@@ -146,4 +260,9 @@ def search_brave_places(
     }
 
 
-__all__ = ["BRAVE_PLACE_URL", "search_brave_places"]
+__all__ = [
+    "BRAVE_PLACE_URL",
+    "SearchProviderProfile",
+    "build_search_provider_profile",
+    "search_brave_places",
+]

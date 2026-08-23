@@ -8,6 +8,7 @@ import hashlib
 import logging
 import math
 import re
+import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -35,7 +36,11 @@ from app.gcj02 import gcj02_to_wgs84
 from app.knowledge import list_knowledge, upsert_knowledge
 from app.place_identity import PlaceIdentityInput, same_place_candidate
 from app.place_integrity import assess_new_place
-from app.search_providers import search_brave_places
+from app.search_providers import (
+    SearchProviderProfile,
+    build_search_provider_profile,
+    search_brave_places,
+)
 from app.messages import (
     list_open_appeals,
     mark_appeals_read,
@@ -220,25 +225,38 @@ def _insight_fact_tokens(value: str) -> set[str]:
     }
 
 
-def _search_relevance_groups(query: str) -> list[tuple[str, ...]]:
+def _search_relevance_groups(
+    query: str,
+    profile: Optional[SearchProviderProfile] = None,
+) -> list[tuple[str, ...]]:
     folded = query.casefold()
     groups: list[tuple[str, ...]] = []
-    if any(term in folded for term in ("沈阳", "선양", "심양")):
-        groups.append(("沈阳", "선양", "심양", "shenyang"))
-    if any(term in folded for term in ("中街", "중제")):
-        groups.append(("中街", "중제", "zhongjie"))
+    if profile and any(alias.casefold() in folded for alias in profile.city_aliases):
+        groups.append(profile.city_aliases)
+    if profile:
+        groups.extend(
+            group
+            for group in profile.local_relevance_groups
+            if any(term.casefold() in folded for term in group)
+        )
     if any(term in folded for term in ("마사지", "按摩", "spa", "스파", "足疗", "洗浴")):
         groups.append(("마사지", "按摩", "spa", "스파", "足疗", "洗浴", "推拿"))
-    if any(term in folded for term in ("식당", "맛집", "음식", "餐厅", "美食", "小吃", "饭店")):
-        groups.append(("식당", "맛집", "음식", "餐厅", "美食", "小吃", "饭店", "restaurant"))
+    if any(term in folded for term in ("식당", "맛집", "음식", "餐厅", "美食", "小吃", "饭店", "快餐")):
+        groups.append(("식당", "맛집", "음식", "餐厅", "美食", "小吃", "饭店", "快餐", "restaurant"))
     if any(term in folded for term in ("호텔", "숙소", "酒店", "宾馆", "住宿")):
         groups.append(("호텔", "숙소", "酒店", "宾馆", "住宿", "hotel"))
     if any(term in folded for term in ("카페", "음료", "차", "咖啡", "奶茶", "饮品")):
         groups.append(("카페", "음료", "咖啡", "奶茶", "饮品", "tea", "cafe"))
+    if any(term in folded for term in ("관광", "명소", "景点", "景区", "博物馆", "museum", "attraction")):
+        groups.append(("관광", "명소", "景点", "景区", "博物馆", "museum", "attraction"))
     return groups
 
 
-def _search_result_quality(query: str, item: dict[str, Any]) -> float:
+def _search_result_quality(
+    query: str,
+    item: dict[str, Any],
+    profile: Optional[SearchProviderProfile] = None,
+) -> float:
     """Reject unsafe/off-topic search hits before they reach the model or history."""
     url = str(item.get("href") or "")
     host = _search_host(url)
@@ -253,21 +271,55 @@ def _search_result_quality(query: str, item: dict[str, Any]) -> float:
         return 0.0
     # Disposable spam mirrors in this corpus overwhelmingly use /archives/<id>
     # on .cc or CloudFront hosts and have no stable publisher identity.
-    trusted = any(host == domain or host.endswith(f".{domain}") for domain in _TRUSTED_SEARCH_HOSTS)
+    trusted_domains = (
+        (*_TRUSTED_SEARCH_HOSTS, *profile.official_domains)
+        if profile
+        else _TRUSTED_SEARCH_HOSTS
+    )
+    trusted = any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains)
+    if profile and not trusted:
+        trusted = any(
+            host == suffix.lstrip(".") or host.endswith(suffix)
+            for suffix in profile.official_host_suffixes
+        )
     folded_text = text.casefold()
-    relevance_groups = _search_relevance_groups(query)
+    relevance_groups = _search_relevance_groups(query, profile)
     matched_groups = sum(any(term.casefold() in folded_text for term in group) for group in relevance_groups)
 
-    raw_tokens = re.findall(r"[0-9A-Za-z가-힣\u3400-\u9fff]{2,}", query)
+    # Python's Unicode word class keeps Japanese, Thai, Arabic, Cyrillic, etc.;
+    # an explicit Chinese/Korean/Latin allow-list made other destinations look
+    # unrelated even when a business name matched exactly.
+    raw_tokens = re.findall(r"[^\W_]{2,}", query, flags=re.UNICODE)
     tokens = [token for token in raw_tokens if token.casefold() not in _QUERY_ACTION_WORDS]
     token_matches = sum(1 for token in tokens[:12] if token.casefold() in folded_text)
+    relevance_terms = {
+        term.casefold()
+        for group in relevance_groups
+        for term in group
+    }
+    entity_tokens: list[str] = []
+    for token in tokens:
+        entity_token = token.casefold()
+        for term in sorted(relevance_terms, key=len, reverse=True):
+            entity_token = entity_token.replace(term, "")
+        if len(entity_token) >= 2:
+            entity_tokens.append(entity_token)
+    entity_matches = sum(1 for token in entity_tokens[:12] if token.casefold() in folded_text)
+    exact_entity_match = any(
+        len(_compact_subject(token)) >= 3 and _compact_subject(token) in _compact_subject(text)
+        for token in entity_tokens[:12]
+    )
 
     score = 0.18 + (0.38 if trusted else 0.0)
     score += min(0.28, matched_groups * 0.14)
     score += min(0.2, token_matches * 0.05)
-    if relevance_groups and matched_groups == 0 and not trusted:
+    if exact_entity_match:
+        score += 0.34
+    if relevance_groups and matched_groups == 0 and entity_matches == 0:
         return 0.0
-    if len(relevance_groups) >= 2 and matched_groups < 2:
+    if len(relevance_groups) >= 2 and matched_groups < 2 and entity_matches == 0:
+        return 0.0
+    if relevance_groups and entity_tokens and entity_matches == 0 and not exact_entity_match:
         return 0.0
     # A reputable host is not enough when an exact business query has no
     # semantic group (city/food/hotel/etc.).  For example, Trip.com's unrelated
@@ -284,10 +336,11 @@ def _filter_search_results(
     results: list[dict[str, Any]],
     *,
     limit: int,
+    profile: Optional[SearchProviderProfile] = None,
 ) -> tuple[list[dict[str, Any]], int]:
     ranked: list[tuple[float, int, dict[str, Any]]] = []
     for index, item in enumerate(results):
-        quality = _search_result_quality(query, item)
+        quality = _search_result_quality(query, item, profile)
         if quality < 0.55:
             continue
         enriched = dict(item)
@@ -1391,7 +1444,19 @@ def _has_hangul(s: str) -> bool:
 
 
 def _compact_subject(value: str) -> str:
-    return "".join(re.findall(r"[0-9A-Za-z가-힣\u3400-\u9fff]+", value or "")).lower()
+    normalized = unicodedata.normalize("NFKC", value or "").translate(str.maketrans({
+        "瀋": "沈",
+        "陽": "阳",
+        "宮": "宫",
+        "號": "号",
+        "門": "门",
+        "館": "馆",
+        "來": "来",
+        "國": "国",
+        "廣": "广",
+        "區": "区",
+    })).casefold()
+    return "".join(character for character in normalized if character.isalnum())
 
 
 def _title_subjects(title: str) -> list[str]:
@@ -1401,17 +1466,62 @@ def _title_subjects(title: str) -> list[str]:
     return [candidate for candidate in candidates if len(candidate) >= 4]
 
 
+def _address_subjects(*values: Any) -> set[str]:
+    """Extract stable street-number anchors without treating general prose as an address."""
+
+    out: set[str] = set()
+    for raw in values:
+        value = unicodedata.normalize("NFKC", urllib.parse.unquote(str(raw or "")))
+        for match in re.findall(
+            r"[^\s,，;；]{2,45}(?:路|街|巷|道)\s*\d{1,6}(?:号|號)",
+            value,
+            flags=re.IGNORECASE,
+        ):
+            # Province/city/district prefixes differ by publisher. The actual
+            # street-number suffix remains stable enough for branch identity.
+            suffix = re.split(r"[省市区區县縣]", match)[-1]
+            compact = _compact_subject(suffix)
+            if len(compact) >= 6:
+                out.add(compact)
+        for match in re.findall(
+            r"[0-9A-Za-z .'-]{2,50}(?:Road|Street|Avenue|Lane)\s*(?:No\.?\s*)?\d{1,6}",
+            value,
+            flags=re.IGNORECASE,
+        ):
+            compact = _compact_subject(match)
+            if len(compact) >= 8:
+                out.add(compact)
+    return out
+
+
 def _source_mentions_place(marker: Marker, *values: Any) -> bool:
     """Require exact-place evidence for branch facts and attached images."""
 
     aliases = _title_subjects(marker.title)
     branch = _compact_subject(marker.branch_name or "")
-    if len(branch) >= 4:
-        aliases.append(branch)
     haystack = _compact_subject(
         " ".join(urllib.parse.unquote(str(value or "")) for value in values)
     )
-    return bool(haystack and any(alias in haystack for alias in aliases))
+    if not haystack:
+        return False
+    if len(branch) < 4:
+        return any(alias in haystack for alias in aliases)
+    if branch in haystack:
+        return True
+
+    # Some booking pages use the exact official hotel name and full street
+    # address but omit our internal branch token (e.g. 中街故宫店). Accept that
+    # stronger identity pair while still rejecting brand-only/other-branch pages.
+    if not any(alias in haystack for alias in aliases):
+        return False
+    expected_addresses = _address_subjects(marker.coordinate_query, marker.description)
+    source_addresses = _address_subjects(*values)
+    return any(
+        min(len(expected), len(source)) >= 6
+        and (expected in source or source in expected)
+        for expected in expected_addresses
+        for source in source_addresses
+    )
 
 
 def _has_cjk(s: str) -> bool:
@@ -1806,6 +1916,9 @@ def run_tool(
     approved: bool = False,
     server_pure_read: bool = False,
     server_defer_commit: bool = False,
+    server_allow_brave_places: bool = False,
+    server_storage_query: Optional[str] = None,
+    server_record_web_visit: bool = True,
 ) -> Any:
     if name == "list_unread_events":
         limit = int(args.get("limit") or 30)
@@ -2999,16 +3112,58 @@ def run_tool(
             .group_by(Marker.zone_id)
             .all()
         )
-        return [
-            {
+        output: list[dict[str, Any]] = []
+        for zone in zones:
+            polygon_status = "valid"
+            polygon_error = None
+            try:
+                polygon = json.loads(zone.polygon or "[]")
+            except (TypeError, json.JSONDecodeError):
+                # Preserve the zone ID in the observed catalogue so the runner
+                # can record a blocked/cooldown disposition instead of crashing
+                # or falsely treating a broken polygon as outside every zone.
+                polygon = None
+                polygon_status = "invalid"
+                polygon_error = "malformed_polygon_json"
+            else:
+                try:
+                    vertices = [
+                        (float(point["lat"]), float(point["lng"]))
+                        for point in polygon
+                        if isinstance(point, dict)
+                    ] if isinstance(polygon, list) else []
+                    twice_area = sum(
+                        x1 * y2 - x2 * y1
+                        for (y1, x1), (y2, x2) in zip(
+                            vertices,
+                            vertices[1:] + vertices[:1],
+                        )
+                    )
+                    geometry_valid = (
+                        isinstance(polygon, list)
+                        and len(vertices) == len(polygon)
+                        and len(vertices) >= 3
+                        and all(
+                            math.isfinite(lat) and math.isfinite(lng)
+                            for lat, lng in vertices
+                        )
+                        and abs(twice_area) > 1e-12
+                    )
+                except (KeyError, TypeError, ValueError):
+                    geometry_valid = False
+                if not geometry_valid:
+                    polygon_status = "invalid"
+                    polygon_error = "invalid_polygon_geometry"
+            output.append({
                 "id": zone.id,
                 "title": zone.title,
                 "category": zone.category.value if zone.category else "other",
                 "member_count": int(counts.get(zone.id, 0)),
-                "polygon": json.loads(zone.polygon or "[]"),
-            }
-            for zone in zones
-        ]
+                "polygon": polygon,
+                "polygon_status": polygon_status,
+                "polygon_error": polygon_error,
+            })
+        return output
 
     if name == "assign_place_zone":
         place_id = int(args["place_id"])
@@ -3474,6 +3629,9 @@ def run_tool(
                 viewbox=city.search_viewbox,
                 city_name=city.name_local,
                 city_context=city.search_context,
+                city_slug=city.slug,
+                city_name_ko=city.name_ko,
+                country_code=city.country_code,
                 local_candidates=local_candidates,
                 arcgis_api_key=settings.arcgis_api_key,
             )
@@ -3485,11 +3643,34 @@ def run_tool(
         query = str(args.get("query") or "").strip()
         if not query:
             return {"results": []}
+        # This value is trusted runner provenance and never comes from the model
+        # tool schema. A no-storage Brave lead may be used as a live query while
+        # only a constant, non-derived marker is retained in search history.
+        stored_query = (
+            query
+            if server_storage_query is None
+            else str(server_storage_query or "[transient-query]").strip()[:300]
+        )
         max_results = max(1, min(int(args.get("max_results") or 8), 15))
         city = db.get(City, city_id)
+        profile = (
+            build_search_provider_profile(
+                country_code=city.country_code,
+                city_slug=city.slug,
+                city_name=city.name_local,
+                city_name_ko=city.name_ko,
+            )
+            if city is not None
+            else None
+        )
         place_candidates: list[dict[str, Any]] = []
         provider_attempts: list[dict[str, Any]] = []
-        if settings.brave_place_enabled and settings.brave_search_api_key and city is not None:
+        if (
+            server_allow_brave_places
+            and settings.brave_place_enabled
+            and settings.brave_search_api_key
+            and city is not None
+        ):
             bounds = parse_viewbox(city.search_viewbox)
             try:
                 brave_result = search_brave_places(
@@ -3499,6 +3680,7 @@ def run_tool(
                     longitude=city.center_lng,
                     count=max_results,
                     city_bounds=(bounds.south, bounds.west, bounds.north, bounds.east) if bounds else None,
+                    country_code=profile.country_code if profile else city.country_code,
                     storage_allowed=settings.brave_search_storage_rights,
                 )
             except Exception as exc:  # noqa: BLE001 - optional provider must not break text search
@@ -3518,7 +3700,7 @@ def run_tool(
                 "outside_city_count": int(brave_result.get("outside_city_count") or 0),
                 "retries": int(brave_result.get("retries") or 0),
             })
-        elif settings.brave_place_enabled:
+        elif server_allow_brave_places and settings.brave_place_enabled:
             provider_attempts.append({
                 "provider": "brave_place",
                 "status": "skipped_no_key",
@@ -3578,7 +3760,7 @@ def run_tool(
             else:
                 db.add(
                     AgentSearchLog(
-                        query=query[:300],
+                        query=stored_query,
                         city_id=city_id,
                         results_count=0,
                         new_count=0,
@@ -3588,8 +3770,12 @@ def run_tool(
                 logger.warning(
                     "web_search failed city=%s query=%r error=%s",
                     city_id,
-                    query[:120],
-                    str(exc)[:240],
+                    stored_query[:120],
+                    (
+                        "transient_search_failed"
+                        if stored_query != query
+                        else str(exc)[:240]
+                    ),
                 )
                 return {
                     "error": str(exc),
@@ -3599,7 +3785,12 @@ def run_tool(
                 }
 
         raw_result_count = len(results)
-        results, discarded_count = _filter_search_results(query, results, limit=max_results)
+        results, discarded_count = _filter_search_results(
+            query,
+            results,
+            limit=max_results,
+            profile=profile,
+        )
         hrefs = [r.get("href") or "" for r in results]
         known_rows = (
             db.query(AgentSearchResult).filter(AgentSearchResult.url.in_(hrefs)).all()
@@ -3619,7 +3810,7 @@ def run_tool(
         ]
         past = (
             db.query(AgentSearchLog)
-            .filter(AgentSearchLog.query == query, AgentSearchLog.city_id == city_id)
+            .filter(AgentSearchLog.query == stored_query, AgentSearchLog.city_id == city_id)
             .order_by(AgentSearchLog.searched_at.desc())
             .all()
         )
@@ -3644,8 +3835,10 @@ def run_tool(
                 )
         db.add(
             AgentSearchLog(
-                query=query[:300],
+                query=stored_query,
                 city_id=city_id,
+                # Brave's no-storage response is excluded even from aggregate
+                # counters; only independently returned text-search rows count.
                 results_count=len(out),
                 new_count=sum(1 for r in out if not r["seen"]),
             )
@@ -3671,10 +3864,18 @@ def run_tool(
             return {"error": "bad_url"}
         if _blocked_search_url(url):
             return {"error": "blocked_source", "detail": "스팸·성인·저품질 출처는 열람하지 않습니다."}
-        prior = db.query(AgentWebVisit).filter(
-            AgentWebVisit.url == url,
-            AgentWebVisit.city_id == city_id,
-        ).first()
+        # This switch is server-owned and deliberately absent from the tool
+        # schema. A URL chosen after a no-retention provider result may itself
+        # be provider-derived, so the discovery runner can fetch it for live
+        # cross-verification without writing the URL to AgentWebVisit.
+        prior = (
+            db.query(AgentWebVisit).filter(
+                AgentWebVisit.url == url,
+                AgentWebVisit.city_id == city_id,
+            ).first()
+            if server_record_web_visit
+            else None
+        )
         already_visited = prior is not None
         try:
             page = _extract_page_text(url)
@@ -3689,11 +3890,17 @@ def run_tool(
                 try:
                     companion_page = _extract_page_text(coordinate_companion_url)
                 except Exception as exc:  # noqa: BLE001
-                    logger.info(
-                        "Ctrip coordinate companion failed url=%s error=%s",
-                        coordinate_companion_url,
-                        str(exc)[:180],
-                    )
+                    if server_record_web_visit:
+                        logger.info(
+                            "Ctrip coordinate companion failed url=%s error=%s",
+                            coordinate_companion_url,
+                            str(exc)[:180],
+                        )
+                    else:
+                        logger.info(
+                            "Transient follow-up coordinate companion failed class=%s",
+                            type(exc).__name__,
+                        )
                 else:
                     companion_title = str(companion_page.get("title") or "").strip()
                     companion_coordinates = []
@@ -3723,7 +3930,8 @@ def run_tool(
                 "error": "page_not_useful_evidence",
                 "detail": "로그인·인증 화면이거나 여행 정보 본문이 없어 검증 근거로 사용할 수 없습니다.",
             }
-        _record_visit(db, url, page.get("title") or "", city_id=city_id)
+        if server_record_web_visit:
+            _record_visit(db, url, page.get("title") or "", city_id=city_id)
         return {
             "url": url,
             "title": page.get("title") or "",

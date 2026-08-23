@@ -980,8 +980,22 @@ def _resolve_shared_place_candidate(
         "coordinate_source": f"{result.source}_share",
         "coordinate_source_url": result.source_url,
         "coordinate_query": result.title,
+        # import_share_text is a server-side resolution of a link the user
+        # supplied directly; make its durable-use grant explicit before the
+        # attestation layer signs it.
+        "storage_allowed": True,
     }
-    candidate = issue_coordinate_attestation(candidate)
+    candidate = issue_coordinate_attestation(candidate, {
+        "title": result.title,
+        "display_name": result.title,
+        "address": result.address,
+        "lat": result.lat,
+        "lng": result.lng,
+        "source": f"{result.source}_share",
+        "source_url": result.source_url,
+        "confidence": 0.98,
+        "storage_allowed": True,
+    })
     return candidate, trace
 
 
@@ -1256,7 +1270,7 @@ def _extract_grounded_candidates(
                 continue
             points = result.get("results") or result.get("coordinate_candidates") or []
             point = next(
-                (hit for hit in points if isinstance(hit, dict) and hit.get("storage_allowed") is not False),
+                (hit for hit in points if isinstance(hit, dict) and hit.get("storage_allowed") is True),
                 None,
             )
             if point:
@@ -1284,7 +1298,7 @@ def _extract_grounded_candidates(
                         "source_url": str(point.get("source_url") or result.get("url") or ""),
                         "external_id": str(point.get("external_id") or ""),
                         "confidence": float(point.get("confidence") or 0.75),
-                        "storage_allowed": point.get("storage_allowed") is not False,
+                        "storage_allowed": point.get("storage_allowed") is True,
                     })
                     candidate.clear()
                     candidate.update(attested)
@@ -1886,7 +1900,7 @@ def answer_travel_chat(
         )
         grounded: list[dict[str, Any]] = []
         for coordinate in coordinate_rows:
-            if not isinstance(coordinate, dict) or coordinate.get("storage_allowed") is False:
+            if not isinstance(coordinate, dict) or coordinate.get("storage_allowed") is not True:
                 continue
             try:
                 point = (float(coordinate["lat"]), float(coordinate["lng"]))
@@ -2280,7 +2294,7 @@ def answer_travel_chat(
                         geo_hits = candidate_hits
                         break
                 for hit in geo_hits:
-                    if isinstance(hit, dict) and hit.get("storage_allowed") is not False:
+                    if isinstance(hit, dict) and hit.get("storage_allowed") is True:
                         try:
                             point = (float(hit["lat"]), float(hit["lng"]))
                         except (KeyError, TypeError, ValueError):
@@ -2868,7 +2882,7 @@ def answer_travel_chat(
             if name == "geocode_place" and isinstance(result, dict):
                 grounded_hits: list[dict[str, Any]] = []
                 for hit in result.get("results") or []:
-                    if not isinstance(hit, dict) or hit.get("storage_allowed") is False:
+                    if not isinstance(hit, dict) or hit.get("storage_allowed") is not True:
                         continue
                     try:
                         coordinate = (float(hit["lat"]), float(hit["lng"]))

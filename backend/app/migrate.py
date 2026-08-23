@@ -9,6 +9,19 @@ def ensure_schema() -> None:
     tables = set(insp.get_table_names())
 
     with engine.begin() as conn:
+        # This repository uses an idempotent bootstrap migration instead of
+        # Alembic. Normal API/agent startup calls Base.metadata.create_all
+        # before ensure_schema, while this explicit create also covers an
+        # existing deployment that runs ensure_schema directly.
+        if (
+            "agent_quality_gap_dispositions" not in tables
+            and {"cities", "markers"}.issubset(tables)
+        ):
+            from app.models import AgentQualityGapDisposition
+
+            AgentQualityGapDisposition.__table__.create(bind=conn, checkfirst=True)
+            tables.add("agent_quality_gap_dispositions")
+
         if "cities" in tables:
             city_cols = {c["name"] for c in insp.get_columns("cities")}
             if "search_context" not in city_cols:

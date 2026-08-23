@@ -602,6 +602,45 @@ class AgentTask(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AgentQualityGapDisposition(Base):
+    """Auditable terminal/cooldown state for one exact place quality gap.
+
+    A managed quality task is derived from live marker fields, so a gap that is
+    valid but currently impossible (for example no exact freely licensed image)
+    must be represented separately from the task row.  The condition fingerprint
+    lets the scheduler retry only when the place, zone catalogue, source set, or
+    an explicit cooldown condition has actually changed.
+    """
+
+    __tablename__ = "agent_quality_gap_dispositions"
+    __table_args__ = (
+        UniqueConstraint("place_id", "gap_kind", name="uq_agent_quality_gap_place_kind"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(
+        ForeignKey("cities.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    place_id: Mapped[int] = mapped_column(
+        ForeignKey("markers.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    gap_kind: Mapped[str] = mapped_column(String(30), index=True, nullable=False)
+    # blocked | source_exhausted | waived are active dispositions.  resolved
+    # and reopened retain the audit row without suppressing future work.
+    status: Mapped[str] = mapped_column(String(30), default="blocked", index=True, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    evidence_refs: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    condition_fingerprint: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    source_revision: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    retry_after: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
+    )
+
+
 class AgentMission(Base):
     """A durable objective that survives individual model calls and batch runs."""
 

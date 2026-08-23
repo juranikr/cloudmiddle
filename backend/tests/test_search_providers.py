@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from app.agent.tools import run_tool
 from app.config import settings
 from app.db import Base
-from app.models import AgentSearchLog, City
+from app.models import AgentSearchLog, AgentWebVisit, City
 from app.search_providers import search_brave_places
 
 
@@ -207,6 +207,7 @@ class BravePlaceToolIntegrationTests(unittest.TestCase):
                 "web_search",
                 {"query": "沈阳 不老林糖果", "max_results": 5},
                 city_id=1,
+                server_allow_brave_places=True,
             )
 
         self.assertNotIn("error", result)
@@ -214,6 +215,7 @@ class BravePlaceToolIntegrationTests(unittest.TestCase):
         self.assertEqual(result["results"], [])
         self.assertTrue(any("blocked" in item for item in result["backend_errors"]))
         self.assertEqual(self.db.query(AgentSearchLog).count(), 1)
+        self.assertEqual(self.db.query(AgentSearchLog).one().results_count, 0)
         kwargs = provider.call_args.kwargs
         self.assertEqual(kwargs["city_bounds"], (41.45, 122.85, 42.15, 123.85))
 
@@ -239,11 +241,80 @@ class BravePlaceToolIntegrationTests(unittest.TestCase):
                 "web_search",
                 {"query": "沈阳 不老林糖果", "max_results": 5},
                 city_id=1,
+                server_allow_brave_places=True,
             )
 
         self.assertTrue(result["results"])
         self.assertEqual(result["place_candidates"], [])
         self.assertEqual(result["provider_attempts"][0]["http_status"], 403)
+
+    def test_brave_places_are_disabled_without_server_discovery_opt_in(self):
+        text_results = [{
+            "title": "沈阳旅行",
+            "href": "https://example.test/shenyang",
+            "body": "沈阳 行程",
+        }]
+        with (
+            patch.dict(sys.modules, {"ddgs": self._ddgs_module(results=text_results)}),
+            patch.object(settings, "brave_search_api_key", "test-key"),
+            patch("app.agent.tools.search_brave_places") as provider,
+        ):
+            result = run_tool(
+                self.db,
+                "web_search",
+                {"query": "沈阳旅行", "max_results": 5},
+                city_id=1,
+            )
+
+        provider.assert_not_called()
+        self.assertEqual(result["place_candidates"], [])
+        self.assertEqual(result["provider_attempts"], [])
+
+    def test_transient_followup_query_is_not_logged_or_persisted(self):
+        secret = "BRAVE_ONLY_FOLLOWUP_SECRET"
+        marker = "[BRAVE_TRANSIENT_QUERY_DISCARDED]"
+        with (
+            patch.dict(sys.modules, {"ddgs": self._ddgs_module(error=f"blocked {secret}")}),
+            patch("app.agent.tools.logger.warning") as warning,
+        ):
+            run_tool(
+                self.db,
+                "web_search",
+                {"query": secret, "max_results": 5},
+                city_id=1,
+                server_storage_query=marker,
+            )
+
+        row = self.db.query(AgentSearchLog).one()
+        self.assertEqual(row.query, marker)
+        logged = " ".join(str(value) for value in warning.call_args.args)
+        self.assertNotIn(secret, logged)
+        self.assertIn("transient_search_failed", logged)
+
+    def test_transient_followup_fetch_does_not_record_web_visit(self):
+        tainted_url = "https://brave-only.example/temporary-place-id"
+        with (
+            patch("app.agent.tools._ctrip_food_coordinate_url", return_value=f"{tainted_url}/companion"),
+            patch("app.agent.tools._extract_page_text", side_effect=[{
+                "title": "독립 공개 페이지",
+                "text": "여행 장소의 주소와 방문 정보를 제공하는 충분한 공개 본문입니다. " * 8,
+                "coordinate_candidates": [],
+            }, RuntimeError(f"blocked while fetching {tainted_url}/companion")]),
+            patch("app.agent.tools.logger.info") as info,
+        ):
+            result = run_tool(
+                self.db,
+                "fetch_page",
+                {"url": tainted_url},
+                city_id=1,
+                server_record_web_visit=False,
+            )
+
+        self.assertNotIn("error", result)
+        self.assertEqual(self.db.query(AgentWebVisit).count(), 0)
+        logged = " ".join(str(value) for value in info.call_args.args)
+        self.assertNotIn(tainted_url, logged)
+        self.assertIn("RuntimeError", logged)
 
 
 if __name__ == "__main__":

@@ -117,7 +117,7 @@ def grounded_candidate_packets(
         page_title = str(result.get("title") or "").strip()
         excerpt = re.sub(r"\s+", " ", str(result.get("text") or "")).strip()[:5000]
         for coordinate in result.get("coordinate_candidates") or []:
-            if not isinstance(coordinate, Mapping) or coordinate.get("storage_allowed") is False:
+            if not isinstance(coordinate, Mapping) or coordinate.get("storage_allowed") is not True:
                 continue
             lat, lng = _float(coordinate.get("lat")), _float(coordinate.get("lng"))
             if lat is None or lng is None:

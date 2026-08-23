@@ -38,7 +38,10 @@ def _canonical_evidence(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         "source_url": str(evidence.get("source_url") or "")[:1000],
         "external_id": str(evidence.get("external_id") or "")[:300],
         "confidence": round(max(0.0, min(_float(evidence.get("confidence")) or 0.5, 1.0)), 4),
-        "storage_allowed": evidence.get("storage_allowed") is not False,
+        # Fail closed for evidence supplied by a provider.  A missing flag is
+        # not a storage grant; server-owned callers that intentionally attest a
+        # durable observation pass ``storage_allowed=True`` explicitly.
+        "storage_allowed": evidence.get("storage_allowed") is True,
     }
 
 
@@ -72,10 +75,13 @@ def issue_coordinate_attestation(
         "source_url": candidate.get("coordinate_source_url"),
         "external_id": candidate.get("coordinate_external_id"),
         "confidence": candidate.get("coordinate_confidence") or candidate.get("confidence"),
-        "storage_allowed": True,
+        # Even the convenience path fails closed. Callers that own durable
+        # evidence (for example a server-resolved user Amap share) must mark
+        # that provenance explicitly rather than gaining a grant by omission.
+        "storage_allowed": candidate.get("storage_allowed") is True,
     }
     canonical = _canonical_evidence(source)
-    if canonical is None or canonical["storage_allowed"] is False:
+    if canonical is None or canonical["storage_allowed"] is not True:
         output.pop("coordinate_attestation", None)
         return output
     signing_secret = secret if secret is not None else settings.jwt_secret
@@ -101,7 +107,7 @@ def trusted_coordinate_evidence(
     if not isinstance(raw_evidence, Mapping):
         return None
     canonical = _canonical_evidence(raw_evidence)
-    if canonical is None or canonical["storage_allowed"] is False:
+    if canonical is None or canonical["storage_allowed"] is not True:
         return None
     signing_secret = secret if secret is not None else settings.jwt_secret
     if not hmac.compare_digest(

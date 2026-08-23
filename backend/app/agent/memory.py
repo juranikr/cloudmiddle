@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import or_
@@ -24,10 +24,12 @@ from app.models import (
     AgentKnowledgeUse,
     AgentLesson,
     AgentMission,
+    AgentQualityGapDisposition,
     AgentRun,
     AgentTask,
     AgentWorkItem,
     Marker,
+    MarkerShape,
 )
 
 
@@ -55,6 +57,291 @@ POLICY_GUARD_DECIDE_ERRORS = frozenset({
     "material_decision_required",
     "structured_integrity_verdict_required",
 })
+QUALITY_GAP_KINDS = frozenset({"image", "zone", "verification", "description", "insights"})
+QUALITY_GAP_DISPOSITIONS = frozenset({"blocked", "source_exhausted", "waived"})
+TERMINAL_QUALITY_GAP_DISPOSITIONS = frozenset({"source_exhausted", "waived"})
+QUALITY_GAPS_BY_TASK_KIND = {
+    "quality_images": frozenset({"image"}),
+    "quality_zones": frozenset({"zone"}),
+    "quality_verification": frozenset({"verification"}),
+    "quality_information": frozenset({"description", "insights"}),
+    "quality_drafts": QUALITY_GAP_KINDS,
+}
+
+
+def _utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def quality_gaps_for_marker(marker: Marker) -> list[str]:
+    """Return the physical DB gaps understood by managed quality missions."""
+
+    shape = marker.shape.value if isinstance(marker.shape, MarkerShape) else str(marker.shape or "")
+    if shape != MarkerShape.point.value or marker.merged_into_id is not None:
+        return []
+    gaps: list[str] = []
+    if not marker.images:
+        gaps.append("image")
+    if marker.zone_id is None:
+        gaps.append("zone")
+    if marker.last_verified_at is None:
+        gaps.append("verification")
+    if len((marker.description or "").strip()) < 60:
+        gaps.append("description")
+    if len(marker.insights or []) < 2:
+        gaps.append("insights")
+    return gaps
+
+
+def _zone_catalogue_signature(db: Session, *, city_id: int) -> list[dict[str, Any]]:
+    zones = (
+        db.query(Marker)
+        .filter(
+            Marker.city_id == city_id,
+            Marker.shape == MarkerShape.polygon,
+            Marker.merged_into_id.is_(None),
+        )
+        .order_by(Marker.id.asc())
+        .all()
+    )
+    return [
+        {
+            "id": zone.id,
+            "title": zone.title,
+            "lat": round(float(zone.lat), 7),
+            "lng": round(float(zone.lng), 7),
+            "polygon": zone.polygon or "",
+        }
+        for zone in zones
+    ]
+
+
+def quality_gap_condition_fingerprint(
+    db: Session,
+    *,
+    marker: Marker,
+    gap_kind: str,
+    source_revision: str = "",
+) -> str:
+    """Hash only conditions whose change justifies retrying an exact gap.
+
+    ``source_revision`` is an opaque, non-secret provider/policy version such
+    as ``"wikimedia:v1|manual-upload:v1"``.  Callers bump it when a new source
+    becomes available; API keys themselves must never be stored here.
+    """
+
+    if gap_kind not in QUALITY_GAP_KINDS:
+        raise ValueError(f"unsupported quality gap: {gap_kind}")
+    common: dict[str, Any] = {
+        "city_id": marker.city_id,
+        "place_id": marker.id,
+        "title": marker.title,
+        "branch_name": marker.branch_name or "",
+        "lat": round(float(marker.lat), 7),
+        "lng": round(float(marker.lng), 7),
+        "merged_into_id": marker.merged_into_id,
+        "source_revision": str(source_revision or "")[:200],
+    }
+    if gap_kind == "image":
+        common.update({
+            "coordinate_query": marker.coordinate_query or "",
+            "coordinate_external_id": marker.coordinate_external_id or "",
+        })
+    elif gap_kind == "zone":
+        common["zones"] = _zone_catalogue_signature(db, city_id=marker.city_id)
+    elif gap_kind == "verification":
+        common.update({
+            "coordinate_source": marker.coordinate_source or "",
+            "coordinate_source_url": marker.coordinate_source_url or "",
+        })
+    elif gap_kind == "description":
+        common["description"] = marker.description or ""
+    elif gap_kind == "insights":
+        common["insights"] = [
+            {
+                "id": insight.id,
+                "kind": insight.kind,
+                "title": insight.title,
+                "content": insight.content,
+                "source_url": insight.source_url,
+            }
+            for insight in marker.insights
+        ]
+    return hashlib.sha256(_dump(common).encode("utf-8")).hexdigest()
+
+
+def record_quality_gap_disposition(
+    db: Session,
+    *,
+    marker: Marker,
+    gap_kind: str,
+    disposition: str,
+    reason: str,
+    evidence_refs: Iterable[str] = (),
+    source_revision: str = "",
+    cooldown_hours: float = 24,
+    now: Optional[datetime] = None,
+) -> AgentQualityGapDisposition:
+    """Close or cool one exact gap without pretending the marker field exists.
+
+    Terminal decisions require auditable evidence.  ``blocked`` is temporary;
+    ``source_exhausted`` and ``waived`` remain suppressed until a fingerprinted
+    condition changes or the physical gap is first resolved and later returns.
+    The caller owns the surrounding transaction.
+    """
+
+    if gap_kind not in QUALITY_GAP_KINDS:
+        raise ValueError(f"unsupported quality gap: {gap_kind}")
+    if disposition not in QUALITY_GAP_DISPOSITIONS:
+        raise ValueError(f"unsupported quality gap disposition: {disposition}")
+    normalized_reason = str(reason or "").strip()
+    if not normalized_reason:
+        raise ValueError("quality gap disposition requires a reason")
+    refs = list(dict.fromkeys(str(ref).strip() for ref in evidence_refs if str(ref).strip()))
+    if disposition in TERMINAL_QUALITY_GAP_DISPOSITIONS and not refs:
+        raise ValueError(f"{disposition} quality gap disposition requires evidence_refs")
+    if gap_kind not in quality_gaps_for_marker(marker):
+        raise ValueError(f"marker #{marker.id} no longer has the {gap_kind} quality gap")
+
+    timestamp = now or datetime.now(timezone.utc)
+    row = db.query(AgentQualityGapDisposition).filter(
+        AgentQualityGapDisposition.place_id == marker.id,
+        AgentQualityGapDisposition.gap_kind == gap_kind,
+    ).first()
+    if row is None:
+        row = AgentQualityGapDisposition(
+            city_id=marker.city_id,
+            place_id=marker.id,
+            gap_kind=gap_kind,
+            condition_fingerprint="",
+        )
+        db.add(row)
+    else:
+        row.attempt_count = int(row.attempt_count or 0) + 1
+    row.city_id = marker.city_id
+    row.status = disposition
+    row.reason = normalized_reason[:4000]
+    row.evidence_refs = _dump(refs[:30])
+    row.source_revision = str(source_revision or "")[:200]
+    row.condition_fingerprint = quality_gap_condition_fingerprint(
+        db,
+        marker=marker,
+        gap_kind=gap_kind,
+        source_revision=row.source_revision,
+    )
+    row.retry_after = (
+        timestamp + timedelta(hours=max(0.25, float(cooldown_hours)))
+        if disposition == "blocked"
+        else None
+    )
+    row.resolved_at = None
+    row.updated_at = timestamp
+    db.flush()
+    return row
+
+
+def evaluate_quality_gap_disposition(
+    db: Session,
+    *,
+    marker: Marker,
+    gap_kind: str,
+    source_revision: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Return whether an exact gap is executable, reopening only on a trigger."""
+
+    if gap_kind not in QUALITY_GAP_KINDS:
+        raise ValueError(f"unsupported quality gap: {gap_kind}")
+    timestamp = now or datetime.now(timezone.utc)
+    row = db.query(AgentQualityGapDisposition).filter(
+        AgentQualityGapDisposition.place_id == marker.id,
+        AgentQualityGapDisposition.gap_kind == gap_kind,
+    ).first()
+    if row is None or row.status in {"resolved", "reopened"}:
+        return {"actionable": True, "trigger": "untracked" if row is None else row.status, "row": row}
+
+    effective_revision = row.source_revision if source_revision is None else str(source_revision or "")
+    current_fingerprint = quality_gap_condition_fingerprint(
+        db,
+        marker=marker,
+        gap_kind=gap_kind,
+        source_revision=effective_revision,
+    )
+    trigger = ""
+    if current_fingerprint != row.condition_fingerprint:
+        trigger = "condition_changed"
+    elif row.status == "blocked" and row.retry_after is not None and _utc(timestamp) >= _utc(row.retry_after):
+        trigger = "cooldown_elapsed"
+    if trigger:
+        row.status = "reopened"
+        row.resolved_at = timestamp
+        row.updated_at = timestamp
+        db.flush()
+        return {"actionable": True, "trigger": trigger, "row": row}
+    return {
+        "actionable": False,
+        "trigger": row.status,
+        "retry_after": row.retry_after,
+        "reason": row.reason,
+        "row": row,
+    }
+
+
+def filter_actionable_quality_gaps(
+    db: Session,
+    *,
+    markers: Iterable[Marker],
+    gaps_by_id: dict[int, list[str]],
+    source_revisions: Optional[dict[str, str]] = None,
+    now: Optional[datetime] = None,
+) -> dict[int, list[str]]:
+    """Remove terminal/cooling gaps before managed quality tasks are built.
+
+    Physical resolution retires the disposition.  If the same physical gap is
+    introduced later (for example an image is deleted), it is actionable again.
+    """
+
+    timestamp = now or datetime.now(timezone.utc)
+    marker_rows = list(markers)
+    marker_by_id = {marker.id: marker for marker in marker_rows}
+    if not marker_by_id:
+        return {}
+    dispositions = db.query(AgentQualityGapDisposition).filter(
+        AgentQualityGapDisposition.place_id.in_(marker_by_id),
+    ).all()
+    current_gap_sets = {
+        marker_id: set(gaps_by_id.get(marker_id, []))
+        for marker_id in marker_by_id
+    }
+    for row in dispositions:
+        if row.gap_kind not in current_gap_sets.get(row.place_id, set()) and row.status != "resolved":
+            row.status = "resolved"
+            row.resolved_at = timestamp
+            row.updated_at = timestamp
+
+    revisions = source_revisions or {}
+    actionable: dict[int, list[str]] = {}
+    for marker_id, gaps in gaps_by_id.items():
+        marker = marker_by_id.get(marker_id)
+        if marker is None:
+            continue
+        kept: list[str] = []
+        for gap_kind in gaps:
+            if gap_kind not in QUALITY_GAP_KINDS:
+                kept.append(gap_kind)
+                continue
+            evaluation = evaluate_quality_gap_disposition(
+                db,
+                marker=marker,
+                gap_kind=gap_kind,
+                source_revision=revisions.get(gap_kind) if gap_kind in revisions else None,
+                now=timestamp,
+            )
+            if evaluation["actionable"]:
+                kept.append(gap_kind)
+        actionable[marker_id] = kept
+    db.flush()
+    return actionable
 
 
 def _json_value(raw: str, fallback: Any) -> Any:
@@ -1106,7 +1393,8 @@ def reconcile_work_items(db: Session, *, mission: Optional[AgentMission]) -> Opt
         if task is not None:
             task.status = "completed"
             task.completed_at = now
-            task.result = "모든 세부 대상의 운영 DB 성공조건을 재측정해 완료했습니다."
+            if mission.kind != "candidate_discovery" or not (task.result or "").strip():
+                task.result = "모든 세부 대상의 운영 DB 성공조건을 재측정해 완료했습니다."
     if mission.status not in {"paused", "completed"}:
         mission.progress = _dump({
             "active_work_item_id": active.id if active else None,
@@ -1129,6 +1417,11 @@ def rotate_blocked_work_item(
     reason: str,
     activate_next: bool = True,
     commit: bool = True,
+    quality_disposition: Optional[str] = None,
+    quality_gap_kinds: Optional[Iterable[str]] = None,
+    quality_evidence_refs: Iterable[str] = (),
+    quality_source_revision: str = "",
+    quality_cooldown_hours: float = 24,
 ) -> Optional[AgentWorkItem]:
     """Block the current cursor and optionally activate its ready successor.
 
@@ -1139,9 +1432,40 @@ def rotate_blocked_work_item(
 
     if mission is None or current is None:
         return current
+    disposition_rows: list[AgentQualityGapDisposition] = []
+    if quality_disposition is not None:
+        marker = db.get(Marker, current.place_id) if current.place_id is not None else None
+        if marker is None:
+            raise ValueError("quality disposition requires an exact place work item")
+        requested_gaps = list(dict.fromkeys(str(item) for item in (quality_gap_kinds or ())))
+        if not requested_gaps:
+            raise ValueError("quality disposition requires exact quality_gap_kinds")
+        allowed_gaps = QUALITY_GAPS_BY_TASK_KIND.get(mission.kind, frozenset())
+        invalid_gaps = [gap for gap in requested_gaps if gap not in allowed_gaps]
+        if invalid_gaps:
+            raise ValueError(
+                f"{mission.kind} cannot dispose quality gaps: {', '.join(invalid_gaps)}"
+            )
+        for gap_kind in requested_gaps:
+            disposition_rows.append(record_quality_gap_disposition(
+                db,
+                marker=marker,
+                gap_kind=gap_kind,
+                disposition=quality_disposition,
+                reason=reason,
+                evidence_refs=quality_evidence_refs,
+                source_revision=quality_source_revision,
+                cooldown_hours=quality_cooldown_hours,
+            ))
     current.status = "blocked"
     current.blocked_reason = reason[:3000]
-    current.retry_condition = "새 출처·인증 가능한 접근·사용자 근거 중 하나가 생길 때 재개"
+    current.retry_condition = (
+        "기록된 장소·구역·공급자 조건 지문이 바뀔 때만 재개"
+        if quality_disposition in TERMINAL_QUALITY_GAP_DISPOSITIONS
+        else "기록된 냉각 시간이 지나거나 장소·구역·공급자 조건 지문이 바뀔 때 재개"
+        if quality_disposition == "blocked"
+        else "새 출처·인증 가능한 접근·사용자 근거 중 하나가 생길 때 재개"
+    )
     current.updated_at = datetime.now(timezone.utc)
     next_item = db.query(AgentWorkItem).filter(
         AgentWorkItem.mission_id == mission.id,
@@ -1170,6 +1494,19 @@ def rotate_blocked_work_item(
             ).count(),
             "retry_condition": "새 출처 또는 12시간 냉각 후 재평가",
         })
+        mission.progress = _dump(progress)
+    if disposition_rows:
+        progress = _json_dict(mission.progress)
+        progress["quality_dispositions"] = [
+            {
+                "id": row.id,
+                "place_id": row.place_id,
+                "gap_kind": row.gap_kind,
+                "status": row.status,
+                "retry_after": row.retry_after,
+            }
+            for row in disposition_rows
+        ]
         mission.progress = _dump(progress)
     run = db.get(AgentRun, run_id)
     if run is not None:
@@ -1201,20 +1538,44 @@ def finalize_mission(
     mission: Optional[AgentMission],
     task: Optional[AgentTask],
     run_id: int,
+    commit: bool = True,
 ) -> None:
     if mission is None:
         return
     mission.last_run_id = run_id
-    if task is not None and task.status == "completed":
-        mission.status = "completed"
-        mission.completed_at = datetime.now(timezone.utc)
-        for item in db.query(AgentWorkItem).filter(
+    if task is not None and task.status in {"completed", "blocked"}:
+        now = datetime.now(timezone.utc)
+        terminal_items = db.query(AgentWorkItem).filter(
             AgentWorkItem.mission_id == mission.id,
             AgentWorkItem.status.in_(("ready", "active", "blocked")),
-        ).all():
-            item.status = "done"
-            item.completed_at = datetime.now(timezone.utc)
-    db.commit()
+        ).all()
+        if task.status == "completed":
+            mission.status = "completed"
+            mission.completed_at = now
+            for item in terminal_items:
+                item.status = "done"
+                item.completed_at = now
+        else:
+            # A blocked discovery slice is a durable pause, not an abandoned
+            # active cursor. The periodic discovery scheduler reopens the same
+            # task and ``ensure_mission_for_task`` resumes this exact item with
+            # its checkpoint/evidence history intact.
+            mission.status = "paused"
+            mission.completed_at = None
+            mission.updated_at = now
+            for item in terminal_items:
+                item.status = "blocked"
+                item.blocked_reason = (task.result or "과제가 차단 상태로 종료됨")[:3000]
+                item.retry_condition = "다음 예약된 discovery slice에서 새 출처 조건으로 재평가"
+                item.updated_at = now
+            mission.progress = _dump({
+                "active_work_item_id": None,
+                "resume_work_item_id": terminal_items[0].id if terminal_items else None,
+                "terminal_task_status": "blocked",
+                "retry_condition": "다음 예약된 discovery slice에서 같은 체크포인트로 재개",
+            })
+    if commit:
+        db.commit()
 
 
 def learn_from_recent_runs(db: Session, *, city_id: int, limit: int = 12) -> int:

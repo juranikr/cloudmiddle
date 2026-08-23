@@ -134,6 +134,16 @@ resource "aws_ecs_task_definition" "api" {
         {
           name  = "S3_PUBLIC_BASE_URL"
           value = "https://${aws_cloudfront_distribution.images.domain_name}"
+        },
+        {
+          name  = "BRAVE_PLACE_ENABLED"
+          value = "true"
+        },
+        {
+          # Standard Search subscriptions are discovery-only. Keep Brave
+          # response fields transient until a storage-rights contract exists.
+          name  = "BRAVE_SEARCH_STORAGE_RIGHTS"
+          value = "false"
         }
       ]
       secrets = [
@@ -168,6 +178,10 @@ resource "aws_ecs_task_definition" "api" {
         {
           name      = "ARCGIS_API_KEY"
           valueFrom = "${aws_secretsmanager_secret.app.arn}:ARCGIS_API_KEY::"
+        },
+        {
+          name      = "BRAVE_SEARCH_API_KEY"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:BRAVE_SEARCH_API_KEY::"
         }
       ]
       logConfiguration = {

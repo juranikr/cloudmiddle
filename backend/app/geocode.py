@@ -27,6 +27,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
+from app.search_providers import SearchProviderProfile, build_search_provider_profile
+
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 ARCGIS_URL = (
     "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/"
@@ -117,25 +119,45 @@ def _cached(key: str, loader: Callable[[], Any]) -> Any:
 
 def _normalize(value: str) -> str:
     value = unicodedata.normalize("NFKC", value or "").casefold()
-    return re.sub(r"[^0-9a-z\u3400-\u9fff\uac00-\ud7a3]+", "", value)
+    # ``str.isalnum`` keeps Japanese kana, Thai, Arabic, Cyrillic and other
+    # destination scripts. The previous allow-list silently erased all of them.
+    return "".join(character for character in value if character.isalnum())
 
 
-def _meaningful_entity_match(query: str, display_name: str, city_name: str = "") -> bool:
+def _meaningful_entity_match(
+    query: str,
+    display_name: str,
+    city_name: str = "",
+    *,
+    city_aliases: Iterable[str] = (),
+    country_code: str = "CN",
+) -> bool:
     """Reject city-centre/provider fallbacks that do not name the requested entity or address."""
-    generic = {
-        _normalize(item) for item in (
-            city_name, f"{city_name}市", "沈阳", "沈阳市", "济南", "济南市",
-            "辽宁省", "山东省", "中国", "地址", "位置", "地图",
-            "추천", "장소", "검색", "어디",
-        ) if item
-    }
+    generic_values = [
+        city_name,
+        f"{city_name}市" if city_name else "",
+        *city_aliases,
+        "地址",
+        "位置",
+        "地图",
+        "추천",
+        "장소",
+        "검색",
+        "어디",
+        "address",
+        "location",
+        "map",
+    ]
+    if str(country_code or "").upper() == "CN":
+        generic_values.extend(("辽宁省", "山东省", "中国", "China"))
+    generic = {_normalize(item) for item in generic_values if item}
 
     def fragments(value: str) -> list[str]:
         raw = re.split(r"[\s,，、;；:：!！?？()（）\[\]【】·|/\\]+", value or "")
         out: list[str] = []
         for part in raw:
             normalized = _normalize(part)
-            for token in generic:
+            for token in sorted(generic, key=len, reverse=True):
                 normalized = normalized.replace(token, "")
             if len(normalized) >= 2:
                 out.append(normalized)
@@ -227,9 +249,10 @@ def _search_nominatim(
     limit: int,
     bounds: Optional[Bounds],
     city_name: str,
+    profile: SearchProviderProfile,
 ) -> list[dict[str, Any]]:
     search_query = f"{query}, {city_name}" if city_name and city_name not in query else query
-    cache_key = f"nominatim:{search_query}:{bounds}:{limit}"
+    cache_key = f"nominatim:{profile.country_code}:{search_query}:{bounds}:{limit}"
 
     def load() -> list[dict[str, Any]]:
         global _nominatim_last_request
@@ -245,8 +268,8 @@ def _search_nominatim(
                 "namedetails": 1,
                 "limit": max(1, min(limit, 10)),
                 "bounded": 1 if bounds else 0,
-                "accept-language": "ko,zh-CN,en",
-                "countrycodes": "cn",
+                "accept-language": ",".join(profile.language_tags),
+                "countrycodes": profile.country_code.casefold(),
             }
             if bounds:
                 values["viewbox"] = f"{bounds.west},{bounds.north},{bounds.east},{bounds.south}"
@@ -265,7 +288,13 @@ def _search_nominatim(
             if bounds and not bounds.contains(lat, lng):
                 continue
             display_name = str(item.get("display_name") or query)
-            if not _meaningful_entity_match(query, display_name, city_name):
+            if not _meaningful_entity_match(
+                query,
+                display_name,
+                city_name,
+                city_aliases=profile.city_aliases,
+                country_code=profile.country_code,
+            ):
                 continue
             importance = max(0.0, min(float(item.get("importance") or 0.35), 1.0))
             exact_bonus = 0.07 if query_norm and query_norm in _normalize(display_name) else 0.0
@@ -328,14 +357,15 @@ def _search_arcgis(
     city_name: str,
     city_context: str,
     api_key: str,
+    profile: SearchProviderProfile,
 ) -> list[dict[str, Any]]:
     can_store = bool(api_key)
     search_parts = [query]
-    context = city_context or " ".join(part for part in (city_name, "中国") if part)
+    context = city_context or city_name
     if context:
         search_parts.append(context)
     search_query = " ".join(search_parts)
-    cache_key = f"arcgis:{search_query}:{bounds}:{limit}:{can_store}"
+    cache_key = f"arcgis:{profile.country_code}:{search_query}:{bounds}:{limit}:{can_store}"
 
     def load() -> list[dict[str, Any]]:
         values: dict[str, Any] = {
@@ -343,9 +373,10 @@ def _search_arcgis(
             "f": "json",
             "outFields": "Match_addr,Addr_type,PlaceName,MatchID",
             "maxLocations": max(1, min(limit, 10)),
-            "sourceCountry": "CHN",
             "forStorage": "true" if can_store else "false",
         }
+        if profile.arcgis_country_code:
+            values["sourceCountry"] = profile.arcgis_country_code
         if bounds:
             values["searchExtent"] = bounds.arcgis_extent
         if api_key:
@@ -364,16 +395,20 @@ def _search_arcgis(
             attrs = item.get("attributes") or {}
             match_type = str(attrs.get("Addr_type") or "")
             display_name = str(item.get("address") or attrs.get("Match_addr") or query)
-            query_norm = _normalize(query)
-            display_norm = _normalize(display_name)
             query_core = _place_query_core(query)
             # ArcGIS가 POI를 못 찾았을 때 도시 자체를 높은 점수 후보로 돌려주는 오탐을 제거한다.
-            meaningfully_matched = query_norm in display_norm or (
-                len(query_core) >= 2 and query_core in display_norm
+            meaningfully_matched = _meaningful_entity_match(
+                query,
+                display_name,
+                city_name,
+                city_aliases=profile.city_aliases,
+                country_code=profile.country_code,
             )
             if not meaningfully_matched:
                 continue
-            if match_type == "Locality" and query_core == _normalize(city_name):
+            if match_type == "Locality" and query_core in {
+                _normalize(alias) for alias in profile.city_aliases
+            }:
                 continue
             confidence = max(0.0, min(raw_score / 100 * _arcgis_type_weight(match_type), 1.0))
             results.append(
@@ -397,12 +432,21 @@ def _search_arcgis(
     return _cached(cache_key, load)
 
 
-def _query_languages(query: str) -> list[str]:
+def _query_languages(query: str, profile: SearchProviderProfile) -> list[str]:
+    preferred: list[str]
     if re.search(r"[\uac00-\ud7a3]", query):
-        return ["ko", "zh", "en"]
-    if re.search(r"[\u3400-\u9fff]", query):
-        return ["zh", "ko", "en"]
-    return ["en", "zh", "ko"]
+        preferred = ["ko"]
+    elif re.search(r"[\u3040-\u30ff]", query):
+        preferred = ["ja"]
+    elif re.search(r"[\u0e00-\u0e7f]", query):
+        preferred = ["th"]
+    elif re.search(r"[\u0400-\u04ff]", query):
+        preferred = ["ru"]
+    elif re.search(r"[\u3400-\u9fff]", query):
+        preferred = ["zh"]
+    else:
+        preferred = ["en"]
+    return list(dict.fromkeys([*preferred, *profile.wikidata_languages, "en"]))
 
 
 def _entity_label(entity: dict[str, Any], languages: list[str], fallback: str) -> str:
@@ -437,9 +481,10 @@ def _search_wikidata(
     *,
     limit: int,
     bounds: Optional[Bounds],
+    profile: SearchProviderProfile,
 ) -> list[dict[str, Any]]:
-    languages = _query_languages(query)
-    cache_key = f"wikidata:{query}:{bounds}:{limit}"
+    languages = _query_languages(query, profile)
+    cache_key = f"wikidata:{profile.country_code}:{query}:{bounds}:{limit}"
 
     def load() -> list[dict[str, Any]]:
         ranked_ids: list[str] = []
@@ -492,7 +537,12 @@ def _search_wikidata(
                 continue
             label = _entity_label(entity, languages, matched_names.get(entity_id, query))
             description = _entity_description(entity, languages)
-            if not _meaningful_entity_match(query, f"{label} {description}"):
+            if not _meaningful_entity_match(
+                query,
+                f"{label} {description}",
+                city_aliases=profile.city_aliases,
+                country_code=profile.country_code,
+            ):
                 continue
             exact_bonus = 0.08 if _normalize(label) == query_norm else 0.0
             rank_score = max(0.0, 0.86 - rank * 0.025 + exact_bonus)
@@ -591,6 +641,9 @@ def search_address(
     viewbox: str = "",
     city_name: str = "",
     city_context: str = "",
+    city_slug: str = "",
+    city_name_ko: str = "",
+    country_code: str = "CN",
     local_candidates: Optional[Iterable[dict[str, Any]]] = None,
     include_display_only: bool = False,
     arcgis_api_key: Optional[str] = None,
@@ -607,16 +660,28 @@ def search_address(
     limit = max(1, min(limit, 20))
     bounds = parse_viewbox(viewbox)
     api_key = (arcgis_api_key if arcgis_api_key is not None else os.environ.get("ARCGIS_API_KEY", "")).strip()
+    profile = build_search_provider_profile(
+        country_code=country_code,
+        city_slug=city_slug,
+        city_name=city_name,
+        city_name_ko=city_name_ko,
+    )
 
     all_hits = _local_hits(q, local_candidates or [], limit)
     providers: list[tuple[str, Callable[[], list[dict[str, Any]]]]] = [
         (
             "nominatim",
-            lambda: _search_nominatim(q, limit=limit, bounds=bounds, city_name=city_name),
+            lambda: _search_nominatim(
+                q,
+                limit=limit,
+                bounds=bounds,
+                city_name=city_name,
+                profile=profile,
+            ),
         ),
         (
             "wikidata",
-            lambda: _search_wikidata(q, limit=limit, bounds=bounds),
+            lambda: _search_wikidata(q, limit=limit, bounds=bounds, profile=profile),
         ),
     ]
     if api_key or include_display_only:
@@ -630,6 +695,7 @@ def search_address(
                     city_name=city_name,
                     city_context=city_context,
                     api_key=api_key,
+                    profile=profile,
                 ),
             )
         )
@@ -645,13 +711,20 @@ def search_address(
             except Exception as exc:  # 공급자 하나의 장애가 전체 검색을 깨지 않게 한다.
                 logger.warning("Unexpected geocode provider %s failure: %s", provider, exc)
 
-    # Chinese POI searches often arrive as "city + brand + branch + street number".
-    # Open data providers may index only the short storefront name, so retry a small,
+    # POI searches often arrive as "city + brand + branch + street number" while
+    # open-data providers index only the storefront name. Retry a small,
     # deterministic set of progressively simpler variants before giving up.
     if not any(hit.get("storage_allowed") for hit in all_hits):
-        without_city = q.replace(city_name, " ").strip() if city_name else q
+        without_city = q
+        for alias in sorted(profile.city_aliases, key=len, reverse=True):
+            without_city = re.sub(re.escape(alias), " ", without_city, flags=re.IGNORECASE)
+        without_city = re.sub(r"\s+", " ", without_city).strip()
         first_chunk = re.split(r"\s+", without_city, maxsplit=1)[0].strip()
-        stripped_suffix = re.sub(r"(?:旗舰)?(?:分)?(?:店|馆|門店|门店)$", "", first_chunk).strip()
+        stripped_suffix = (
+            re.sub(r"(?:旗舰)?(?:分)?(?:店|馆|門店|门店)$", "", first_chunk).strip()
+            if profile.country_code == "CN"
+            else first_chunk
+        )
         variants: list[str] = []
         for variant in (without_city, first_chunk, stripped_suffix):
             if len(_normalize(variant)) >= 2 and variant != q and variant not in variants:
@@ -660,10 +733,17 @@ def search_address(
             fallback_hits: list[dict[str, Any]] = []
             fallback_providers: list[tuple[str, Callable[[], list[dict[str, Any]]]]] = [
                 ("nominatim", lambda variant=variant: _search_nominatim(
-                    variant, limit=limit, bounds=bounds, city_name=city_name
+                    variant,
+                    limit=limit,
+                    bounds=bounds,
+                    city_name=city_name,
+                    profile=profile,
                 )),
                 ("wikidata", lambda variant=variant: _search_wikidata(
-                    variant, limit=limit, bounds=bounds
+                    variant,
+                    limit=limit,
+                    bounds=bounds,
+                    profile=profile,
                 )),
             ]
             if api_key or include_display_only:
@@ -674,6 +754,7 @@ def search_address(
                     city_name=city_name,
                     city_context=city_context,
                     api_key=api_key,
+                    profile=profile,
                 )))
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(fallback_providers)) as executor:
                 futures = {executor.submit(loader): name for name, loader in fallback_providers}

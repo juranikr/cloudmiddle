@@ -52,6 +52,9 @@ export interface AdminStatus {
   admin_email: string;
   groq_configured: boolean;
   groq_model: string;
+  brave_place_configured?: boolean;
+  brave_storage_rights?: boolean;
+  quality_gaps_suppressed?: number;
   markers_active: number;
   zones_active?: number;
   events_total: number;

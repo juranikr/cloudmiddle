@@ -20,6 +20,7 @@ class CoordinateAttestationTests(unittest.TestCase):
             "coordinate_external_id": "poi-1",
             "confidence": 0.88,
             "status": "located",
+            "storage_allowed": True,
         }
 
     def test_signed_coordinate_survives_a_later_turn(self):
@@ -51,6 +52,30 @@ class CoordinateAttestationTests(unittest.TestCase):
         self.assertNotIn("lng", result)
         self.assertNotIn("coordinate_source", result)
         self.assertEqual(result["status"], "location_needed")
+
+    def test_provider_evidence_without_explicit_storage_grant_is_not_signed(self):
+        signed = issue_coordinate_attestation(
+            self.candidate,
+            {
+                "display_name": self.candidate["title"],
+                "lat": self.candidate["lat"],
+                "lng": self.candidate["lng"],
+                "source": "transient_provider",
+                "source_url": "https://provider.example/place",
+                # storage_allowed is intentionally absent.
+            },
+            secret="test-secret",
+        )
+
+        self.assertNotIn("coordinate_attestation", signed)
+
+    def test_convenience_path_without_explicit_storage_grant_is_not_signed(self):
+        unsigned = dict(self.candidate)
+        unsigned.pop("storage_allowed")
+
+        result = issue_coordinate_attestation(unsigned, secret="test-secret")
+
+        self.assertNotIn("coordinate_attestation", result)
 
 
 if __name__ == "__main__":

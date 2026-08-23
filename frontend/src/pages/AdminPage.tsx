@@ -51,6 +51,23 @@ function runMaterialChanges(run: AdminAgentRunHistory): Record<string, unknown>[
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object") : [];
 }
 
+function runDiscoveryFunnel(run: AdminAgentRunHistory): Array<[string, number]> {
+  const funnel = asRecord(run.metrics.discovery_funnel);
+  const labels: Array<[string, string]> = [
+    ["search_calls", "검색"],
+    ["place_discovery_calls", "장소 발견 호출"],
+    ["raw_hits", "원시 결과"],
+    ["exposed_hits", "필터 통과"],
+    ["validated_pages", "본문 검증"],
+    ["geocode_candidates", "좌표 후보"],
+    ["proposal_attempts", "제안 시도"],
+    ["proposals_created", "제안 생성"],
+  ];
+  return labels
+    .map(([key, label]) => [label, Number(funnel[key] ?? 0)] as [string, number])
+    .filter(([, value]) => Number.isFinite(value));
+}
+
 function stepDescription(step: AdminAgentRunStep): string {
   const args = asRecord(step.detail.args);
   const result = asRecord(step.detail.result);
@@ -329,6 +346,10 @@ export default function AdminPage() {
             <li>
               Groq: {status.groq_configured ? "설정됨" : "미설정"} ({status.groq_model})
             </li>
+            <li>
+              Brave Place: {status.brave_place_configured ? "발견용 연결됨" : "미설정"}
+              {status.brave_storage_rights ? " · 저장 권한 있음" : " · 발견 전용 · 응답 데이터 비보존"}
+            </li>
             <li>활성 장소: {status.markers_active}</li>
             <li>관광 구역: {status.zones_active ?? 0}</li>
             <li>
@@ -339,6 +360,7 @@ export default function AdminPage() {
             <li>지식 주제: {status.knowledge_topics ?? 0}</li>
             <li>에이전트 추천 장소: {status.agent_suggested_places ?? 0}</li>
             <li>승인 대기 제안: {status.proposals_pending ?? 0}</li>
+            <li>조건 변경까지 보류한 품질 결손: {status.quality_gaps_suppressed ?? 0}</li>
           </ul>
         ) : (
           <p className="panel__meta">불러오는 중…</p>
@@ -383,7 +405,7 @@ export default function AdminPage() {
         </div>
         <p className="panel__meta">
           매일 03:00·11:00·19:00(KST)에 성과 기반 자동 실행됩니다. API 키는 AWS Secrets Manager
-          (`tourmiddle-dev/app`의 GROQ_*)에서 관리합니다.
+          (`tourmiddle-dev/app`의 GROQ_*·BRAVE_*)에서 관리합니다.
         </p>
       </section> : null}
 
@@ -440,6 +462,7 @@ export default function AdminPage() {
               const metrics = asRecord(run.metrics);
               const delta = runDelta(run);
               const material = runMaterialChanges(run);
+              const discoveryFunnel = runDiscoveryFunnel(run);
               const steps = runSteps[run.id];
               const duration = Number(metrics.duration_seconds ?? 0);
               return (
@@ -456,6 +479,11 @@ export default function AdminPage() {
                       <span key={key}>{METRIC_LABEL[key] ?? key} {value > 0 ? "+" : ""}{value}</span>
                     )) : <span className="is-empty">측정된 DB 변화 없음</span>}
                   </div>
+                  {discoveryFunnel.some(([, value]) => value > 0) ? (
+                    <div className="admin__run-delta" aria-label="신규 장소 발굴 퍼널">
+                      {discoveryFunnel.map(([label, value]) => <span key={label}>{label} {value}</span>)}
+                    </div>
+                  ) : null}
                   {material.length ? (
                     <ul className="admin__run-material">
                       {material.slice(0, 8).map((item, index) => (

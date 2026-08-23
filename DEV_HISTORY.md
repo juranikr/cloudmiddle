@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-14 (KST) — 운영 복제 기반 로컬 통합 환경·에이전트 큐/감사 연속성
+최종 갱신: 2026-08-23 (KST) — 도시별 다중 검색·신규 장소 발굴 연속성·품질 결손 종료 상태
 
 ---
 
@@ -31,7 +31,7 @@
 | RDS | `tourmiddle-dev-postgres…` (Postgres 16, `db.t4g.micro`, **publicly accessible**, SG `0.0.0.0/0:5432` — 강한 비밀번호 의존) |
 | GitHub OIDC role | `arn:aws:iam::155557574983:role/tourmiddle-dev-github-actions` |
 | TF state | S3 `tourmiddle-tfstate-155557574983` + DynamoDB `tourmiddle-tf-lock` |
-| App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`, `GROQ_API_KEY`, `GROQ_MODEL`, `ARCGIS_API_KEY`) |
+| App secret | Secrets Manager `tourmiddle-dev/app` (`DATABASE_URL`, `JWT_SECRET`, `SEED_PASSWORD_*`, `GROQ_API_KEY`, `GROQ_MODEL`, `ARCGIS_API_KEY`, `BRAVE_SEARCH_API_KEY`) |
 | 이미지 S3 | `tourmiddle-dev-place-images-155557574983` |
 | 이미지 CDN | https://d3qw5zq6yb15c.cloudfront.net |
 | 에이전트 스케줄 | EventBridge `cron(0 2,10,18 * * ? *)` = 매일 11:00/19:00/03:00 KST → ECS task `tourmiddle-dev-agent` |
@@ -75,6 +75,9 @@
   - `list_recent_rollbacks`: 롤백 교훈을 읽고 **같은 방향 수정 반복 금지**
   - 실행별 실제 DB 변화·새 근거·반복 호출·성과 점수·남은 공백을 `agent_runs`/`agent_run_steps`에 기록하고 관리자 UI에서 단계별 확인
   - 동일 조사 호출 차단, 새 근거 없는 행동 감지, 측정 가능한 후속 과제와 자동 공백 해소로 고정 스텝 대신 성과 기반 종료
+  - 신규 장소 발굴은 별도 `candidate_discovery` 미션으로 주기적 시간을 보장하고, 실제 검색·본문/좌표 검증 뒤 `agent_proposals`를 만든 경우에만 완료
+  - 사진·구역처럼 현재 해결 불가능한 결손은 `agent_quality_gap_dispositions`에 근거·조건 지문·냉각 시간을 남겨 같은 실패를 매 배치 반복하지 않고 조건이 바뀌면 자동 재개
+  - Brave Place는 배치의 일시적 발견 단서로만 사용하며 응답 원문·ID·건수·후속 질의·모델 자유서술을 DB/실행 이력/로그에 보존하지 않음. 일반 대화에는 Brave를 노출하지 않고 독립 출처로 재검증된 canonical 값만 제안 가능
 - **메시지함** UI (상단) + 장소 상세/메시지에서 이의신청
 - **관리자** `/admin` (성주한 `joohan92@naver.com`만, `ADMIN_EMAILS`): 에이전트 수동 실행, 실행별 DB 증감·실제 변경·전체 도구 과정, **에이전트 변경 이력·롤백**, 사용자 CRUD, 미읽음/Groq 상태. API 키는 Secrets Manager
 - 기존 마커에 `place_events`가 없으면 기동 시 **create 미읽음 백필**
@@ -163,6 +166,15 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 7) 히스토리 타임라인
+
+### 2026-08-23 — 다중 검색 발견 레인 + 연속성 있는 품질 종료
+- Brave Search Place Search를 기존 Yahoo/Yandex 웹 검색·ArcGIS/Nominatim/Wikidata 위치 검색 앞단의 **발견 단서**로 추가하고, 국가·도시별 언어/별칭/공식 도메인 프로필로 중국 외 도시도 같은 구조를 사용하도록 일반화
+- 표준 Search 플랜의 비보존 조건에 맞춰 Brave 후보는 실행 메모리에서만 사용: chat 경로 차단, ephemeral ID·원문·파생 count/hash·후속 query·오류 자유서술을 Step/checkpoint/task/summary/SearchLog/CloudWatch에 저장하지 않음
+- 저장 가능한 비-Brave 지오코더 또는 직접 읽은 공개 본문으로 같은 장소를 독립 확인한 필드만 canonical 제안으로 승격하고, 좌표 저장 허용 플래그 누락은 fail-closed 처리
+- 신규 장소 발굴을 품질 보강과 분리한 가중 레인으로 추가. 차단 시 같은 task/mission/work item/checkpoint를 이어 받고, 검색 없이 차단 선언하거나 모델이 완료를 자칭하는 경로는 서버가 거절
+- 사진 검색 3회는 `정상 무후보 / 공급자 오류 / 후보 있음`으로 구분하고, 정상 무후보 3회만 `source_exhausted`; 오류는 냉각 `blocked`. 구역은 전체 polygon geometry가 유효하고 어느 구역에도 포함되지 않을 때만 `waived`
+- 관리자 실행 이력에 검색→독립 본문→저장 가능한 좌표→승인 제안 퍼널과 조건부 보류 결손 수를 표시하되 Brave 응답 파생 건수는 표시·저장하지 않음
+- 키는 코드/문서가 아니라 AWS Secrets Manager에만 저장하고 `BRAVE_SEARCH_STORAGE_RIGHTS=false`로 배포
 
 ### 2026-08-11 — 도시별 근거 기반 에이전트·구조화 장소 지식
 - 러너/툴/스케줄을 활성 도시별로 실행하고 모든 장소·이벤트·이의·재검증 쿼리에 `city_id` 경계 적용
