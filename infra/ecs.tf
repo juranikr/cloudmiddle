@@ -140,6 +140,10 @@ resource "aws_ecs_task_definition" "api" {
           value = "true"
         },
         {
+          name  = "AGENT_STATE_MACHINE_ARN"
+          value = aws_sfn_state_machine.agent.arn
+        },
+        {
           # Standard Search subscriptions are discovery-only. Keep Brave
           # response fields transient until a storage-rights contract exists.
           name  = "BRAVE_SEARCH_STORAGE_RIGHTS"
@@ -225,6 +229,7 @@ resource "aws_ecs_service" "api" {
   depends_on = [
     aws_lb_listener.http,
     aws_iam_role_policy.ecs_task_execution_secrets,
+    aws_iam_role_policy.ecs_task_agent_state_machine,
   ]
 
   lifecycle {

@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     aws_region: str = "ap-northeast-2"
     s3_bucket: str = ""
     s3_public_base_url: str = ""  # CloudFront 또는 S3 website URL
+    # Production admin runs use the same Step Functions + fresh Fargate path
+    # as scheduled runs. Local development leaves this blank intentionally.
+    agent_state_machine_arn: str = ""
 
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"

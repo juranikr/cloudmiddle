@@ -10,9 +10,17 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session, joinedload
 
-from app.agent.tools import TOOLS, _containing_zone, is_useful_fetched_page, run_tool
+from app.agent.tools import (
+    TOOLS,
+    _containing_zone,
+    _source_mentions_place,
+    is_useful_fetched_page,
+    run_tool,
+)
+from app.agent.candidate_curator import curate_grounded_candidate
 from app.agent.model_recovery import classify_failure, make_recovery_plan
 from app.config import settings
 from app.agent.memory import (
@@ -242,10 +250,19 @@ def _candidate_discovery_system(
     """Narrow system contract for a proposal-only place discovery slice."""
 
     available = _tool_contract_line(CANDIDATE_DISCOVERY_TOOLS)
+    target_role = _candidate_mission_role(mission)
+    role_contract = (
+        f"이 프런티어의 고정 여행 역할은 target_role={target_role}"
+        f"({CANDIDATE_ROLE_LABELS[target_role]})입니다. 검색·후보·제안의 travel_role을 끝까지 "
+        "같게 유지하고 다른 역할로 전환하지 마세요.\n"
+        if target_role
+        else "이전 버전의 역할 미지정 프런티어이므로 새 광역 탐색을 시작하지 마세요.\n"
+    )
     return (
         "당신은 여행 지도 신규 장소 후보 발굴 에이전트입니다. "
         f"범위는 city_id={city.id}, {city.name_ko}({city.name_local}), "
         f"mission_id={mission.id}, task_id={mission.task_id}, work_item_id={work_item.id}입니다.\n"
+        f"{role_contract}"
         "이번 실행은 사용자 작업 큐나 기존 장소 품질 보강이 아니라, 현재 지도에 없는 여행 가치가 높은 "
         "장소를 근거 기반 승인 제안으로 만드는 독립된 시간 조각입니다. 다른 도시를 다루지 마세요.\n"
         f"사용 가능한 도구는 정확히 다음뿐입니다: {available}. "
@@ -300,13 +317,16 @@ def _scoped_mission_user_message(
     """Build a user message whose named tools match the scoped system contract."""
 
     if mission.kind == CANDIDATE_DISCOVERY_KIND:
+        target_role = _candidate_mission_role(mission)
         return (
             f"현재 실행 도시는 {city.name_ko}({city.name_local}), city_id={city.id}입니다.\n"
             f"신규 장소 발굴 목표: {mission.objective}\n"
             f"성공조건: {mission.success_metric}\n"
+            f"고정 여행 역할: target_role={target_role or '미지정'}"
+            f" ({CANDIDATE_ROLE_LABELS.get(target_role, '재지정 필요')})\n"
             f"이전 체크포인트: {continuity_hint}\n"
             "list_places와 list_research_history, list_agent_tasks로 기존 장소·과거 검색·현재 과제를 먼저 "
-            "확인하세요. 부족한 여행 역할 하나를 고르고 web_search의 새 결과를 fetch_page로 검증한 뒤, "
+            "확인하세요. 서버가 고정한 여행 역할 안에서만 web_search의 새 결과를 fetch_page로 검증한 뒤, "
             "기존 장소와 중복되지 않는 정확한 지점만 geocode_place로 좌표를 확인해 propose_place로 승인 "
             "제안을 남기세요. 제안 성공은 서버가 자동 완료합니다. 실패한 경우에만 현재 실행의 조사 근거가 "
             "생긴 뒤 현재 task_id를 upsert_agent_task(status=blocked)로 마무리하세요.\n"
@@ -582,6 +602,28 @@ CANDIDATE_DISCOVERY_KIND = "candidate_discovery"
 # more often when there is no executable non-discovery work, but a large quality
 # backlog can never push it out of the schedule indefinitely.
 CANDIDATE_DISCOVERY_INTERVAL = 3
+CANDIDATE_DISCOVERY_COOLDOWN_HOURS = 12
+CANDIDATE_ROLE_TARGETS = {
+    "history": 2,
+    "food": 3,
+    "market_night": 2,
+    "neighborhood": 2,
+    "nature": 2,
+    "shopping": 1,
+    "rest": 1,
+    "practical": 1,
+}
+CANDIDATE_ROLE_LABELS = {
+    "history": "역사",
+    "food": "음식",
+    "market_night": "시장·야간",
+    "neighborhood": "동네 산책",
+    "nature": "자연·공원",
+    "shopping": "쇼핑",
+    "rest": "휴식",
+    "practical": "교통·실용",
+}
+_CANDIDATE_ROLE_PREFIX = "target_role:"
 CANDIDATE_DISCOVERY_TOOLS = frozenset({
     "list_knowledge",
     "list_agent_tasks",
@@ -660,6 +702,49 @@ def _candidate_discovery_tools(
                         "Explain the searched source axis, its independent verification, "
                         "and the retry condition. "
                         "The server stores only its own audited terminal summary."
+                    ),
+                },
+            },
+            "required": ["task_id", "status", "result"],
+            "additionalProperties": False,
+        }
+        break
+    return tools
+
+
+def _scoped_quality_tools(
+    *,
+    task_id: int,
+    tool_names: list[str] | set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Advertise an exact, blocker-only terminal shape for one quality task.
+
+    DB-derived quality tasks are completed only when the server re-measures the
+    place.  The model may therefore report only that the *current* target is
+    blocked, and it must name the already selected task exactly.  Keeping the
+    provider schema aligned with that runtime contract prevents the repeated
+    free-form ``upsert_agent_task`` calls seen in production.
+    """
+
+    tools = copy.deepcopy(_filtered_tools(tool_names))
+    for tool in tools:
+        if tool.get("function", {}).get("name") != "upsert_agent_task":
+            continue
+        tool["function"]["description"] = (
+            "Report that the current exact quality target is blocked after this "
+            "run has produced auditable target evidence. Completion is measured "
+            "and recorded only by the server."
+        )
+        tool["function"]["parameters"] = {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer", "enum": [task_id]},
+                "status": {"type": "string", "enum": ["blocked"]},
+                "result": {
+                    "type": "string",
+                    "description": (
+                        "State the observed blocker and a concrete retry condition "
+                        "for the current place only."
                     ),
                 },
             },
@@ -1223,6 +1308,201 @@ def _auditable_run_step_refs(
     return refs
 
 
+def _scoped_quality_block_evidence_refs(
+    db: Session,
+    *,
+    run_id: int,
+    mission: AgentMission | None,
+    work_item: AgentWorkItem | None,
+) -> list[str]:
+    """Return server-audited observations that can close one quality slice.
+
+    A model statement is not evidence.  A blocker needs a sufficiently broad,
+    server-observed attempt set for this exact place; one search followed by a
+    parallel ``blocked`` call is never terminal evidence.
+    """
+
+    if (
+        mission is None
+        or mission.kind not in QUALITY_TASK_KINDS
+        or work_item is None
+        or work_item.place_id is None
+    ):
+        return []
+    place_id = int(work_item.place_id)
+    if mission.kind == "quality_images":
+        image_audit = _image_search_audit(db, run_id=run_id, place_id=place_id)
+        # The runtime's own image terminal path handles clean source
+        # exhaustion and provider outages after three exact searches.  Expose
+        # those same observations to a model-authored blocker only after the
+        # full sample exists and contains no usable candidate.
+        if len(image_audit["all"]) >= 3 and not image_audit["with_candidates"]:
+            return image_audit["all"][:3]
+        attachment_refs = _audited_image_attachment_failure_refs(
+            db,
+            run_id=run_id,
+            place_id=place_id,
+        )
+        return attachment_refs if len(attachment_refs) >= 3 else []
+
+    exact_reads = _auditable_run_step_refs(
+        db,
+        run_id=run_id,
+        place_id=place_id,
+        tools={"get_place"},
+        successful_only=True,
+    )
+    if not exact_reads:
+        return []
+    # Zone completion/waiver is derived from the full DB polygon catalogue in
+    # the runtime.  Letting a bare list_zones observation authorize a model
+    # blocker would bypass that stronger audit.
+    if mission.kind == "quality_zones":
+        return []
+
+    marker = db.get(Marker, place_id)
+    if marker is None:
+        return []
+
+    source_refs: list[str] = []
+    failed_axis_refs: list[str] = []
+    seen_sources: set[str] = set()
+    seen_axes: set[str] = set()
+    rows = (
+        db.query(AgentRunStep)
+        .filter(
+            AgentRunStep.run_id == run_id,
+            AgentRunStep.tool.in_({"web_search", "fetch_page", "geocode_place"}),
+        )
+        .order_by(AgentRunStep.sequence.asc())
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(detail, dict):
+            continue
+        args = detail.get("args") if isinstance(detail.get("args"), dict) else {}
+        result = detail.get("result") if isinstance(detail.get("result"), dict) else {}
+        ref = f"run:{run_id}:step:{row.sequence}"
+        if row.tool == "fetch_page":
+            url = str(result.get("url") or args.get("url") or "").strip()
+            if (
+                url
+                and url not in seen_sources
+                and not result.get("error")
+                and is_useful_fetched_page(result)
+                and _source_mentions_place(
+                    marker,
+                    result.get("title"),
+                    result.get("url"),
+                    result.get("text"),
+                )
+            ):
+                seen_sources.add(url)
+                source_refs.append(ref)
+            continue
+
+        query = str(args.get("query") or "").strip()
+        normalized_query = _normalize_research_query(query)
+        if (
+            not normalized_query
+            or normalized_query in seen_axes
+            or not _source_mentions_place(marker, query)
+        ):
+            continue
+        rows_value = result.get("results")
+        no_yield = bool(result.get("error")) or (
+            isinstance(rows_value, list) and not rows_value
+        )
+        if no_yield:
+            seen_axes.add(normalized_query)
+            failed_axis_refs.append(ref)
+
+    # Three distinct, exact-subject source bodies can establish that the pages
+    # contain no usable missing fact.  Alternatively, three distinct exact
+    # search/geocode axes may establish a temporary research blocker.  A
+    # single generic result for another attraction never qualifies.
+    audited_attempts = source_refs if len(source_refs) >= 3 else failed_axis_refs
+    if len(audited_attempts) < 3:
+        return []
+    return [*exact_reads[-1:], *audited_attempts[:3]]
+
+
+def _audited_image_attachment_failure_refs(
+    db: Session,
+    *,
+    run_id: int,
+    place_id: int,
+) -> list[str]:
+    """Return exact candidate attachment failures, bound to searched URLs.
+
+    A model cannot turn arbitrary URLs into evidence.  Each failed attachment
+    must use a different URL returned by an earlier exact-place image search in
+    this run.  Three such attempts are required before a cooldown blocker may
+    be recorded.
+    """
+
+    searched_urls: set[str] = set()
+    failed_urls: set[str] = set()
+    refs: list[str] = []
+    terminal_candidate_errors = {
+        "image_source_subject_mismatch",
+        "duplicate_image_source",
+        "bad_url",
+        "too_large",
+        "too_small",
+    }
+    rows = (
+        db.query(AgentRunStep)
+        .filter(
+            AgentRunStep.run_id == run_id,
+            AgentRunStep.tool.in_({"search_place_images", "attach_image_from_url"}),
+        )
+        .order_by(AgentRunStep.sequence.asc())
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        args = detail.get("args") if isinstance(detail, dict) else None
+        result = detail.get("result") if isinstance(detail, dict) else None
+        if not isinstance(args, dict) or not isinstance(result, dict):
+            continue
+        try:
+            exact_target = int(args.get("place_id")) == place_id
+        except (TypeError, ValueError):
+            exact_target = False
+        if not exact_target:
+            continue
+        if row.tool == "search_place_images":
+            for item in result.get("results") or result.get("results_preview") or []:
+                if isinstance(item, dict):
+                    url = str(item.get("image_url") or item.get("url") or "").strip()
+                    if url:
+                        searched_urls.add(url)
+            continue
+        url = str(args.get("image_url") or "").strip()
+        error = str(result.get("error") or "")
+        candidate_terminal = (
+            error in terminal_candidate_errors
+            or error.startswith("unsupported_type:")
+        )
+        if (
+            url
+            and url in searched_urls
+            and url not in failed_urls
+            and candidate_terminal
+        ):
+            failed_urls.add(url)
+            refs.append(f"run:{run_id}:step:{row.sequence}")
+    return refs
+
+
 def _image_search_audit(
     db: Session,
     *,
@@ -1235,6 +1515,7 @@ def _image_search_audit(
         "all": [],
         "clean_empty": [],
         "provider_failure": [],
+        "audit_uncertain": [],
         "with_candidates": [],
     }
     rows = (
@@ -1270,6 +1551,16 @@ def _image_search_audit(
             isinstance(result, dict)
             and isinstance(result_rows, list)
             and not result_rows
+            and int(result.get("rejected_subject_mismatch") or 0) > 0
+        ):
+            # Providers returned media, but none could be bound to the exact
+            # POI.  This is an uncertain/temporary blocker, never proof that
+            # the legal source pool itself is empty.
+            audit["audit_uncertain"].append(ref)
+        elif (
+            isinstance(result, dict)
+            and isinstance(result_rows, list)
+            and not result_rows
             and not result.get("error")
             and not (result.get("warnings") or [])
         ):
@@ -1279,6 +1570,18 @@ def _image_search_audit(
             # evidence of source exhaustion.
             audit["provider_failure"].append(ref)
     return audit
+
+
+def _image_terminal_disposition(audit: dict[str, list[str]]) -> str | None:
+    """Map a complete exact-search sample to its honest persistence class."""
+
+    if len(audit.get("all") or []) < 3 or audit.get("with_candidates"):
+        return None
+    if len(audit.get("clean_empty") or []) == 3:
+        return "source_exhausted"
+    if audit.get("provider_failure") or audit.get("audit_uncertain"):
+        return "blocked"
+    return None
 
 
 def _zone_catalog_geometry_valid(rows: Any) -> bool:
@@ -1451,11 +1754,13 @@ def _active_agent_task_mismatch(
     args: dict[str, Any],
     mission: AgentMission | None,
 ) -> dict[str, Any] | None:
-    """Keep a data-integrity audit from creating or editing another task."""
+    """Keep a scoped mission from creating or editing another task."""
 
     if (
         mission is None
-        or mission.kind not in {"data_integrity", CANDIDATE_DISCOVERY_KIND}
+        or mission.kind not in {
+            "data_integrity", CANDIDATE_DISCOVERY_KIND, *QUALITY_TASK_KINDS,
+        }
         or name != "upsert_agent_task"
     ):
         return None
@@ -1600,6 +1905,127 @@ def _project_candidate_discovery_task_result_args(
     }, None
 
 
+def _candidate_proposal_role_error(
+    name: str,
+    args: dict[str, Any],
+    mission: AgentMission | None,
+) -> dict[str, Any] | None:
+    """Fail closed when a model drifts away from the selected role frontier."""
+
+    if name != "propose_place" or mission is None or mission.kind != CANDIDATE_DISCOVERY_KIND:
+        return None
+    target_role = _candidate_mission_role(mission)
+    requested_role = str(args.get("travel_role") or "").strip().casefold()
+    if target_role and requested_role != target_role:
+        return {
+            "error": "candidate_target_role_mismatch",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": (
+                f"현재 후보 발굴 프런티어는 travel_role={target_role}로 고정되어 있습니다. "
+                "다른 역할 후보를 저장하지 말고 현재 역할에 맞는 후보만 검증하세요."
+            ),
+            "target_role": target_role,
+            "requested_role": requested_role or None,
+        }
+    return None
+
+
+def _project_scoped_quality_task_result_args(
+    name: str,
+    args: dict[str, Any],
+    mission: AgentMission | None,
+    task: AgentTask | None,
+    *,
+    run_id: int,
+    evidence_refs: list[str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Project a quality blocker onto the selected DB-derived task only."""
+
+    if mission is None or mission.kind not in QUALITY_TASK_KINDS or name != "upsert_agent_task":
+        return args, None
+    if (
+        task is None
+        or task.id != mission.task_id
+        or task.city_id != mission.city_id
+        or task.kind != mission.kind
+    ):
+        return {}, {
+            "error": "active_agent_task_not_writable",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": "서버가 현재 품질 과제 원본을 확인하지 못해 결과를 기록하지 않았습니다.",
+            "active_task_id": mission.task_id,
+        }
+    status = str(args.get("status") or "").strip().lower()
+    if status != "blocked":
+        return {}, {
+            "error": "quality_task_completion_server_controlled",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": (
+                "품질 과제 완료는 현재 장소의 운영 DB 성공조건을 서버가 재측정해 기록합니다. "
+                "모델은 감사 가능한 차단 결과만 blocked로 기록할 수 있습니다."
+            ),
+            "allowed_statuses": ["blocked"],
+        }
+    blocker = str(args.get("result") or "").strip()
+    if not blocker:
+        return {}, {
+            "error": "quality_task_block_reason_required",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": "현재 대상의 관찰된 차단 원인과 재시도 조건을 result에 기록하세요.",
+        }
+    if not evidence_refs:
+        return {}, {
+            "error": "quality_task_block_evidence_required",
+            "error_class": "policy_guard",
+            "guard_disposition": "retry",
+            "detail": (
+                "현재 실행에서 활성 장소를 직접 읽고 품질 종류에 맞는 조사·행동을 시도한 근거가 없습니다. "
+                "대상을 관찰한 뒤 blocked 결과를 다시 기록하세요."
+            ),
+        }
+    result_text = (
+        f"실행 #{run_id} 차단 근거 {', '.join(evidence_refs)}. {blocker}"
+    )[:8000]
+    return {
+        "task_id": task.id,
+        "status": "blocked",
+        "result": result_text,
+    }, None
+
+
+def _mission_cursor_continuity(
+    mission: AgentMission | None,
+    work_item: AgentWorkItem | None,
+) -> dict[str, Any] | None:
+    """Serialize the cursor that a *future* run should resume.
+
+    ``mission_context`` requires an executable item. Paused missions can have
+    no active item, but their progress still contains the durable resume and
+    cooldown state that operators need to distinguish from this run's target.
+    """
+
+    if mission is None:
+        return None
+    if work_item is not None:
+        return mission_context(mission, work_item)
+    try:
+        progress = json.loads(mission.progress or "{}")
+    except (TypeError, json.JSONDecodeError):
+        progress = {}
+    if not isinstance(progress, dict):
+        progress = {}
+    return {
+        "mission_id": mission.id,
+        "work_item_id": None,
+        "status": mission.status,
+        "progress": progress,
+    }
+
+
 def _halt_stalled_mission(
     db: Session,
     *,
@@ -1672,9 +2098,10 @@ def _halt_stalled_mission(
     except Exception:
         db.rollback()
         raise
-    # The completed run remains attributed to the target it actually handled;
-    # the ready sibling is only a future resume cursor.
-    return stalled_item
+    # Return the future resume cursor. ``rotate_blocked_work_item`` keeps the
+    # AgentRun attributed to ``stalled_item`` when activate_next=False, while
+    # callers use this return value only for next_work_item_id/continuity.
+    return next_item
 
 
 def _mission_has_no_executable_target(
@@ -1864,6 +2291,29 @@ def _page_supports_coordinate_evidence(
         evidence_lng = float(coordinate_evidence["lng"])
     except (KeyError, TypeError, ValueError):
         return False
+
+    identity = str(
+        coordinate_evidence.get("title")
+        or coordinate_evidence.get("display_name")
+        or ""
+    ).split(",", 1)[0]
+    page_key = _compact_evidence_text(
+        f"{page.get('title') or ''} {str(page.get('text') or '')[:2500]}"
+    )
+    identity_keys = {
+        _compact_evidence_text(value)
+        for value in (
+            identity,
+            re.split(r"[（(]", identity, maxsplit=1)[0],
+        )
+        if value
+    }
+    page_identity_match = any(
+        len(key) >= 3 and key in page_key for key in identity_keys
+    )
+    address_key = _compact_evidence_text(coordinate_evidence.get("address"))
+    page_address_match = len(address_key) >= 5 and address_key in page_key
+
     for row in page.get("coordinate_candidates") or []:
         if (
             not isinstance(row, dict)
@@ -1876,29 +2326,43 @@ def _page_supports_coordinate_evidence(
                 abs(float(row["lat"]) - evidence_lat) <= 0.002
                 and abs(float(row["lng"]) - evidence_lng) <= 0.002
             ):
-                return True
+                row_key = _compact_evidence_text(
+                    " ".join(
+                        str(row.get(field) or "")
+                        for field in ("display_name", "title", "name", "address")
+                    )
+                )
+                row_identity_match = any(
+                    len(key) >= 3 and key in row_key for key in identity_keys
+                )
+                row_address_match = bool(
+                    len(address_key) >= 5 and address_key in row_key
+                )
+                # Coordinates prove that the page describes *some* nearby POI,
+                # not that it describes this POI. Require the page or embedded
+                # coordinate record to carry the same identity/address as well.
+                if (
+                    page_identity_match
+                    or page_address_match
+                    or row_identity_match
+                    or row_address_match
+                ):
+                    return True
         except (KeyError, TypeError, ValueError):
             continue
-
-    identity = str(
-        coordinate_evidence.get("title")
-        or coordinate_evidence.get("display_name")
-        or ""
-    ).split(",", 1)[0]
-    identity_key = _compact_evidence_text(identity)
-    page_key = _compact_evidence_text(
-        f"{page.get('title') or ''} {str(page.get('text') or '')[:2500]}"
-    )
-    if len(identity_key) >= 3 and identity_key in page_key:
-        return True
-    address_key = _compact_evidence_text(coordinate_evidence.get("address"))
-    return len(address_key) >= 5 and address_key in page_key
+    return page_identity_match or page_address_match
 
 
 def _canonical_transient_proposal_args(
     coordinate_evidence: dict[str, Any],
     verified_pages: list[dict[str, Any]],
     transient_taint: "_TransientProviderTaint",
+    *,
+    client: Any,
+    model: str,
+    city_name: str,
+    user_goal: str,
+    target_role: str = "",
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Build a proposal using only independently retainable observations.
 
@@ -1954,85 +2418,72 @@ def _canonical_transient_proposal_args(
     source_urls = list(dict.fromkeys(
         str(page.get("url") or "").strip() for page in matched_pages
     ))[:4]
-    primary_page = matched_pages[0]
-    evidence_text = " ".join((
-        display_name,
-        str(coordinate_evidence.get("type") or ""),
-        str(primary_page.get("title") or ""),
-        str(primary_page.get("text") or "")[:1200],
-    )).casefold()
-    category = "other"
-    category_label = "여행 장소"
-    travel_role = "general"
-    category_rules = (
-        (r"酒店|宾馆|旅馆|hotel|lodging", "lodging", "숙소", "rest"),
-        (r"餐厅|饭店|餐馆|restaurant|food", "restaurant", "음식점", "local_food"),
-        (r"咖啡|茶饮|奶茶|饮品|甜品|cafe|coffee|tea", "drink", "음료점", "snack"),
-        (r"地铁|车站|机场|transport|station", "transport", "교통 장소", "practical"),
-        (r"商场|市场|购物|mall|shopping", "shopping", "쇼핑 장소", "shopping"),
-        (r"博物馆|故宫|公园|景区|museum|park|attraction", "tourist", "관광지", "culture"),
-        (r"便利店|药店|超市|convenience|pharmacy", "convenience", "편의 장소", "practical"),
-    )
-    for pattern, candidate_category, label, role in category_rules:
-        if re.search(pattern, evidence_text, re.IGNORECASE):
-            category, category_label, travel_role = candidate_category, label, role
-            break
-    title = local_name[:150]
-    if not re.search(r"[\uac00-\ud7a3]", title):
-        title = f"{title} ({category_label})"[:200]
-    source_url = source_urls[0]
-    source_title = str(primary_page.get("title") or local_name).strip()[:300]
-    description = f"독립 출처로 확인한 {category_label}입니다. 주소: {address}"[:2000]
-    return {
-        "title": title,
-        "description": description,
-        "address": address[:300],
-        "category": category,
-        "travel_role": travel_role,
+    source_titles = [
+        str(page.get("title") or local_name).strip()[:300]
+        for page in matched_pages
+    ][:4]
+    packet = {
+        "candidate_key": (
+            f"{coordinate_source}:{coordinate_evidence.get('external_id') or source_urls[0]}:"
+            f"{float(coordinate_evidence['lat']):.6f}:{float(coordinate_evidence['lng']):.6f}"
+        ),
+        "title": display_name,
+        "address": address,
         "lat": float(coordinate_evidence["lat"]),
         "lng": float(coordinate_evidence["lng"]),
-        "context": "저장 가능한 독립 지오코딩과 공개 본문으로 재검증한 관리자 승인 대기 제안입니다.",
+        "source_urls": source_urls,
+        "source_titles": source_titles,
+        "source_excerpt": "\n\n".join(
+            str(page.get("text") or "")[:2500] for page in matched_pages
+        )[:5000],
+        "coordinate_evidence": dict(coordinate_evidence),
+    }
+    try:
+        curated = curate_grounded_candidate(
+            client,
+            model=model,
+            city_name=city_name,
+            user_goal=user_goal,
+            subject="candidate_discovery",
+            packet=packet,
+            target_role=target_role,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed; the outer ReAct loop can recover
+        return None, {
+            "error": "candidate_curation_failed",
+            "detail": (
+                "독립 근거만 넣은 별도 편집 단계가 유효한 구조화 결과를 만들지 못해 "
+                "낮은 품질의 일반 라벨 장소를 저장하지 않았습니다."
+            ),
+            "failure": str(exc)[:240],
+        }
+    if not curated.get("ok") or not isinstance(curated.get("args"), dict):
+        return None, {
+            "error": str(curated.get("error") or "candidate_curation_rejected"),
+            "detail": str(curated.get("detail") or "독립 근거 편집 품질 기준을 통과하지 못했습니다.")[:500],
+        }
+    canonical = dict(curated["args"])
+    # Location and provenance never come from the editor. Re-pin them to the
+    # server observation even though candidate_curator already does so.
+    canonical.update({
+        "lat": float(coordinate_evidence["lat"]),
+        "lng": float(coordinate_evidence["lng"]),
         "coordinate_source": coordinate_source[:50],
         "coordinate_external_id": str(coordinate_evidence.get("external_id") or "")[:200],
         "coordinate_query": display_name[:300],
         "coordinate_source_url": str(coordinate_evidence.get("source_url") or "")[:1000],
-        "coordinate_confidence": max(
-            0.0, min(float(coordinate_evidence.get("confidence") or 0.7), 1.0)
-        ),
-        "zone_id": None,
-        "chain_name_local": "",
-        "chain_name_ko": "",
-        "branch_name": str(coordinate_evidence.get("branch_name") or "")[:120],
-        "evidence": (
-            "저장 가능한 비-Brave 좌표 근거로 장소명·주소·위치를 확인하고, "
-            "별도 공개 페이지의 본문으로 동일 장소임을 교차 검증했습니다."
-        ),
-        "source_urls": source_urls,
-        "confidence": max(
-            0.0, min(float(coordinate_evidence.get("confidence") or 0.7), 0.95)
-        ),
-        "insights": [
-            {
-                "kind": "location",
-                "title": "위치 확인",
-                "content": f"독립 좌표 근거에서 주소를 {address}로 확인했습니다.",
-                "source_url": source_url,
-                "source_title": source_title,
-                "confidence": max(
-                    0.0, min(float(coordinate_evidence.get("confidence") or 0.7), 0.95)
-                ),
-            },
-            {
-                "kind": "visit",
-                "title": "방문 전 확인",
-                "content": "방문 전 운영시간과 입장·예약 조건을 연결된 출처에서 다시 확인하세요.",
-                "source_url": source_url,
-                "source_title": source_title,
-                "confidence": 0.7,
-            },
-        ],
+        "_coordinate_evidence": dict(coordinate_evidence),
         "_validated_source_urls": source_urls,
-    }, None
+        "_validated_source_documents": [
+            {
+                "url": str(page.get("url") or "")[:1000],
+                "title": str(page.get("title") or "")[:300],
+                "text": str(page.get("text") or "")[:7000],
+            }
+            for page in matched_pages
+        ],
+    })
+    return canonical, None
 
 
 def _run_outcome_status(*, unread_after: int, gaps: list[str], material_change_count: int) -> str:
@@ -2369,10 +2820,18 @@ def _persistable_tool_args(
 ) -> dict[str, Any]:
     """Project model arguments onto a retention-safe durable shape."""
 
+    # Fetched page bodies are an execution-only attestation passed from the
+    # runner to mutation tools.  Keeping them in AgentRunStep would duplicate
+    # arbitrary page text in durable history and could exceed the step budget.
+    persistable_args = {
+        key: value
+        for key, value in args.items()
+        if key != "_validated_source_documents"
+    }
     if name == "web_search":
         return {
             "query": storage_safe_query or _TRANSIENT_QUERY_REDACTION,
-            "max_results": args.get("max_results"),
+            "max_results": persistable_args.get("max_results"),
         }
     if transient_input and name == "geocode_place":
         return {"query": _TRANSIENT_QUERY_REDACTION}
@@ -2380,7 +2839,7 @@ def _persistable_tool_args(
         return {"url": _TRANSIENT_QUERY_REDACTION}
     if transient_input and name not in {"propose_place", "upsert_agent_task"}:
         return {"transient_input": "discarded"}
-    return transient_taint.redact(args)
+    return transient_taint.redact(persistable_args)
 
 
 def _step_detail_json(
@@ -2402,7 +2861,8 @@ def _step_detail_json(
             for key in (
                 "ok", "error", "detail", "status", "id", "proposal_id", "place_id", "task_id",
                 "changed", "created", "marked", "merged", "resolved", "url", "title",
-                "already_visited",
+                "already_visited", "pool_size", "rejected_subject_mismatch", "queries",
+                "warnings",
             )
             if key in result
         }
@@ -2512,7 +2972,7 @@ QUALITY_TASK_KINDS = {
 QUALITY_SOURCE_REVISIONS = {
     # Legal image sources currently available to persisted quality work.
     # Brave place/photo payloads are discovery-only and intentionally absent.
-    "image": "wikimedia:v1|openverse:v1|manual-upload:v1",
+    "image": "wikimedia:v2|openverse:v2|manual-upload:v1",
 }
 
 
@@ -2856,49 +3316,279 @@ def _candidate_discovery_due(db: Session, *, city_id: int) -> bool:
     return CANDIDATE_DISCOVERY_KIND not in recent
 
 
-def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask:
-    """Create or resume the single bounded discovery cycle for a city."""
+def _candidate_role_from_text(value: str) -> str:
+    """Read the machine-owned role header without interpreting model prose."""
 
-    task = (
+    for line in str(value or "").splitlines()[:3]:
+        key, separator, raw_role = line.partition(":")
+        if separator and f"{key.strip().casefold()}:" == _CANDIDATE_ROLE_PREFIX:
+            role = raw_role.strip().casefold()
+            return role if role in CANDIDATE_ROLE_TARGETS else ""
+    return ""
+
+
+def _candidate_task_role(task: AgentTask | None) -> str:
+    if task is None or task.kind != CANDIDATE_DISCOVERY_KIND:
+        return ""
+    return _candidate_role_from_text(task.detail)
+
+
+def _candidate_mission_role(mission: AgentMission | None) -> str:
+    if mission is None or mission.kind != CANDIDATE_DISCOVERY_KIND:
+        return ""
+    try:
+        strategy = json.loads(mission.strategy or "{}")
+    except (TypeError, json.JSONDecodeError):
+        strategy = {}
+    role = str(strategy.get("target_role") or "").strip().casefold() if isinstance(strategy, dict) else ""
+    if role in CANDIDATE_ROLE_TARGETS:
+        return role
+    return _candidate_role_from_text(mission.objective)
+
+
+def _pin_candidate_mission_role(mission: AgentMission, task: AgentTask) -> str:
+    """Copy the task's immutable frontier role into durable mission strategy."""
+
+    role = _candidate_task_role(task)
+    if not role:
+        return ""
+    try:
+        strategy = json.loads(mission.strategy or "{}")
+    except (TypeError, json.JSONDecodeError):
+        strategy = {}
+    if not isinstance(strategy, dict):
+        strategy = {}
+    strategy.update({
+        "target_role": role,
+        "frontier_policy": "role_fixed_until_terminal",
+        "resume_policy": "checkpoint_first_after_cooldown",
+        "cooldown_hours": CANDIDATE_DISCOVERY_COOLDOWN_HOURS,
+    })
+    mission.strategy = json.dumps(strategy, ensure_ascii=False)
+    return role
+
+
+def _candidate_mission_is_cooling(
+    db: Session,
+    mission: AgentMission | None,
+    *,
+    cutoff: datetime,
+) -> bool:
+    if mission is None or mission.status != "paused":
+        return False
+    # Let each database compare timestamps. SQLite fixtures can be naive while
+    # PostgreSQL production rows are timezone-aware.
+    return db.query(AgentMission.id).filter(
+        AgentMission.id == mission.id,
+        AgentMission.updated_at > cutoff,
+    ).first() is not None
+
+
+def _latest_candidate_mission(db: Session, task: AgentTask) -> AgentMission | None:
+    return (
+        db.query(AgentMission)
+        .filter(
+            AgentMission.city_id == task.city_id,
+            AgentMission.task_id == task.id,
+            AgentMission.kind == CANDIDATE_DISCOVERY_KIND,
+            AgentMission.status.in_(("active", "paused")),
+        )
+        .order_by(AgentMission.id.desc())
+        .first()
+    )
+
+
+def _quarantine_legacy_candidate_frontier(
+    db: Session,
+    *,
+    task: AgentTask,
+    mission: AgentMission | None,
+) -> None:
+    """Preserve an old unscoped cursor without allowing another broad search."""
+
+    task.status = "blocked"
+    task.completed_at = None
+    if not (task.result or "").strip():
+        task.result = (
+            "역할 고정 정책 이전에 생성된 광역 발굴 프런티어입니다. 기존 체크포인트는 보존하지만 "
+            "자동 재개하지 않으며, 역할이 고정된 새 프런티어로 회전합니다."
+        )
+    if mission is None:
+        return
+    mission.status = "paused"
+    mission.completed_at = None
+    try:
+        progress = json.loads(mission.progress or "{}")
+    except (TypeError, json.JSONDecodeError):
+        progress = {}
+    if not isinstance(progress, dict):
+        progress = {}
+    progress.update({
+        "active_work_item_id": None,
+        "scheduler_disposition": "legacy_unscoped_frontier",
+        "retry_condition": "target_role을 명시적으로 지정하기 전에는 자동 재개하지 않음",
+    })
+    mission.progress = json.dumps(progress, ensure_ascii=False)
+    for item in db.query(AgentWorkItem).filter(
+        AgentWorkItem.mission_id == mission.id,
+        AgentWorkItem.status.in_(("ready", "active", "blocked")),
+    ).all():
+        item.status = "blocked"
+        item.retry_condition = "target_role을 명시적으로 지정하기 전에는 자동 재개하지 않음"
+
+
+def _candidate_role_counts(db: Session, *, city_id: int) -> dict[str, int]:
+    snapshot = _performance_snapshot(db, city_id)
+    return {
+        role: int(snapshot.get(f"role_{role}", 0) or 0)
+        for role in CANDIDATE_ROLE_TARGETS
+    }
+
+
+def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | None:
+    """Select a role-scoped frontier without reopening a fresh blocked slice.
+
+    A paused exact slice stays intact for at least 12 hours. During that window
+    discovery rotates to another missing travel role. When every missing role
+    already has a cooling frontier, ``None`` tells the caller to defer without
+    spending a model call.
+    """
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS)
+    role_counts = _candidate_role_counts(db, city_id=city.id)
+    missing_roles = [
+        role for role, target in CANDIDATE_ROLE_TARGETS.items()
+        if role_counts.get(role, 0) < target
+    ]
+    if not missing_roles:
+        return None
+
+    tasks = (
         db.query(AgentTask)
         .filter(
             AgentTask.city_id == city.id,
             AgentTask.kind == CANDIDATE_DISCOVERY_KIND,
             AgentTask.status.in_(("pending", "blocked")),
         )
-        .order_by(AgentTask.id.desc())
-        .first()
+        .order_by(AgentTask.id.asc())
+        .all()
     )
-    if task is None:
-        task = AgentTask(
-            city_id=city.id,
-            kind=CANDIDATE_DISCOVERY_KIND,
-            title=f"자동 신규 장소 발굴: {city.name_ko}",
-            detail=(
-                f"{city.name_ko}({city.name_local})의 현재 지도와 조사 이력을 읽고, "
-                f"{_research_themes(city)} 중 부족한 여행 역할 하나를 선택하세요. "
-                "서로 다른 출처의 본문으로 정확한 상호·지점·주소를 확인하고 기존 장소와 중복되지 않는 "
-                "후보만 좌표 검증 후 관리자 승인 제안으로 남기세요. 안전한 후보가 없으면 조사한 출처 축과 "
-                "탈락 사유, 다음에 달라져야 할 재시도 조건을 기록하세요."
+    entries: list[tuple[AgentTask, AgentMission | None, str]] = []
+    changed = False
+    for task in tasks:
+        mission = _latest_candidate_mission(db, task)
+        role = _candidate_task_role(task) or _candidate_mission_role(mission)
+        if not role:
+            _quarantine_legacy_candidate_frontier(db, task=task, mission=mission)
+            changed = True
+            continue
+        entries.append((task, mission, role))
+
+    cooling_roles: set[str] = set()
+    resumable: list[tuple[AgentTask, AgentMission, str]] = []
+    for task, mission, role in entries:
+        if role not in missing_roles or mission is None or mission.status != "paused":
+            continue
+        if _candidate_mission_is_cooling(db, mission, cutoff=cutoff):
+            cooling_roles.add(role)
+            continue
+        resumable.append((task, mission, role))
+
+    # An unfinished active frontier represents substantive continuity and wins
+    # before creating another task, except when another exact slice for the same
+    # role is cooling. This closes duplicate legacy/race rows without defeating
+    # the role rotation promised by a fresh pause.
+    active_entries = [
+        entry for entry in entries
+        if entry[0].status == "pending"
+        and entry[2] in missing_roles
+        and entry[2] not in cooling_roles
+        and (entry[1] is None or entry[1].status == "active")
+    ]
+    if active_entries:
+        task, _mission, _role = min(
+            active_entries,
+            key=lambda entry: (
+                int(entry[1].last_run_id or 0) if entry[1] is not None else 0,
+                int(entry[0].attempts or 0),
+                entry[0].id,
             ),
-            success_metric=(
-                "중복·본문·좌표가 검증된 신규 장소 승인 제안 1건 이상 또는 서로 다른 출처 축을 "
-                "소진했다는 감사 가능한 차단 결과"
-            ),
-            priority=88,
-            status="pending",
         )
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-    elif task.status == "blocked":
-        # Preserve the prior mission/work-item/checkpoint chain. A blocked
-        # discovery slice becomes executable only when the weighted scheduler
-        # reserves the next discovery turn and calls this helper again.
+        if changed:
+            db.commit()
+        return task
+
+    # Rotate roles by least-recent candidate mission, then by relative coverage.
+    last_role_mission_id = {role: 0 for role in missing_roles}
+    history_missions = (
+        db.query(AgentMission)
+        .filter(
+            AgentMission.city_id == city.id,
+            AgentMission.kind == CANDIDATE_DISCOVERY_KIND,
+        )
+        .order_by(AgentMission.id.asc())
+        .all()
+    )
+    for history_mission in history_missions:
+        history_task = (
+            db.get(AgentTask, history_mission.task_id)
+            if history_mission.task_id is not None
+            else None
+        )
+        role = _candidate_mission_role(history_mission) or _candidate_task_role(history_task)
+        if role in last_role_mission_id:
+            last_role_mission_id[role] = history_mission.id
+
+    available_roles = [role for role in missing_roles if role not in cooling_roles]
+    if not available_roles:
+        if changed:
+            db.commit()
+        return None
+
+    target_role = min(
+        available_roles,
+        key=lambda role: (
+            last_role_mission_id.get(role, 0),
+            role_counts.get(role, 0) / CANDIDATE_ROLE_TARGETS[role],
+            tuple(CANDIDATE_ROLE_TARGETS).index(role),
+        ),
+    )
+    exact_resume = next(
+        (entry for entry in resumable if entry[2] == target_role),
+        None,
+    )
+    if exact_resume is not None:
+        task, _mission, _role = exact_resume
         task.status = "pending"
         task.completed_at = None
         db.commit()
         db.refresh(task)
+        return task
+
+    label = CANDIDATE_ROLE_LABELS[target_role]
+    task = AgentTask(
+        city_id=city.id,
+        kind=CANDIDATE_DISCOVERY_KIND,
+        title=f"자동 신규 장소 발굴 [{label}]: {city.name_ko}",
+        detail=(
+            f"{_CANDIDATE_ROLE_PREFIX} {target_role}\n"
+            f"{city.name_ko}({city.name_local})에서 여행 역할 '{target_role}'({label})만 탐색하세요. "
+            f"현재 역할 커버리지는 {role_counts[target_role]}/{CANDIDATE_ROLE_TARGETS[target_role]}입니다. "
+            "서로 다른 출처의 본문으로 정확한 상호·지점·주소를 확인하고 기존 장소와 중복되지 않는 "
+            "후보만 좌표 검증 후 관리자 승인 제안으로 남기세요. 다른 역할 후보로 바꾸지 마세요. "
+            "안전한 후보가 없으면 조사한 출처 축과 탈락 사유, 다음의 정확한 검증 질의를 기록하세요."
+        ),
+        success_metric=(
+            f"travel_role={target_role}인 중복·본문·좌표 검증 신규 장소 승인 제안 1건 또는 "
+            "독립 보존 가능한 근거와 다음 정확한 질의를 포함한 감사 가능한 차단 결과"
+        ),
+        priority=88,
+        status="pending",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
     return task
 
 
@@ -2962,7 +3652,7 @@ def _select_autonomous_task(
     db: Session,
     *,
     city: City,
-) -> tuple[AgentTask, str, bool]:
+) -> tuple[AgentTask | None, str, bool]:
     """Select a safety-first lane while reserving periodic discovery capacity."""
 
     non_discovery = _fair_non_discovery_task(db, city_id=city.id)
@@ -2991,24 +3681,128 @@ def _select_autonomous_task(
 
     discovery_due = _candidate_discovery_due(db, city_id=city.id)
     if discovery_due:
-        return (
-            _ensure_candidate_discovery_task(db, city=city),
-            CANDIDATE_DISCOVERY_KIND,
-            True,
-        )
+        discovery_task = _ensure_candidate_discovery_task(db, city=city)
+        if discovery_task is not None:
+            return discovery_task, CANDIDATE_DISCOVERY_KIND, True
+        if non_discovery is not None:
+            return non_discovery, "quality_or_backlog", False
+        return None, "discovery_deferred", True
     if non_discovery is not None:
         return non_discovery, "quality_or_backlog", False
     # Avoid a no-op idle run when every quality target is cooling down. This is
     # an opportunistic discovery slice; the periodic counter still lets a cooled
     # quality mission win on the next non-due run once it becomes executable.
-    return (
-        _ensure_candidate_discovery_task(db, city=city),
-        CANDIDATE_DISCOVERY_KIND,
-        False,
-    )
+    discovery_task = _ensure_candidate_discovery_task(db, city=city)
+    if discovery_task is not None:
+        return discovery_task, CANDIDATE_DISCOVERY_KIND, False
+    return None, "discovery_deferred", False
+
+
+_AGENT_CITY_LOCK_NAMESPACE = 1_414_678_407
+
+
+def _acquire_agent_city_lock(db: Session, *, city_id: int) -> tuple[Any | None, str]:
+    """Hold one PostgreSQL session advisory lock for an entire city run.
+
+    The agent commits many small checkpoints, so a transaction-level lock on
+    ``db`` would disappear mid-run.  A dedicated connection keeps the
+    session-level lock alive independently until the wrapper releases it.
+    SQLite/local unit tests deliberately bypass this production coordination.
+    """
+
+    bind = db.get_bind()
+    dialect_name = str(getattr(getattr(bind, "dialect", None), "name", ""))
+    if dialect_name != "postgresql":
+        return None, "unsupported"
+    connectable = getattr(bind, "engine", bind)
+    connection = connectable.connect()
+    try:
+        acquired = bool(connection.execute(
+            text("SELECT pg_try_advisory_lock(:namespace, :city_id)"),
+            {"namespace": _AGENT_CITY_LOCK_NAMESPACE, "city_id": int(city_id)},
+        ).scalar())
+        connection.commit()
+    except Exception:
+        # The server may have acquired the session lock even if the response
+        # or commit failed locally. Returning that DBAPI session to the pool
+        # could strand the city lock indefinitely, so force disposal.
+        try:
+            connection.invalidate()
+        finally:
+            connection.close()
+        raise
+    if not acquired:
+        connection.close()
+        return None, "busy"
+    return connection, "acquired"
+
+
+def _release_agent_city_lock(connection: Any, *, city_id: int) -> None:
+    try:
+        try:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(:namespace, :city_id)"),
+                {"namespace": _AGENT_CITY_LOCK_NAMESPACE, "city_id": int(city_id)},
+            )
+            connection.commit()
+        except Exception:
+            # Closing a PostgreSQL connection also releases all of its session
+            # advisory locks only if the physical DBAPI session is actually
+            # terminated. Pool close/reset alone does not, so invalidate the
+            # ambiguous connection while preserving the completed run result.
+            connection.invalidate()
+    finally:
+        connection.close()
 
 
 def run_agent(
+    db: Session,
+    *,
+    city_id: int,
+    max_steps: int | None = None,
+    autonomous_research: bool | None = None,
+) -> dict[str, Any]:
+    """Run one city agent, rejecting overlapping scheduled/manual workers."""
+
+    try:
+        lock_connection, lock_status = _acquire_agent_city_lock(db, city_id=city_id)
+    except Exception as exc:  # noqa: BLE001 - fail closed instead of running unlocked
+        return {
+            "ok": False,
+            "status": "failed",
+            "steps": 0,
+            "message": f"도시 배치 잠금을 확인하지 못해 실행하지 않았습니다: {type(exc).__name__}",
+            "unread_before": 0,
+            "unread_after": 0,
+            "tool_counts": {},
+            "city_id": city_id,
+            "outcome": "agent_lock_unavailable",
+        }
+    if lock_status == "busy":
+        return {
+            "ok": True,
+            "status": "completed",
+            "steps": 0,
+            "message": "같은 도시의 에이전트 배치가 이미 실행 중이어서 중복 실행하지 않았습니다.",
+            "unread_before": count_unread(db, city_id),
+            "unread_after": count_unread(db, city_id),
+            "tool_counts": {},
+            "city_id": city_id,
+            "outcome": "already_running",
+        }
+    try:
+        return _run_agent_impl(
+            db,
+            city_id=city_id,
+            max_steps=max_steps,
+            autonomous_research=autonomous_research,
+        )
+    finally:
+        if lock_connection is not None:
+            _release_agent_city_lock(lock_connection, city_id=city_id)
+
+
+def _run_agent_impl(
     db: Session,
     *,
     city_id: int,
@@ -3138,8 +3932,57 @@ def run_agent(
             db,
             city=city,
         )
+        if primary_task is None:
+            performance = _performance_snapshot(db, city_id)
+            deferred_reason = (
+                "현재 부족한 모든 여행 역할의 후보 발굴 프런티어가 12시간 냉각 중이거나 "
+                "역할별 목표 커버리지가 이미 충족되어 모델 호출을 유예했습니다."
+            )
+            deferred_run = AgentRun(
+                city_id=city_id,
+                mode="idle",
+                status="completed",
+                objective="Defer candidate discovery until a role frontier becomes executable.",
+                score=0,
+                metrics=json.dumps({
+                    "before": performance,
+                    "after": performance,
+                    "delta": {},
+                    "tool_counts": {},
+                    "material_changes": [],
+                    "material_change_count": 0,
+                    "lane": "discovery_deferred",
+                    "discovery_reserved": discovery_reserved,
+                    "outcome": "deferred",
+                    "deferred_reason": "all_missing_role_frontiers_cooling_or_covered",
+                    "cooldown_hours": CANDIDATE_DISCOVERY_COOLDOWN_HOURS,
+                    "quality_task_ids_before": quality_task_ids_before,
+                }, ensure_ascii=False),
+                summary=deferred_reason,
+                finished_at=datetime.now(timezone.utc),
+            )
+            db.add(deferred_run)
+            db.commit()
+            db.refresh(deferred_run)
+            return {
+                "ok": True,
+                "status": "completed",
+                "steps": 0,
+                "message": deferred_reason,
+                "unread_before": 0,
+                "unread_after": 0,
+                "tool_counts": {},
+                "score": 0,
+                "performance": {},
+                "remaining_gaps": _research_gaps({}, {}, performance),
+                "run_id": deferred_run.id,
+                "city_id": city_id,
+                "outcome": "deferred",
+            }
         primary_task.attempts += 1
         active_mission, active_work_item = ensure_mission_for_task(db, primary_task)
+        if active_mission.kind == CANDIDATE_DISCOVERY_KIND:
+            _pin_candidate_mission_role(active_mission, primary_task)
         db.commit()
     integrity_mode = bool(
         autonomous_mode
@@ -3159,6 +4002,17 @@ def run_agent(
         and active_mission.kind in QUALITY_TASK_KINDS
         and active_work_item is not None
     )
+    # AgentRun.work_item_id is historical attribution: it identifies the exact
+    # target whose prompt and tools this run actually used.  Cursor rotation is
+    # recorded separately so activating the next target can never rewrite the
+    # history of the just-finished run.
+    processed_work_item_id = (
+        int(active_work_item.id)
+        if scoped_quality_mode and active_work_item is not None
+        else None
+    )
+    next_work_item_id: int | None = None
+    next_continuity: dict[str, Any] | None = None
     integrity_evidence_refs: dict[str, str] = {}
     integrity_corrective_resume = False
     continuity_payload = (
@@ -3517,6 +4371,7 @@ def run_agent(
     context_compactions = 0
     data_integrity_place_reads: set[int] = set()
     scoped_lane_terminal = False
+    scoped_terminal_reason = ""
     integrity_focus_hint = (
         f"mission_id={active_mission.id}, task_id={active_mission.task_id}, "
         f"place_id={active_work_item.place_id}, title={active_work_item.title}"
@@ -3600,6 +4455,13 @@ def run_agent(
                             tool_names=mission_tool_names,
                         )
                         if discovery_mode
+                        and active_mission is not None
+                        and active_mission.task_id is not None
+                        else _scoped_quality_tools(
+                            task_id=int(active_mission.task_id),
+                            tool_names=mission_tool_names,
+                        )
+                        if scoped_quality_mode
                         and active_mission is not None
                         and active_mission.task_id is not None
                         else _filtered_tools(mission_tool_names)
@@ -3870,8 +4732,16 @@ def run_agent(
                         sequence=action_sequence,
                         reason=stall_reason,
                     )
-                    if active_work_item is not None:
-                        agent_run.work_item_id = active_work_item.id
+                    if scoped_quality_mode:
+                        next_work_item_id = (
+                            int(active_work_item.id) if active_work_item is not None else None
+                        )
+                        next_continuity = _mission_cursor_continuity(
+                            active_mission,
+                            active_work_item,
+                        )
+                        if processed_work_item_id is not None:
+                            agent_run.work_item_id = processed_work_item_id
                     final_text = (
                         f"연속 {no_progress_actions}회 성과 변화가 없어 안전 종료했습니다. "
                         "현재 대상은 차단 사유와 체크포인트를 남기고 회전했습니다."
@@ -3982,6 +4852,11 @@ def run_agent(
                     if argument_error
                     else _active_agent_task_mismatch(name, args, active_mission)
                 )
+                candidate_role_error = (
+                    None
+                    if argument_error
+                    else _candidate_proposal_role_error(name, args, active_mission)
+                )
                 projected_task_args, task_projection_error = (
                     _project_data_integrity_task_result_args(
                         name,
@@ -4017,6 +4892,29 @@ def run_agent(
                                 db,
                                 run_id=agent_run.id,
                             ),
+                        )
+                    )
+                scoped_quality_block_refs: list[str] = []
+                if (
+                    not argument_error
+                    and scoped_quality_mode
+                    and active_mission is not None
+                    and name == "upsert_agent_task"
+                ):
+                    scoped_quality_block_refs = _scoped_quality_block_evidence_refs(
+                        db,
+                        run_id=agent_run.id,
+                        mission=active_mission,
+                        work_item=active_work_item,
+                    )
+                    projected_task_args, task_projection_error = (
+                        _project_scoped_quality_task_result_args(
+                            name,
+                            args,
+                            active_mission,
+                            primary_task,
+                            run_id=agent_run.id,
+                            evidence_refs=scoped_quality_block_refs,
                         )
                     )
                 data_integrity_get_place_id = None
@@ -4126,6 +5024,8 @@ def run_agent(
                     }
                 elif agent_task_mismatch is not None:
                     result = agent_task_mismatch
+                elif candidate_role_error is not None:
+                    result = candidate_role_error
                 elif task_projection_error is not None:
                     result = task_projection_error
                 elif normal_terminal_write:
@@ -4244,7 +5144,9 @@ def run_agent(
                     tool_args = (
                         projected_task_args
                         if active_mission is not None
-                        and active_mission.kind in {"data_integrity", CANDIDATE_DISCOVERY_KIND}
+                        and active_mission.kind in {
+                            "data_integrity", CANDIDATE_DISCOVERY_KIND, *QUALITY_TASK_KINDS,
+                        }
                         and name == "upsert_agent_task"
                         else args
                     )
@@ -4255,8 +5157,25 @@ def run_agent(
                         "propose_place",
                     }:
                         tool_args = {
-                            **args,
+                            **tool_args,
                             "_validated_source_urls": sorted(validated_source_urls),
+                        }
+                    if name in {"upsert_place_insights", "propose_place"}:
+                        # Insight-bearing writes validate concrete claims
+                        # against page bodies fetched successfully in this exact
+                        # run. The server-owned field reaches the write guard
+                        # but _persistable_tool_args strips it from history.
+                        tool_args = {
+                            **tool_args,
+                            "_validated_source_documents": [
+                                {
+                                    "url": str(page.get("url") or "")[:1000],
+                                    "title": str(page.get("title") or "")[:300],
+                                    "text": str(page.get("text") or "")[:7000],
+                                }
+                                for page in verified_page_records
+                                if page.get("url")
+                            ],
                         }
                     effective_tool_args = tool_args
                     if name == "propose_place":
@@ -4279,18 +5198,80 @@ def run_agent(
                             }
                         else:
                             projection_error = None
-                            if transient_input and discovery_mode:
+                            matching_proposal_pages = [
+                                page
+                                for page in verified_page_records
+                                if _page_supports_coordinate_evidence(
+                                    page,
+                                    coordinate_evidence,
+                                )
+                                and (
+                                    not transient_input
+                                    or not transient_taint.was_observed_transient(
+                                        page.get("url")
+                                    )
+                                )
+                            ]
+                            if not matching_proposal_pages:
+                                projection_error = {
+                                    "error": "proposal_source_target_not_verified",
+                                    "detail": (
+                                        "이번 실행에서 읽은 본문 중 제안 장소의 상호·지점·주소 또는 "
+                                        "좌표와 일치하는 페이지가 없습니다. 다른 장소 본문을 제안 근거로 "
+                                        "사용하지 말고 현재 지점의 상세 페이지를 확인하세요."
+                                    ),
+                                }
+                            elif transient_input and discovery_mode:
                                 canonical_args, projection_error = _canonical_transient_proposal_args(
                                     coordinate_evidence,
-                                    verified_page_records,
+                                    matching_proposal_pages,
                                     transient_taint,
+                                    client=client,
+                                    model=model,
+                                    city_name=f"{city.name_ko}({city.name_local})",
+                                    user_goal=(
+                                        active_mission.objective
+                                        if active_mission is not None
+                                        else _research_themes(city)
+                                    ),
+                                    target_role=_candidate_mission_role(active_mission),
                                 )
                                 if canonical_args is not None:
-                                    tool_args = canonical_args
+                                    canonical_role_error = _candidate_proposal_role_error(
+                                        "propose_place",
+                                        canonical_args,
+                                        active_mission,
+                                    )
+                                    if canonical_role_error is not None:
+                                        projection_error = canonical_role_error
+                                    else:
+                                        tool_args = canonical_args
                             if projection_error is not None:
                                 result = projection_error
                             else:
-                                tool_args = {**tool_args, "_coordinate_evidence": coordinate_evidence}
+                                matched_urls = sorted({
+                                    str(page.get("url") or "")
+                                    for page in matching_proposal_pages
+                                    if page.get("url")
+                                })
+                                # Only exact-POI pages reach the proposal
+                                # guard. A page fetched in this run is not
+                                # automatically evidence for every geocoded
+                                # candidate considered by the same model.
+                                tool_args = {
+                                    **tool_args,
+                                    "_coordinate_evidence": coordinate_evidence,
+                                    "_validated_source_urls": matched_urls,
+                                    "_validated_source_documents": [
+                                        {
+                                            "url": str(page.get("url") or "")[:1000],
+                                            "title": str(page.get("title") or "")[:300],
+                                            "text": str(page.get("text") or "")[:7000],
+                                        }
+                                        for page in matching_proposal_pages
+                                        if page.get("url")
+                                    ],
+                                }
                                 effective_tool_args = tool_args
                                 result = run_tool(db, name, tool_args, city_id=city_id)
                     else:
@@ -4306,7 +5287,9 @@ def run_agent(
                             ),
                             server_defer_commit=bool(
                                 active_mission is not None
-                                and active_mission.kind in {"data_integrity", CANDIDATE_DISCOVERY_KIND}
+                                and active_mission.kind in {
+                                    "data_integrity", CANDIDATE_DISCOVERY_KIND, *QUALITY_TASK_KINDS,
+                                }
                                 and name == "upsert_agent_task"
                             ),
                             server_allow_brave_places=(
@@ -4408,6 +5391,19 @@ def run_agent(
                         ).strip(),
                     }
                 error = isinstance(result, dict) and bool(result.get("error"))
+                scoped_quality_blocked = bool(
+                    scoped_quality_mode
+                    and active_mission is not None
+                    and primary_task is not None
+                    and name == "upsert_agent_task"
+                    and not error
+                    and isinstance(result, dict)
+                    and result.get("status_controlled_by_orchestrator") is True
+                    and result.get("task_id") == primary_task.id
+                    and str(projected_task_args.get("status") or "").strip().lower()
+                    == "blocked"
+                    and scoped_quality_block_refs
+                )
                 policy_guard_disposition = (
                     str(result.get("guard_disposition") or "")
                     if isinstance(result, dict)
@@ -4449,7 +5445,12 @@ def run_agent(
                         data_integrity_place_reads.add(data_integrity_get_place_id)
                 if not error:
                     successful_tool_counts[name] = successful_tool_counts.get(name, 0) + 1
-                material_change = _is_material_change(name, result)
+                # Recording an audited blocker changes task.result, but it is a
+                # terminal disposition rather than a place-quality improvement.
+                material_change = (
+                    _is_material_change(name, result)
+                    and not scoped_quality_blocked
+                )
                 # A follow-up fetch after transient provider exposure can help
                 # the live decision, but its model-selected URL/body must not
                 # flow into durable handoff state. Candidate-discovery terminal
@@ -4685,17 +5686,12 @@ def run_agent(
                         place_id=active_image_place_id,
                     )
                     if active_image_place_id is not None and image_attempt_count >= 3
-                    else {"all": [], "clean_empty": [], "provider_failure": [], "with_candidates": []}
+                    else {
+                        "all": [], "clean_empty": [], "provider_failure": [],
+                        "audit_uncertain": [], "with_candidates": [],
+                    }
                 )
-                image_terminal_disposition = None
-                if len(image_audit["all"]) >= 3 and not image_audit["with_candidates"]:
-                    if len(image_audit["clean_empty"]) == 3:
-                        image_terminal_disposition = "source_exhausted"
-                    elif image_audit["provider_failure"]:
-                        # One warning/error means the three-attempt sample did
-                        # not cleanly exhaust the source pool. Cool down instead
-                        # of making a durable source-exhausted claim.
-                        image_terminal_disposition = "blocked"
+                image_terminal_disposition = _image_terminal_disposition(image_audit)
                 image_budget_terminal = bool(
                     active_mission is not None
                     and active_mission.kind == "quality_images"
@@ -4707,13 +5703,74 @@ def run_agent(
                         PlaceImage.place_id == int(active_work_item.place_id)
                     ).first() is None
                 )
-                if material_change and not data_integrity_task_completed:
-                    if scoped_quality_mode:
-                        scoped_lane_terminal = True
+                if scoped_quality_blocked and not data_integrity_task_completed:
+                    blocked_item = active_work_item
+                    blocker = str(
+                        projected_task_args.get("result")
+                        or (primary_task.result if primary_task is not None else "")
+                        or "현재 대상의 감사 가능한 조사 경로가 차단됨"
+                    )
+                    active_work_item = rotate_blocked_work_item(
+                        db,
+                        mission=active_mission,
+                        current=blocked_item,
+                        run_id=agent_run.id,
+                        reason=blocker,
+                        commit=False,
+                        quality_disposition=(
+                            "blocked"
+                            if active_mission is not None
+                            and active_mission.kind == "quality_images"
+                            else None
+                        ),
+                        quality_gap_kinds=(
+                            ["image"]
+                            if active_mission is not None
+                            and active_mission.kind == "quality_images"
+                            else None
+                        ),
+                        quality_evidence_refs=scoped_quality_block_refs,
+                        quality_source_revision=(
+                            QUALITY_SOURCE_REVISIONS["image"]
+                            if active_mission is not None
+                            and active_mission.kind == "quality_images"
+                            else ""
+                        ),
+                    )
+                    next_work_item_id = (
+                        int(active_work_item.id) if active_work_item is not None else None
+                    )
+                    next_continuity = _mission_cursor_continuity(
+                        active_mission,
+                        active_work_item,
+                    )
+                    continuity = next_continuity or continuity
+                    scoped_lane_terminal = True
+                    scoped_terminal_reason = "audited_blocked"
+                    if processed_work_item_id is not None:
+                        agent_run.work_item_id = processed_work_item_id
+                elif material_change and not data_integrity_task_completed:
                     active_work_item = reconcile_work_items(db, mission=active_mission)
-                    if active_work_item is not None:
+                    if scoped_quality_mode:
+                        next_work_item_id = (
+                            int(active_work_item.id) if active_work_item is not None else None
+                        )
+                        next_continuity = _mission_cursor_continuity(
+                            active_mission,
+                            active_work_item,
+                        )
+                        continuity = next_continuity or continuity
+                        scoped_lane_terminal = True
+                        scoped_terminal_reason = "material_change"
+                        if processed_work_item_id is not None:
+                            agent_run.work_item_id = processed_work_item_id
+                    elif active_work_item is not None:
                         agent_run.work_item_id = active_work_item.id
-                        continuity = mission_context(active_mission, active_work_item) if active_mission else continuity
+                        continuity = (
+                            mission_context(active_mission, active_work_item)
+                            if active_mission
+                            else continuity
+                        )
                 elif zone_catalog_exhausted and not data_integrity_task_completed:
                     scoped_lane_terminal = True
                     previous_target = active_work_item.target_key
@@ -4737,8 +5794,18 @@ def run_agent(
                         quality_gap_kinds=["zone"],
                         quality_evidence_refs=zone_refs,
                     )
+                    next_work_item_id = (
+                        int(active_work_item.id) if active_work_item is not None else None
+                    )
+                    next_continuity = _mission_cursor_continuity(
+                        active_mission,
+                        active_work_item,
+                    )
+                    continuity = next_continuity or continuity
+                    scoped_terminal_reason = "zone_catalog_disposition"
+                    if processed_work_item_id is not None:
+                        agent_run.work_item_id = processed_work_item_id
                     if active_work_item is not None:
-                        agent_run.work_item_id = active_work_item.id
                         continuity["rotation"] = {
                             "from": previous_target,
                             "to": active_work_item.target_key,
@@ -4761,8 +5828,8 @@ def run_agent(
                         "현재 이미지 출처 집합을 소진한 것으로 기록합니다."
                         if terminal_disposition == "source_exhausted"
                         else (
-                            "세 번의 이미지 검색 표본 중 하나 이상에서 공급자 오류·경고가 발생해 "
-                            "24시간 냉각 후 재시도하도록 차단합니다."
+                            "세 번의 이미지 검색 표본 중 공급자 오류·경고 또는 정확한 장소로 확인할 수 "
+                            "없는 후보가 있어, 출처 소진으로 단정하지 않고 24시간 후 재감사합니다."
                         )
                         if terminal_disposition == "blocked"
                         else "이미지 결과를 서버가 분류하지 못해 차단했습니다."
@@ -4778,8 +5845,18 @@ def run_agent(
                         quality_evidence_refs=image_refs,
                         quality_source_revision=QUALITY_SOURCE_REVISIONS["image"],
                     )
+                    next_work_item_id = (
+                        int(active_work_item.id) if active_work_item is not None else None
+                    )
+                    next_continuity = _mission_cursor_continuity(
+                        active_mission,
+                        active_work_item,
+                    )
+                    continuity = next_continuity or continuity
+                    scoped_terminal_reason = "image_search_budget_disposition"
+                    if processed_work_item_id is not None:
+                        agent_run.work_item_id = processed_work_item_id
                     if active_work_item is not None:
-                        agent_run.work_item_id = active_work_item.id
                         research_actions_since_material = 0
                         no_progress_actions = 0
                         continuity["rotation"] = {
@@ -4793,6 +5870,8 @@ def run_agent(
                     active_work_item is not None
                     and len(continuity.get("failed_approaches") or []) >= 3
                 ):
+                    if scoped_quality_mode:
+                        scoped_lane_terminal = True
                     previous_target = active_work_item.target_key
                     active_work_item = rotate_blocked_work_item(
                         db,
@@ -4801,8 +5880,21 @@ def run_agent(
                         run_id=agent_run.id,
                         reason="서로 다른 조사 경로 3회가 실패하거나 차단됨",
                     )
+                    if scoped_quality_mode:
+                        next_work_item_id = (
+                            int(active_work_item.id) if active_work_item is not None else None
+                        )
+                        next_continuity = _mission_cursor_continuity(
+                            active_mission,
+                            active_work_item,
+                        )
+                        continuity = next_continuity or continuity
+                        scoped_terminal_reason = "failed_approaches_exhausted"
+                        if processed_work_item_id is not None:
+                            agent_run.work_item_id = processed_work_item_id
                     if active_work_item is not None:
-                        agent_run.work_item_id = active_work_item.id
+                        if not scoped_quality_mode:
+                            agent_run.work_item_id = active_work_item.id
                         research_actions_since_material = 0
                         no_progress_actions = 0
                         continuity["rotation"] = {
@@ -4833,6 +5925,41 @@ def run_agent(
                 )
                 if continuity:
                     continuity_updates.append(continuity)
+                if scoped_quality_mode and scoped_lane_terminal:
+                    # The system/user prompt is an immutable snapshot of one
+                    # exact place. Cursor rotation makes every later call in
+                    # this provider round stale, even when it was emitted in
+                    # parallel. A future run rebuilds the prompt and tool schema
+                    # from the durable next cursor.
+                    for skipped in tool_calls[tool_call_index + 1:]:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": skipped.id,
+                            "content": json.dumps({
+                                "error": "skipped_after_scoped_target_terminal",
+                                "detail": (
+                                    "현재 품질 대상이 실질 변경 또는 감사 가능한 차단으로 종결되어 "
+                                    "같은 프롬프트의 병렬 후속 호출을 실행하지 않았습니다. 다음 실행이 "
+                                    "운영 DB의 다음 커서로 새 프롬프트를 구성합니다."
+                                ),
+                                "processed_work_item_id": processed_work_item_id,
+                                "next_work_item_id": next_work_item_id,
+                            }, ensure_ascii=False),
+                        })
+                    mission_halted = True
+                    final_text = (
+                        "현재 품질 대상에 감사 가능한 차단 근거를 기록하고 냉각/다음 대상으로 넘겼습니다."
+                        if scoped_terminal_reason == "audited_blocked"
+                        else (
+                            "현재 품질 대상에서 첫 실질 변경을 저장했습니다. 다음 실행은 운영 DB를 "
+                            "재측정한 새 커서와 프롬프트로 이어집니다."
+                        )
+                        if scoped_terminal_reason == "material_change"
+                        else (
+                            "현재 품질 대상의 서버 측 종결 조건을 기록하고 다음 실행용 커서로 넘겼습니다."
+                        )
+                    )
+                    break
                 queue_drained = bool(queue_mode and count_unread(db, city_id) == 0)
                 if queue_drained:
                     # Queue and autonomous work are different runs. Once the
@@ -4938,6 +6065,16 @@ def run_agent(
                     run_id=agent_run.id,
                     reason=f"연속 {no_material_actions}개 행동에서 실제 DB 변화 없음",
                 )
+                if scoped_quality_mode:
+                    next_work_item_id = (
+                        int(active_work_item.id) if active_work_item is not None else None
+                    )
+                    next_continuity = _mission_cursor_continuity(
+                        active_mission,
+                        active_work_item,
+                    )
+                    if processed_work_item_id is not None:
+                        agent_run.work_item_id = processed_work_item_id
                 final_text = (
                     f"연속 {no_material_actions}개 행동이 실제 DB 변화로 이어지지 않아 안전 종료했습니다. "
                     "무성과 조사 8회부터 추가 조사를 막고 저장 여부 결정을 요구했으며, 확보한 근거와 "
@@ -4956,8 +6093,16 @@ def run_agent(
                     sequence=action_sequence,
                     reason=stall_reason,
                 )
-                if active_work_item is not None:
-                    agent_run.work_item_id = active_work_item.id
+                if scoped_quality_mode:
+                    next_work_item_id = (
+                        int(active_work_item.id) if active_work_item is not None else None
+                    )
+                    next_continuity = _mission_cursor_continuity(
+                        active_mission,
+                        active_work_item,
+                    )
+                    if processed_work_item_id is not None:
+                        agent_run.work_item_id = processed_work_item_id
                 final_text = (
                     f"연속 {no_progress_actions}개 행동에서 새 근거·데이터·정제가 생기지 않아 종료했습니다. "
                     "현재 대상은 차단 사유와 체크포인트를 남기고 회전했습니다."
@@ -4994,6 +6139,8 @@ def run_agent(
         try:
             failed_run = db.get(AgentRun, agent_run.id)
             if failed_run is not None:
+                if scoped_quality_mode and processed_work_item_id is not None:
+                    failed_run.work_item_id = processed_work_item_id
                 failed_run.status = failure_status
                 failed_run.summary = detail[:4000]
                 failed_run.score = current_score
@@ -5017,6 +6164,20 @@ def run_agent(
                         "model_recovery_history": model_recovery_history,
                         "terminal_model_failure_kind": (
                             terminal_model_failure_kind or _model_output_failure_kind(detail)
+                        ),
+                        "work_item_id": (
+                            processed_work_item_id
+                            if scoped_quality_mode
+                            else failed_run.work_item_id
+                        ),
+                        "next_work_item_id": next_work_item_id,
+                        "continuity": (
+                            next_continuity
+                            if scoped_quality_mode and next_continuity is not None
+                            else _mission_cursor_continuity(
+                                active_mission,
+                                active_work_item,
+                            )
                         ),
                     },
                     ensure_ascii=False,
@@ -5104,6 +6265,8 @@ def run_agent(
         started_at = run_row.started_at
         if started_at.tzinfo is None:
             started_at = started_at.replace(tzinfo=timezone.utc)
+        if scoped_quality_mode and processed_work_item_id is not None:
+            run_row.work_item_id = processed_work_item_id
         run_row.status = run_status
         run_row.score = current_score
         run_row.summary = summary[:4000]
@@ -5135,11 +6298,16 @@ def run_agent(
                 "quality_task_ids_after": quality_task_ids_after,
                 "primary_task_id": primary_task.id if primary_task is not None else None,
                 "mission_id": active_mission.id if active_mission is not None else None,
-                "work_item_id": active_work_item.id if active_work_item is not None else None,
+                "work_item_id": (
+                    processed_work_item_id
+                    if scoped_quality_mode
+                    else active_work_item.id if active_work_item is not None else None
+                ),
+                "next_work_item_id": next_work_item_id,
                 "continuity": (
-                    mission_context(active_mission, active_work_item)
-                    if active_mission is not None and active_work_item is not None
-                    else None
+                    next_continuity
+                    if scoped_quality_mode and next_continuity is not None
+                    else _mission_cursor_continuity(active_mission, active_work_item)
                 ),
                 "retrieved_knowledge_ids": [
                     item.get("id") for item in retrieved_knowledge.get("knowledge", [])
@@ -5155,7 +6323,14 @@ def run_agent(
             ensure_ascii=False,
         )
         db.commit()
-    if primary_task is not None and primary_task.status == "pending":
+    if (
+        primary_task is not None
+        and primary_task.status == "pending"
+        and not (
+            scoped_quality_mode
+            and scoped_terminal_reason == "audited_blocked"
+        )
+    ):
         primary_result = (
             f"실행 #{agent_run.id}: {run_status}, 점수 {current_score}, 실제 변경 {len(material_changes)}건, "
             f"새 근거 {len(evidence_keys)}건. 남은 공백: {', '.join(gaps) or '없음'}"

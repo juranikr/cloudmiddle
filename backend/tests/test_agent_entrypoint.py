@@ -65,12 +65,29 @@ class AgentEntrypointTests(unittest.TestCase):
     @patch("app.agent.__main__.boto3.client")
     def test_reports_partial_result_as_success(self, boto_client: Mock) -> None:
         client = boto_client.return_value
-        results = [{"city_id": 2, "status": "partial", "ok": False, "message": "more research remains"}]
+        results = [{
+            "city_id": 2,
+            "status": "partial",
+            "ok": False,
+            "message": "more research remains",
+            "unread_before": 4,
+            "unread_after": 1,
+            "performance": {"material_change_count": 2},
+            "remaining_gaps": ["one gap"],
+            "outcome": "already_running",
+        }]
 
         outcome = report_step_function_result("secret-task-token", results)
 
         self.assertEqual(outcome, "success")
-        self.assertEqual(client.send_task_success.call_args.kwargs["taskToken"], "secret-task-token")
+        kwargs = client.send_task_success.call_args.kwargs
+        self.assertEqual(kwargs["taskToken"], "secret-task-token")
+        city = json.loads(kwargs["output"])["cities"][0]
+        self.assertEqual(city["unread_before"], 4)
+        self.assertEqual(city["unread_after"], 1)
+        self.assertEqual(city["performance"]["material_change_count"], 2)
+        self.assertEqual(city["remaining_gaps"], ["one gap"])
+        self.assertEqual(city["outcome"], "already_running")
         client.send_task_failure.assert_not_called()
 
     @patch("app.agent.__main__.boto3.client")

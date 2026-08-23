@@ -1613,6 +1613,17 @@ textarea {
 .admin__runs small { color: var(--muted); }
 .admin__runs details { margin-top: 8px; }
 .admin__runs pre { white-space: pre-wrap; font: inherit; font-size: 0.8rem; }
+.admin__run-heading { align-items: center; }
+.run-outcome { max-width: 58%; padding: 4px 8px; border-radius: 999px; background: #f1f5f9; color: #475569; font-size: .7rem; font-weight: 850; text-align: center; }
+.run-outcome--traveler_visible_changed { background: #dcfce7; color: #166534; }
+.run-outcome--proposal_created { background: #dbeafe; color: #1d4ed8; }
+.run-outcome--verified_or_waived_no_change { background: #ecfeff; color: #0e7490; }
+.run-outcome--deferred_or_blocked { background: #fef3c7; color: #92400e; }
+.run-outcome--no_yield { background: #f1f5f9; color: #64748b; }
+.run-outcome--failed { background: #fee2e2; color: #991b1b; }
+.admin__run-outcome-summary { display: grid !important; grid-template-columns: auto minmax(0, 1fr); justify-content: stretch !important; align-items: start; gap: 6px 10px !important; margin-top: 10px; padding: 9px 10px; border: 1px solid #dbe5e3; border-radius: 9px; background: #f7faf9; }
+.admin__run-outcome-summary strong { color: var(--teal-deep); font-size: .76rem; }
+.admin__run-outcome-summary span { min-width: 0; color: #475569; font-size: .72rem; line-height: 1.45; overflow-wrap: anywhere; }
 .admin__run-delta { display: flex !important; flex-wrap: wrap; justify-content: flex-start !important; gap: 5px !important; margin-top: 9px; }
 .admin__run-delta span { padding: 3px 7px; border-radius: 999px; background: #dcfce7; color: #166534; font-size: .7rem; font-weight: 800; }
 .admin__run-delta .is-empty { background: #f1f5f9; color: #64748b; }

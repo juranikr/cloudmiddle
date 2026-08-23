@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -149,29 +150,304 @@ def admin_status(
 
 class AgentRunStatusOut(BaseModel):
     running: bool
+    city_id: Optional[int] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     result: Optional[AgentRunResponse] = None
+    execution_arn: Optional[str] = None
+    backend: str = "local"
+    outcome_category: Optional[str] = None
+    material_change_count: int = 0
+    next_work_item_id: Optional[int] = None
+    next_cursor: dict[str, Any] = Field(default_factory=dict)
 
 
-# 게이트웨이(≈60초) 타임아웃 회피: 실행은 백그라운드 스레드, 관리자 UI는 상태 폴링
-_agent_run_lock = threading.Lock()
+# Gateway timeout avoidance: production delegates to Step Functions and the UI
+# polls its status. Local development keeps the background-thread path.
+_agent_run_lock = threading.RLock()
 _agent_run_state: dict[str, Any] = {
     "running": False,
     "started_at": None,
     "finished_at": None,
     "result": None,
+    "execution_arn": None,
+    "backend": "local",
+    "city_id": None,
+    "city_ids": [],
 }
 
 
-def _agent_run_status() -> AgentRunStatusOut:
-    result = _agent_run_state["result"]
-    return AgentRunStatusOut(
-        running=bool(_agent_run_state["running"]),
-        started_at=_agent_run_state["started_at"],
-        finished_at=_agent_run_state["finished_at"],
-        result=AgentRunResponse(**result) if result else None,
+def _step_functions_client() -> Any:
+    # Lazy client creation means an unset local configuration never contacts
+    # AWS and can run with the existing SQLite/background-thread setup.
+    import boto3
+
+    return boto3.client("stepfunctions", region_name=settings.aws_region)
+
+
+class _AgentWorkflowBusy(RuntimeError):
+    """Another workflow is running but does not include the requested city."""
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _find_sfn_city_result(value: Any, city_id: int) -> Optional[dict[str, Any]]:
+    """Find the compact city result inside Map/callback output shapes."""
+
+    if isinstance(value, str):
+        try:
+            return _find_sfn_city_result(json.loads(value), city_id)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if isinstance(value, list):
+        for item in value:
+            found = _find_sfn_city_result(item, city_id)
+            if found is not None:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    cities = value.get("cities")
+    if isinstance(cities, list):
+        candidates = [item for item in cities if isinstance(item, dict)]
+        return next(
+            (item for item in candidates if _safe_int(item.get("city_id")) == city_id),
+            None,
+        )
+    if "status" in value and ("city_id" in value or "run_id" in value):
+        return value if _safe_int(value.get("city_id")) == city_id else None
+    for nested in value.values():
+        found = _find_sfn_city_result(nested, city_id)
+        if found is not None:
+            return found
+    return None
+
+
+def _sfn_result_response(
+    description: dict[str, Any],
+    *,
+    city_id: int,
+) -> AgentRunResponse:
+    execution_status = str(description.get("status") or "FAILED")
+    city_result = _find_sfn_city_result(
+        description.get("output") or description.get("cause"), city_id
     )
+    if city_result is not None:
+        run_id = _safe_int(city_result.get("run_id"))
+        return AgentRunResponse(
+            ok=bool(city_result.get("ok")),
+            status=str(city_result.get("status") or "failed"),
+            steps=max(0, _safe_int(city_result.get("steps"))),
+            message=str(city_result.get("message") or "")[:4000],
+            unread_before=max(0, _safe_int(city_result.get("unread_before"))),
+            unread_after=max(0, _safe_int(city_result.get("unread_after"))),
+            city_id=_safe_int(city_result.get("city_id"), city_id),
+            score=_safe_float(city_result.get("score")),
+            performance=(
+                city_result.get("performance")
+                if isinstance(city_result.get("performance"), dict)
+                else {}
+            ),
+            remaining_gaps=(
+                city_result.get("remaining_gaps")
+                if isinstance(city_result.get("remaining_gaps"), list)
+                else []
+            ),
+            run_id=run_id or None,
+            outcome=str(city_result.get("outcome") or "") or None,
+        )
+
+    error = str(description.get("error") or execution_status)
+    if execution_status == "SUCCEEDED":
+        message = (
+            f"Step Functions 실행은 끝났지만 요청 도시 #{city_id}의 결과가 없습니다. "
+            "해당 도시가 실행되지 않았거나 도시 처리 전에 중단되었는지 시스템 이력을 확인해 주세요."
+        )
+    else:
+        message = f"Step Functions 실행이 {execution_status.lower()} 상태로 종료되었습니다 ({error[:160]})."
+    return AgentRunResponse(
+        ok=False,
+        status="failed",
+        steps=0,
+        message=message,
+        unread_before=0,
+        unread_after=0,
+        city_id=city_id,
+    )
+
+
+def _sync_sfn_execution_locked(client: Any | None = None) -> None:
+    """Refresh the cached execution without ever starting a fallback run."""
+
+    execution_arn = _agent_run_state.get("execution_arn")
+    if not execution_arn or _agent_run_state.get("backend") != "step_functions":
+        return
+    if not _agent_run_state.get("running") and _agent_run_state.get("result") is not None:
+        return
+    try:
+        description = (client or _step_functions_client()).describe_execution(
+            executionArn=execution_arn
+        )
+    except Exception:
+        # A status-call/network failure is ambiguous. Preserve the active ARN
+        # so a later poll can retry; never launch a duplicate local execution.
+        return
+
+    _agent_run_state["started_at"] = description.get("startDate") or _agent_run_state.get(
+        "started_at"
+    )
+    execution_cities = sorted(_execution_city_ids(description))
+    if execution_cities:
+        _agent_run_state["city_ids"] = execution_cities
+    if description.get("status") == "RUNNING":
+        _agent_run_state["running"] = True
+        return
+
+    city_id = int(_agent_run_state.get("city_id") or 1)
+    _agent_run_state.update(
+        {
+            "running": False,
+            "finished_at": description.get("stopDate") or datetime.now(timezone.utc),
+            "result": _sfn_result_response(description, city_id=city_id).model_dump(),
+        }
+    )
+
+
+def _execution_city_ids(description: dict[str, Any]) -> set[int]:
+    try:
+        payload = json.loads(str(description.get("input") or "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(payload, dict) or not isinstance(payload.get("city_ids"), list):
+        return set()
+    return {
+        parsed
+        for value in payload["city_ids"]
+        if (parsed := _safe_int(value)) > 0
+    }
+
+
+def _adopt_running_sfn_execution_locked(
+    client: Any,
+    *,
+    city_id: Optional[int] = None,
+) -> bool:
+    """Recover an in-flight workflow after an API restart or rolling deploy.
+
+    The old in-memory guard disappeared whenever ECS replaced the API task.
+    Querying Step Functions before every start also lets a manual request join
+    the scheduled all-city workflow instead of running the same city twice.
+    """
+
+    response = client.list_executions(
+        stateMachineArn=settings.agent_state_machine_arn.strip(),
+        statusFilter="RUNNING",
+        maxResults=20,
+    )
+    if not isinstance(response, dict):
+        raise RuntimeError("Step Functions returned an invalid execution list")
+    running = [
+        item for item in response.get("executions") or []
+        if isinstance(item, dict) and str(item.get("executionArn") or "").strip()
+    ]
+    unrelated_running = False
+    for item in running:
+        execution_arn = str(item["executionArn"]).strip()
+        description = client.describe_execution(executionArn=execution_arn)
+        if not isinstance(description, dict) or description.get("status") != "RUNNING":
+            continue
+        execution_cities = _execution_city_ids(description)
+        if city_id is not None and city_id not in execution_cities:
+            unrelated_running = True
+            continue
+        selected_city_id = city_id or min(execution_cities or {1})
+        _agent_run_state.update(
+            {
+                "running": True,
+                "started_at": description.get("startDate") or item.get("startDate") or datetime.now(timezone.utc),
+                "finished_at": None,
+                "result": None,
+                "execution_arn": execution_arn,
+                "backend": "step_functions",
+                "city_id": selected_city_id,
+                "city_ids": sorted(execution_cities or {selected_city_id}),
+            }
+        )
+        return True
+    if unrelated_running:
+        raise _AgentWorkflowBusy(
+            "다른 도시 에이전트 워크플로가 실행 중입니다. 종료 후 다시 시도해 주세요."
+        )
+    return False
+
+
+def _agent_run_status(
+    *,
+    refresh: bool = True,
+    city_id: Optional[int] = None,
+) -> AgentRunStatusOut:
+    with _agent_run_lock:
+        if refresh:
+            if settings.agent_state_machine_arn:
+                client = _step_functions_client()
+                try:
+                    # The API task can be replaced while a Fargate agent keeps
+                    # running. Rebuild the lost in-memory pointer from SFN so a
+                    # GET poll alone is sufficient after a rolling restart.
+                    if not _agent_run_state.get("running"):
+                        _adopt_running_sfn_execution_locked(client, city_id=city_id)
+                    if (
+                        city_id is not None
+                        and city_id in set(_agent_run_state.get("city_ids") or [])
+                    ):
+                        _agent_run_state["city_id"] = city_id
+                    _sync_sfn_execution_locked(client)
+                except _AgentWorkflowBusy:
+                    # Status is global for backward compatibility. If another
+                    # city is active, keep reporting that real execution rather
+                    # than manufacturing an idle result for the selected city.
+                    try:
+                        _adopt_running_sfn_execution_locked(client)
+                        _sync_sfn_execution_locked(client)
+                    except Exception:
+                        pass
+                except Exception:
+                    # A read failure is ambiguous. Preserve the last known ARN
+                    # and let the next poll retry without starting anything.
+                    pass
+            else:
+                _sync_sfn_execution_locked()
+        result = _agent_run_state["result"]
+        reporting: dict[str, Any] = {}
+        if isinstance(result, dict):
+            run_id = _safe_int(result.get("run_id"))
+            reporting = _load_agent_run_reporting(run_id) if run_id > 0 else {}
+            reporting = reporting or _agent_run_reporting(
+                status=str(result.get("status") or "failed"),
+                metrics={"outcome": result.get("outcome")},
+            )
+        return AgentRunStatusOut(
+            running=bool(_agent_run_state["running"]),
+            city_id=_safe_int(_agent_run_state.get("city_id")) or None,
+            started_at=_agent_run_state["started_at"],
+            finished_at=_agent_run_state["finished_at"],
+            result=AgentRunResponse(**result) if result else None,
+            execution_arn=_agent_run_state.get("execution_arn"),
+            backend=str(_agent_run_state.get("backend") or "local"),
+            **reporting,
+        )
 
 
 class AgentRunRequest(BaseModel):
@@ -191,6 +467,10 @@ class AgentRunHistoryOut(BaseModel):
     step_count: int
     started_at: datetime
     finished_at: Optional[datetime] = None
+    outcome_category: str = "no_yield"
+    material_change_count: int = 0
+    next_work_item_id: Optional[int] = None
+    next_cursor: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentRunStepOut(BaseModel):
@@ -201,6 +481,196 @@ class AgentRunStepOut(BaseModel):
     score_delta: float
     detail: dict[str, Any]
     created_at: datetime
+
+
+_TRAVELER_VISIBLE_CHANGE_TOOLS = frozenset({
+    "create_place",
+    "merge_places",
+    "undo_merge",
+    "update_place_fields",
+    "update_place_context",
+    "upsert_place_insights",
+    "verify_place",
+    "attach_image_from_url",
+    "assign_place_zone",
+    "assign_place_chain",
+})
+_AUDITED_NO_CHANGE_DISPOSITIONS = frozenset({"waived", "source_exhausted", "resolved"})
+
+
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    parsed = _safe_int(value)
+    return parsed if parsed > 0 else None
+
+
+def _agent_next_cursor(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Expose the durable future cursor without leaking the whole checkpoint."""
+
+    continuity = metrics.get("continuity")
+    if not isinstance(continuity, dict):
+        continuity = {}
+    progress = continuity.get("progress")
+    if not isinstance(progress, dict):
+        progress = {}
+    target = continuity.get("target")
+    if not isinstance(target, dict):
+        target = {}
+    next_action = continuity.get("next_action")
+    if not isinstance(next_action, dict) or not next_action:
+        next_action = progress.get("next_action")
+    if not isinstance(next_action, dict):
+        next_action = {}
+
+    cursor_status = str(continuity.get("status") or "")[:40]
+    explicit_next_id = _positive_int_or_none(metrics.get("next_work_item_id"))
+    resume_work_item_id = _positive_int_or_none(progress.get("resume_work_item_id"))
+    continuity_work_item_id = (
+        _positive_int_or_none(continuity.get("work_item_id"))
+        if cursor_status in {"active", "ready", "blocked", "paused"}
+        else None
+    )
+    work_item_id = (
+        explicit_next_id
+        or resume_work_item_id
+        or continuity_work_item_id
+    )
+    wait_reason = str(
+        continuity.get("retry_condition")
+        or progress.get("retry_condition")
+        or metrics.get("deferred_reason")
+        or ""
+    )[:500]
+    if (
+        cursor_status in {"done", "completed", "cancelled"}
+        and work_item_id is None
+        and not wait_reason
+    ):
+        return {}
+    cursor = {
+        "mission_id": _positive_int_or_none(continuity.get("mission_id")),
+        "work_item_id": work_item_id,
+        "target": str(target.get("title") or target.get("key") or "")[:240],
+        "stage": str(continuity.get("stage") or "")[:40],
+        "status": cursor_status,
+        "next_tool": str(next_action.get("tool") or "")[:80],
+        "wait_reason": wait_reason,
+    }
+    return {
+        key: value
+        for key, value in cursor.items()
+        if value not in (None, "")
+    }
+
+
+def _agent_run_reporting(*, status: str, metrics: dict[str, Any]) -> dict[str, Any]:
+    """Classify the persisted outcome separately from process completion.
+
+    A green ``completed`` process state only says the worker exited normally.
+    This report tells an operator whether that execution changed a traveler-
+    visible record, created an approval proposal, proved that no change was
+    appropriate, deferred a cursor, or produced no useful result.
+    """
+
+    if not isinstance(metrics, dict):
+        metrics = {}
+    raw_changes = metrics.get("material_changes")
+    changes = [
+        item for item in raw_changes
+        if isinstance(item, dict)
+    ] if isinstance(raw_changes, list) else []
+    reported_count = _safe_int(metrics.get("material_change_count"), len(changes))
+    material_change_count = max(len(changes), reported_count, 0)
+    delta = metrics.get("delta")
+    if not isinstance(delta, dict):
+        delta = {}
+
+    proposal_created = bool(
+        _safe_int(delta.get("proposals")) > 0
+        or any(
+            item.get("proposal_id") is not None
+            or str(item.get("tool") or "") == "propose_place"
+            for item in changes
+        )
+    )
+    traveler_visible_changed = any(
+        str(item.get("tool") or "") in _TRAVELER_VISIBLE_CHANGE_TOOLS
+        and item.get("proposal_id") is None
+        for item in changes
+    )
+
+    continuity = metrics.get("continuity")
+    if not isinstance(continuity, dict):
+        continuity = {}
+    progress = continuity.get("progress")
+    if not isinstance(progress, dict):
+        progress = {}
+    dispositions = progress.get("quality_dispositions")
+    disposition_statuses = {
+        str(item.get("status") or "")
+        for item in dispositions
+        if isinstance(item, dict)
+    } if isinstance(dispositions, list) else set()
+    deferred_or_blocked = bool(
+        metrics.get("outcome") in {"deferred", "already_running"}
+        or metrics.get("lane") == "discovery_deferred"
+        or str(continuity.get("status") or "") in {"paused", "blocked"}
+        or bool(continuity.get("blocked_reason"))
+        or "blocked" in disposition_statuses
+        or _safe_int(metrics.get("no_progress_actions")) > 0
+    )
+    audited_no_change = bool(
+        disposition_statuses & _AUDITED_NO_CHANGE_DISPOSITIONS
+        or metrics.get("lane") == "integrity_repair"
+        or metrics.get("outcome") in {"verified", "waived"}
+        or (
+            _safe_int(delta.get("completed_tasks")) > 0
+            and material_change_count == 0
+            and metrics.get("lane") in {"quality_or_backlog", "data_integrity"}
+        )
+        or (
+            _safe_int((metrics.get("successful_tool_counts") or {}).get("verify_place")) > 0
+            if isinstance(metrics.get("successful_tool_counts"), dict)
+            else False
+        )
+    )
+
+    normalized_status = str(status or "").lower()
+    if normalized_status == "failed":
+        outcome_category = "failed"
+    elif traveler_visible_changed:
+        outcome_category = "traveler_visible_changed"
+    elif proposal_created:
+        outcome_category = "proposal_created"
+    elif audited_no_change:
+        outcome_category = "verified_or_waived_no_change"
+    elif deferred_or_blocked:
+        outcome_category = "deferred_or_blocked"
+    else:
+        outcome_category = "no_yield"
+
+    next_cursor = _agent_next_cursor(metrics)
+    return {
+        "outcome_category": outcome_category,
+        "material_change_count": material_change_count,
+        "next_work_item_id": _positive_int_or_none(next_cursor.get("work_item_id")),
+        "next_cursor": next_cursor,
+    }
+
+
+def _load_agent_run_reporting(run_id: int) -> dict[str, Any]:
+    """Read the final report from the run row after a local/SFN execution."""
+
+    db = SessionLocal()
+    try:
+        row = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+        if row is None:
+            return {}
+        return _agent_run_reporting(status=row.status, metrics=_json_dict(row.metrics))
+    except Exception:
+        # Reporting must never turn a completed agent call into a status error.
+        return {}
+    finally:
+        db.close()
 
 
 def _agent_discovery_funnel(steps: list[AgentRunStep]) -> dict[str, int]:
@@ -324,9 +794,60 @@ def _run_agent_background(city_id: int, research: bool) -> None:
         }
     finally:
         db.close()
-    _agent_run_state["result"] = result
-    _agent_run_state["finished_at"] = datetime.now(timezone.utc)
-    _agent_run_state["running"] = False
+    with _agent_run_lock:
+        _agent_run_state["result"] = result
+        _agent_run_state["finished_at"] = datetime.now(timezone.utc)
+        _agent_run_state["running"] = False
+
+
+def _start_sfn_execution_locked(city_id: int, *, research: bool) -> None:
+    now = datetime.now(timezone.utc)
+    execution_name = f"admin-{city_id}-{now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:12]}"
+    try:
+        client = _step_functions_client()
+        if _adopt_running_sfn_execution_locked(client, city_id=city_id):
+            return
+        response = client.start_execution(
+            stateMachineArn=settings.agent_state_machine_arn.strip(),
+            name=execution_name,
+            input=json.dumps(
+                {"city_ids": [city_id], "autonomous_research": bool(research)},
+                separators=(",", ":"),
+            ),
+        )
+        execution_arn = str(response.get("executionArn") or "").strip()
+        if not execution_arn:
+            raise RuntimeError("Step Functions returned no execution ARN")
+    except Exception:
+        # A failed AWS request can be ambiguous (the workflow may have accepted
+        # it before the connection broke). Never start the in-process fallback
+        # here, because that could run the same city twice.
+        _agent_run_state.update(
+            {
+                "running": False,
+                "started_at": now,
+                "finished_at": datetime.now(timezone.utc),
+                "result": None,
+                "execution_arn": None,
+                "backend": "step_functions",
+                "city_id": city_id,
+                "city_ids": [city_id],
+            }
+        )
+        raise
+
+    _agent_run_state.update(
+        {
+            "running": True,
+            "started_at": response.get("startDate") or now,
+            "finished_at": None,
+            "result": None,
+            "execution_arn": execution_arn,
+            "backend": "step_functions",
+            "city_id": city_id,
+            "city_ids": [city_id],
+        }
+    )
 
 
 @router.post("/agent/run", response_model=AgentRunStatusOut)
@@ -339,6 +860,34 @@ def admin_run_agent(
     if db.query(City.id).filter(City.id == body.city_id, City.status == "active").first() is None:
         raise HTTPException(status_code=404, detail="도시를 찾을 수 없습니다")
     with _agent_run_lock:
+        if settings.agent_state_machine_arn:
+            _sync_sfn_execution_locked()
+        if _agent_run_state["running"]:
+            running_cities = set(_agent_run_state.get("city_ids") or [])
+            cached_city_id = _safe_int(_agent_run_state.get("city_id"))
+            if not running_cities and cached_city_id > 0:
+                running_cities.add(cached_city_id)
+            if running_cities and body.city_id not in running_cities:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"도시 #{sorted(running_cities)[0]} 에이전트가 이미 실행 중입니다. "
+                        "종료 후 다시 시도해 주세요."
+                    ),
+                )
+        if settings.agent_state_machine_arn:
+            if not _agent_run_state["running"]:
+                try:
+                    _start_sfn_execution_locked(body.city_id, research=body.research)
+                except _AgentWorkflowBusy as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="에이전트 워크플로를 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                    ) from exc
+            return _agent_run_status(refresh=False)
+
         if not _agent_run_state["running"]:
             _agent_run_state.update(
                 {
@@ -346,6 +895,10 @@ def admin_run_agent(
                     "started_at": datetime.now(timezone.utc),
                     "finished_at": None,
                     "result": None,
+                    "execution_arn": None,
+                    "backend": "local",
+                    "city_id": body.city_id,
+                    "city_ids": [body.city_id],
                 }
             )
             threading.Thread(
@@ -353,15 +906,16 @@ def admin_run_agent(
                 args=(body.city_id, body.research),
                 daemon=True,
             ).start()
-    return _agent_run_status()
+    return _agent_run_status(refresh=False)
 
 
 @router.get("/agent/run/status", response_model=AgentRunStatusOut)
 def admin_agent_run_status(
+    city_id: Optional[int] = None,
     admin: User = Depends(get_admin_user),
 ) -> AgentRunStatusOut:
     _ = admin
-    return _agent_run_status()
+    return _agent_run_status(city_id=city_id)
 
 
 @router.get("/agent/runs", response_model=list[AgentRunHistoryOut])
@@ -385,10 +939,12 @@ def admin_agent_runs(
         if not isinstance(metrics, dict):
             metrics = {}
         metrics["discovery_funnel"] = _agent_discovery_funnel(list(row.steps or []))
+        reporting = _agent_run_reporting(status=row.status, metrics=metrics)
         output.append(AgentRunHistoryOut(
             id=row.id, city_id=row.city_id, mode=row.mode, status=row.status,
             objective=row.objective, score=row.score, metrics=metrics, summary=row.summary,
             step_count=len(row.steps or []), started_at=row.started_at, finished_at=row.finished_at,
+            **reporting,
         ))
     return output
 

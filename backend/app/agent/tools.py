@@ -35,7 +35,7 @@ from app.geocode import parse_viewbox, search_address
 from app.gcj02 import gcj02_to_wgs84
 from app.knowledge import list_knowledge, upsert_knowledge
 from app.place_identity import PlaceIdentityInput, same_place_candidate
-from app.place_integrity import assess_new_place
+from app.place_integrity import assess_new_place, is_specific_korean_place_name
 from app.search_providers import (
     SearchProviderProfile,
     build_search_provider_profile,
@@ -223,6 +223,88 @@ def _insight_fact_tokens(value: str) -> set[str]:
         re.sub(r"\s+", "", token)
         for token in re.findall(r"(?:\+?\d[\d\s-]{6,}\d)", folded)
     }
+
+
+_INSIGHT_PLACEHOLDER_RE = re.compile(
+    r"(?:x{3,}|[?？]{3,}|(?:전화|연락처|phone|tel)\s*[:：]?\s*"
+    r"(?:미상|없음|확인\s*필요|unknown|n/?a)|待确认|尚未确认|정보\s*없음)",
+    re.IGNORECASE,
+)
+
+
+def _insight_claim_anchors(value: str) -> set[str]:
+    """Extract precise facts that must literally occur in the cited page.
+
+    Narrative translation cannot be compared word-for-word across languages,
+    but phone numbers, coordinates, hours, prices, street/building locations,
+    and local proper-place strings must not be invented or copied from a search
+    snippet.  These anchors provide a deterministic lower bound without asking
+    another model to judge its own claim.
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    patterns = (
+        r"(?:\+?86[\s-]?)?(?:0\d{2,3}[\s-]?)?\d{7,8}",
+        r"(?<!\d)(?:[01]?\d|2[0-3])\s*(?::|시)\s*[0-5]?\d?(?!\d)",
+        r"(?<!\d)\d+(?:\.\d+)?\s*(?:元|위안|CNY|RMB|¥)(?!\w)",
+        r"(?<!\d)-?\d{2,3}\.\d{4,}(?!\d)",
+        r"[0-9A-Za-z\u3400-\u9fff]{2,45}(?:大街|大道|路|街|巷|道|号|號|"
+        r"馆|館|楼|樓|层|層|座|门|門|店|寺)[0-9A-Za-z\u3400-\u9fff]{0,18}",
+        # Korean place-name transliterations cannot be compared literally with
+        # Chinese source text. Extract only language-independent structural
+        # claims here; exact place/branch identity is enforced separately by
+        # _source_supports_claim_in_place_context and _source_mentions_place.
+        r"(?<![A-Za-z])(?:[A-Za-z]\s*관)(?![가-힣A-Za-z])",
+        r"(?<!\d)\d{1,3}\s*(?:층|호)(?![가-힣\d])",
+    )
+    anchors: set[str] = set()
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            compact = _compact_insight_evidence(match)
+            if len(compact) >= 3:
+                anchors.add(compact)
+    return anchors
+
+
+def _compact_insight_evidence(value: str) -> str:
+    """Normalize Korean structural suffixes only when their role is unambiguous."""
+
+    compact = _compact_subject(value)
+    compact = re.sub(r"(?<=[a-z])관", "馆", compact)
+    compact = re.sub(r"(?<=\d)[층楼層层]", "层", compact)
+    compact = re.sub(r"(?<=\d)호", "号", compact)
+    return compact
+
+
+def _validated_source_documents(args: dict[str, Any]) -> dict[str, str]:
+    """Return runner-owned fetched bodies keyed by normalized evidence URL."""
+
+    return {
+        url: str(record.get("blob") or "")
+        for url, record in _validated_source_document_records(args).items()
+    }
+
+
+def _validated_source_document_records(
+    args: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Return fetched title/body separately so model metadata cannot spoof identity."""
+
+    documents: dict[str, dict[str, str]] = {}
+    for raw in args.get("_validated_source_documents") or []:
+        if not isinstance(raw, dict):
+            continue
+        url = _normalize_evidence_url(str(raw.get("url") or ""))
+        if not url:
+            continue
+        title = str(raw.get("title") or "").strip()[:300]
+        text = str(raw.get("text") or "").strip()[:12_000]
+        documents[url] = {
+            "title": title,
+            "text": text,
+            "blob": f"{title} {text}"[:12_000],
+        }
+    return documents
 
 
 def _search_relevance_groups(
@@ -1095,6 +1177,33 @@ _propose_place_tool["function"]["description"] = (
     "준비되면 반드시 이 도구를 호출한다. "
     + _propose_place_tool["function"]["description"]
 )
+_proposal_parameters = _propose_place_tool["function"]["parameters"]
+_proposal_properties = _proposal_parameters["properties"]
+# ``propose_place`` has a deliberately stricter runtime contract than the
+# legacy direct-create tool. Advertising optional/null here caused valid model
+# JSON to reach the handler with ``description=None`` or no role, then fail a
+# deterministic guard and burn the rest of the batch correcting its schema.
+_proposal_properties["description"] = {
+    "type": "string",
+    "minLength": 60,
+    "description": "여행 선택 이유와 위치 맥락을 담은 한국어 본문(최소 60자) + 중국어 주소",
+}
+_proposal_properties["travel_role"] = {
+    "type": "string",
+    "enum": [
+        "history", "food", "market_night", "neighborhood", "nature",
+        "shopping", "rest", "practical", "general",
+    ],
+    "description": "현재 후보가 실제로 수행하는 여행 역할",
+}
+_proposal_properties["source_urls"]["minItems"] = 1
+_proposal_parameters["required"] = list(dict.fromkeys([
+    *_proposal_parameters.get("required", []),
+    "description",
+    "travel_role",
+    "evidence",
+    "confidence",
+]))
 TOOLS.append(_propose_place_tool)
 
 
@@ -1199,6 +1308,19 @@ def _candidate_title_key(value: str) -> str:
     return re.sub(r"[^\w]+", "", local_name, flags=re.UNICODE).casefold()
 
 
+_LARGE_PUBLIC_FEATURE_RE = re.compile(
+    r"(?:大街|大道|公园|公園|广场|廣場|景区|景區|风景区|風景區|"
+    r"博物馆|博物館|纪念馆|紀念館|火车站|火車站|客运站|客運站|"
+    r"地铁站|地鐵站|机场|機場|码头|碼頭|城墙|城牆|河|湖|山|路|街)$"
+)
+
+
+def _is_large_public_feature_title(value: str) -> bool:
+    """Identify linear/area features whose map pin is only representative."""
+
+    return bool(_LARGE_PUBLIC_FEATURE_RE.search(_candidate_title_key(value)))
+
+
 def _matching_existing_place(
     db: Session,
     *,
@@ -1209,6 +1331,7 @@ def _matching_existing_place(
     chain_name: str = "",
     branch_name: str = "",
     address: str = "",
+    category: str = "",
     max_distance_m: float = 800.0,
 ) -> Optional[Marker]:
     city = db.get(City, city_id)
@@ -1243,6 +1366,24 @@ def _matching_existing_place(
             ),
         )
         if decision.same and (decision.distance_m is None or decision.distance_m <= max_distance_m):
+            return row
+        # A road, park, station complex, or other large public feature can have
+        # multiple equally valid representative points.  Branch-aware business
+        # identity intentionally needs close coordinates, but applying its 80 m
+        # fallback to an exact-name public feature created duplicate streets in
+        # production.  Keep this exception narrow: exact normalized local name,
+        # no explicit branch on either side, a non-business category, and at
+        # most 1.5 km between representative points.
+        same_large_feature = bool(
+            category in {"tourist", "transport", "other"}
+            and _is_large_public_feature_title(title)
+            and not branch_name.strip()
+            and not (row.branch_name or "").strip()
+            and _candidate_title_key(row.title) == _candidate_title_key(title)
+            and decision.distance_m is not None
+            and decision.distance_m <= 1_500
+        )
+        if same_large_feature:
             return row
     return None
 
@@ -1323,6 +1464,7 @@ def _pending_proposal(
             chain_name=str(payload.get("chain_name_local") or ""),
             branch_name=str(payload.get("branch_name") or ""),
             address=str(payload.get("address") or payload.get("description") or ""),
+            category=str(payload.get("category") or ""),
         )
     except (KeyError, TypeError, ValueError):
         existing_place = None
@@ -1385,7 +1527,8 @@ def _pending_proposal(
             )
             same_large_feature = False
             if (
-                str(payload.get("category") or "") in {"tourist", "transport"}
+                str(payload.get("category") or "") in {"tourist", "transport", "other"}
+                and _is_large_public_feature_title(title)
                 and _candidate_title_key(candidate.title) == _candidate_title_key(title)
             ):
                 try:
@@ -1443,6 +1586,16 @@ def _has_hangul(s: str) -> bool:
     return any("\uac00" <= ch <= "\ud7a3" for ch in s)
 
 
+def _has_specific_korean_place_name(title: str) -> bool:
+    """Reject display labels that pretend to be a Korean place name."""
+
+    groups = re.findall(r"[（(]([^）)]*)[）)]", str(title or ""))
+    if not groups:
+        return False
+    korean = groups[-1].strip()
+    return is_specific_korean_place_name(korean)
+
+
 def _compact_subject(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value or "").translate(str.maketrans({
         "瀋": "沈",
@@ -1494,8 +1647,41 @@ def _address_subjects(*values: Any) -> set[str]:
     return out
 
 
+def _coordinate_identity_aliases(value: Any) -> list[str]:
+    """Return exact Latin-script POI aliases retained by the server.
+
+    ``coordinate_query`` often contains the official English/transliterated
+    name used to resolve a Chinese POI.  Wikimedia and Openverse may use that
+    name while our display title is Chinese/Korean.  Treat only the complete,
+    sufficiently specific query as an alias: loose token overlap would turn a
+    generic cityscape into a match again.
+    """
+
+    raw = " ".join(
+        unicodedata.normalize("NFKC", urllib.parse.unquote(str(value or ""))).split()
+    ).strip()
+    if not raw:
+        return []
+    latin_words = re.findall(r"[A-Za-z][A-Za-z'’-]*", raw)
+    if len(latin_words) < 3:
+        return []
+    latin_characters = sum(len(word) for word in latin_words)
+    alphanumeric_characters = sum(character.isalnum() for character in raw)
+    if not alphanumeric_characters or latin_characters / alphanumeric_characters < 0.7:
+        return []
+    intent_words = {
+        "best", "top", "near", "nearby", "photo", "photos", "image", "images",
+        "picture", "pictures", "guide", "travel", "tourist", "attraction",
+        "attractions", "things", "recommendation", "recommendations",
+    }
+    if any(word.casefold() in intent_words for word in latin_words):
+        return []
+    compact = _compact_subject(raw)
+    return [compact] if len(compact) >= 12 else []
+
+
 def _source_mentions_place(marker: Marker, *values: Any) -> bool:
-    """Require exact-place evidence for branch facts and attached images."""
+    """Require exact-place evidence for branch facts and source records."""
 
     aliases = _title_subjects(marker.title)
     branch = _compact_subject(marker.branch_name or "")
@@ -1522,6 +1708,105 @@ def _source_mentions_place(marker: Marker, *values: Any) -> bool:
         for expected in expected_addresses
         for source in source_addresses
     )
+
+
+def _image_source_mentions_place(marker: Marker, *values: Any) -> bool:
+    """Apply one exact identity gate to image discovery and attachment.
+
+    The coordinate alias is image-specific: it should not loosen the stronger
+    branch/source binding used for textual facts and place mutations.
+    """
+
+    if _source_mentions_place(marker, *values):
+        return True
+    haystack = _compact_subject(
+        " ".join(urllib.parse.unquote(str(value or "")) for value in values)
+    )
+    return bool(haystack) and any(
+        alias in haystack
+        for alias in _coordinate_identity_aliases(marker.coordinate_query)
+    )
+
+
+def _source_supports_claim_in_place_context(
+    marker: Marker,
+    content: str,
+    source_record: dict[str, str],
+) -> bool:
+    """Tie precise claim anchors to the cited place, not any number on the page.
+
+    Pages for chains and malls often list several branches. Merely finding the
+    target in the title and the same opening hour somewhere in a long body is
+    not enough. Each precise anchor must occur close to the strongest available
+    place identity token in the server-fetched title/body.
+    """
+
+    anchors = _insight_claim_anchors(content)
+    if not anchors:
+        return True
+    source_values = (
+        source_record.get("title"),
+        source_record.get("text"),
+    )
+    source_blob = _compact_insight_evidence(str(source_record.get("blob") or ""))
+    if not source_blob:
+        return False
+    branch = _compact_subject(marker.branch_name or "")
+    aliases = _title_subjects(marker.title)
+    subjects = aliases
+    if len(branch) >= 4:
+        if branch in source_blob:
+            subjects = [branch]
+        else:
+            # Some hotel/booking pages omit our internal branch label but carry
+            # the exact official property name and full street-number address.
+            # Mirror _source_mentions_place's stronger fallback and use the
+            # matched address as the context pivot; a brand-only page still
+            # cannot pass.
+            expected_addresses = _address_subjects(
+                marker.coordinate_query,
+                marker.description,
+            )
+            source_addresses = _address_subjects(*source_values)
+            matched_addresses = {
+                source
+                for expected in expected_addresses
+                for source in source_addresses
+                if min(len(expected), len(source)) >= 6
+                and (expected in source or source in expected)
+            }
+            present_aliases = [alias for alias in aliases if alias in source_blob]
+            if not matched_addresses or not present_aliases:
+                return False
+            # The alias is an identity precondition; the exact address is the
+            # stronger pivot that prevents a number near a generic page title
+            # from borrowing evidence from another branch farther down.
+            subjects = sorted(matched_addresses)
+    subject_positions: list[int] = []
+    for subject in subjects:
+        start = 0
+        while True:
+            position = source_blob.find(subject, start)
+            if position < 0:
+                break
+            subject_positions.append(position)
+            start = position + 1
+    if not subject_positions:
+        return False
+    for anchor in anchors:
+        start = 0
+        nearby = False
+        while True:
+            position = source_blob.find(anchor, start)
+            if position < 0:
+                break
+            if any(abs(position - subject_position) <= 1_200 for subject_position in subject_positions):
+                nearby = True
+                break
+            start = position + 1
+        if not nearby:
+            return False
+    return True
 
 
 def _has_cjk(s: str) -> bool:
@@ -1905,6 +2190,22 @@ def _image_relevance(item: dict[str, Any], query: str) -> float:
     if re.search(r"logo|icon|map|地图|portrait|person|旗|徽|seal|diagram", haystack):
         score -= 36
     return round(score, 1)
+
+
+def _image_candidate_matches_place(marker: Marker, item: dict[str, Any]) -> bool:
+    """Do not expose a nearby/city image as though it depicted the POI.
+
+    Provider ranking is useful only after subject identity is established.  A
+    generic Shenyang cityscape used to count as a usable candidate and kept an
+    image-quality mission looping even though ``attach_image_from_url`` would
+    correctly reject it later.
+    """
+
+    return _image_source_mentions_place(
+        marker,
+        item.get("title"),
+        item.get("page_url"),
+    )
 
 
 def run_tool(
@@ -2427,6 +2728,33 @@ def run_tool(
             transaction_lock(db, f"approved-place-create:{city_id}")
         title = str(args.get("title") or "추천 장소")[:200]
         desc = str(args.get("description") or "")[:2000]
+        if name == "propose_place":
+            # Identity reconciliation is a safety decision, not an endorsement
+            # of the candidate prose. Recognize an existing place before asking
+            # the model to polish a thin or generic duplicate; otherwise the
+            # same known POI can loop forever on proposal-quality corrections.
+            try:
+                existing_place = _matching_existing_place(
+                    db,
+                    city_id=city_id,
+                    title=title,
+                    lat=float(args["lat"]),
+                    lng=float(args["lng"]),
+                    chain_name=str(args.get("chain_name_local") or ""),
+                    branch_name=str(args.get("branch_name") or ""),
+                    address=str(args.get("address") or desc),
+                    category=str(args.get("category") or "other"),
+                )
+            except (KeyError, TypeError, ValueError):
+                existing_place = None
+            if existing_place is not None:
+                return {
+                    "ok": True,
+                    "proposal_created": False,
+                    "proposal_id": None,
+                    "duplicate": True,
+                    "existing_place_id": existing_place.id,
+                }
         if not _has_hangul(title):
             return {
                 "error": "korean_required",
@@ -2435,12 +2763,28 @@ def run_tool(
                     "예: '泉城广场 (취안청 광장)'. 수정해 다시 호출하세요."
                 ),
             }
+        if name == "propose_place" and not _has_specific_korean_place_name(title):
+            return {
+                "error": "specific_korean_name_required",
+                "detail": (
+                    "괄호 안에는 '관광지', '음식점', '공원' 같은 종류 라벨이 아니라 이 장소를 "
+                    "식별하는 자연스러운 한국어 음역·명칭이 필요합니다."
+                ),
+            }
         if desc and not _has_hangul(desc):
             return {
                 "error": "korean_required",
                 "detail": (
                     "description 본문은 무조건 한국어로 작성해야 합니다. "
                     "중국어 정보는 번역하고, 주소만 '주소: [중국어 원문]' 형태로 유지하세요."
+                ),
+            }
+        if name == "propose_place" and len(desc.strip()) < 60:
+            return {
+                "error": "proposal_description_too_thin",
+                "detail": (
+                    "신규 장소 설명은 주소만 붙인 보일러플레이트가 아니라 여행자가 선택할 이유와 "
+                    "위치 맥락을 담은 한국어 60자 이상이어야 합니다."
                 ),
             }
         cat_raw = str(args.get("category") or "other")
@@ -2475,6 +2819,46 @@ def run_tool(
                     "confidence": max(0.0, min(float(raw.get("confidence") or 0.5), 1.0)),
                 }
             )
+        proposal_documents_supplied = "_validated_source_documents" in args
+        proposal_document_records = _validated_source_document_records(args)
+        proposal_documents = {
+            url: str(record.get("blob") or "")
+            for url, record in proposal_document_records.items()
+        }
+        for item in insights_payload:
+            content = str(item.get("content") or "")
+            if _INSIGHT_PLACEHOLDER_RE.search(content):
+                return {
+                    "error": "insight_placeholder_forbidden",
+                    "detail": "신규 장소의 구조화 정보에 미확인 placeholder를 저장할 수 없습니다.",
+                }
+            source_url = _normalize_evidence_url(str(item.get("source_url") or ""))
+            if proposal_documents_supplied and source_url not in proposal_documents:
+                return {
+                    "error": "insight_source_document_missing",
+                    "detail": "신규 장소 인사이트의 인용 URL 본문을 현재 실행에서 확인하지 못했습니다.",
+                }
+            if source_url in proposal_documents:
+                trusted_title = str(
+                    proposal_document_records[source_url].get("title") or ""
+                ).strip()
+                if trusted_title:
+                    item["source_title"] = trusted_title[:300]
+                source_blob = _compact_insight_evidence(proposal_documents[source_url])
+                unsupported = [
+                    anchor
+                    for anchor in _insight_claim_anchors(content)
+                    if anchor not in source_blob
+                ]
+                if unsupported:
+                    return {
+                        "error": "insight_claim_not_supported",
+                        "detail": (
+                            "신규 장소 인사이트의 정확 주소·전화·시간·가격·고유 지명이 인용 본문에서 "
+                            "확인되지 않습니다."
+                        ),
+                        "unsupported_anchor_count": len(unsupported),
+                    }
         coordinate_evidence = (
             dict(args.get("_coordinate_evidence") or {})
             if isinstance(args.get("_coordinate_evidence"), dict)
@@ -2507,12 +2891,25 @@ def run_tool(
             # observation's location or provenance.
             coordinate_lat = coordinate_evidence.get("lat", coordinate_lat)
             coordinate_lng = coordinate_evidence.get("lng", coordinate_lng)
+        travel_role = str(args.get("travel_role") or "general").strip()
+        valid_travel_roles = {
+            "history", "food", "market_night", "neighborhood", "nature",
+            "shopping", "rest", "practical", "general",
+        }
+        if travel_role not in valid_travel_roles:
+            return {
+                "error": "invalid_travel_role",
+                "detail": (
+                    "travel_role은 history|food|market_night|neighborhood|nature|shopping|"
+                    "rest|practical|general 중 하나여야 합니다."
+                ),
+            }
         payload = {
             "title": title,
             "description": desc,
             "address": str(args.get("address") or "")[:300],
             "category": cat.value,
-            "travel_role": str(args.get("travel_role") or "general")[:30],
+            "travel_role": travel_role,
             "lat": float(coordinate_lat),
             "lng": float(coordinate_lng),
             "context": str(args.get("context") or "")[:8000],
@@ -2565,6 +2962,7 @@ def run_tool(
                 chain_name=payload["chain_name_local"],
                 branch_name=payload["branch_name"],
                 address=payload["address"] or payload["description"],
+                category=payload["category"],
             )
             if existing_place is not None:
                 return {
@@ -2677,6 +3075,7 @@ def run_tool(
             chain_name=payload["chain_name_local"],
             branch_name=payload["branch_name"],
             address=payload["address"] or payload["description"],
+            category=payload["category"],
         )
         if existing_place is not None:
             return {
@@ -2795,10 +3194,60 @@ def run_tool(
         raw_items = args.get("insights") or []
         if not isinstance(raw_items, list):
             return {"error": "bad_insights"}
+        source_documents_supplied = "_validated_source_documents" in args
+        source_document_records = _validated_source_document_records(args)
+        source_documents = {
+            url: str(record.get("blob") or "")
+            for url, record in source_document_records.items()
+        }
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
             content = str(raw.get("content") or "")
+            if _INSIGHT_PLACEHOLDER_RE.search(content):
+                return {
+                    "error": "insight_placeholder_forbidden",
+                    "detail": (
+                        "전화번호·주소·시간 같은 구조화 정보에 xxxx, 미상, 확인 필요 같은 "
+                        "placeholder를 저장할 수 없습니다. 확인된 값만 쓰거나 해당 사실을 생략하세요."
+                    ),
+                }
+            source_url = _normalize_evidence_url(str(raw.get("source_url") or ""))
+            if source_documents_supplied and source_url not in source_documents:
+                return {
+                    "error": "insight_source_document_missing",
+                    "detail": (
+                        "인용 URL의 유효한 fetch_page 본문이 현재 실행의 서버 검증 문서에 없습니다. "
+                        "검색 결과 요약만으로 인사이트를 저장할 수 없습니다."
+                    ),
+                }
+            if source_url in source_documents:
+                anchors = _insight_claim_anchors(content)
+                source_blob = _compact_insight_evidence(source_documents[source_url])
+                unsupported = sorted(anchor for anchor in anchors if anchor not in source_blob)
+                if unsupported:
+                    return {
+                        "error": "insight_claim_not_supported",
+                        "detail": (
+                            "인사이트의 정확 주소·전화·시간·가격·고유 지명 중 인용한 본문에서 "
+                            "확인되지 않는 값이 있습니다. 검색 snippet이나 다른 지점의 값을 섞지 말고 "
+                            "현재 fetch_page 본문이 직접 뒷받침하는 사실만 저장하세요."
+                        ),
+                        "unsupported_anchor_count": len(unsupported),
+                    }
+                if not _source_supports_claim_in_place_context(
+                    m,
+                    content,
+                    source_document_records[source_url],
+                ):
+                    return {
+                        "error": "insight_claim_context_mismatch",
+                        "detail": (
+                            "인사이트의 정확한 주소·지점·건물·층·영업 정보가 인용 본문의 "
+                            "해당 장소 문맥 가까이에서 함께 확인되지 않습니다. 같은 페이지의 다른 "
+                            "지점 숫자나 모델이 쓴 source_title을 근거로 사용할 수 없습니다."
+                        ),
+                    }
             has_source_currency = bool(re.search(r"(?:위안|元|CNY|RMB|¥)", content, re.IGNORECASE))
             has_converted_currency = bool(re.search(r"(?:\d[\d,]*(?:\.\d+)?\s*원|KRW|₩)", content, re.IGNORECASE))
             if has_source_currency and has_converted_currency:
@@ -2817,10 +3266,20 @@ def run_tool(
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
+            source_url = _normalize_evidence_url(str(raw.get("source_url") or ""))
+            source_record = source_document_records.get(source_url)
             source_districts = _district_tokens(
                 " ".join(
                     str(value or "")
-                    for value in (raw.get("source_title"), raw.get("content"))
+                    for value in (
+                        (
+                            source_record.get("title")
+                            if source_record
+                            else raw.get("source_title")
+                        ),
+                        source_record.get("text") if source_record else "",
+                        raw.get("content"),
+                    )
                 )
             )
             if marker_districts and source_districts and marker_districts.isdisjoint(source_districts):
@@ -2839,10 +3298,23 @@ def run_tool(
                 kind = str(raw.get("kind") or "").strip().lower()
                 if kind not in {"location", "visit", "tip"}:
                     continue
+                source_url = _normalize_evidence_url(str(raw.get("source_url") or ""))
+                source_record = source_document_records.get(source_url)
+                identity_values = (
+                    (
+                        source_record.get("title"),
+                        source_record.get("text"),
+                        source_url,
+                    )
+                    if source_record is not None
+                    else (
+                        raw.get("source_title"),
+                        raw.get("source_url"),
+                    )
+                )
                 if not _source_mentions_place(
                     m,
-                    raw.get("source_title"),
-                    raw.get("source_url"),
+                    *identity_values,
                 ):
                     return {
                         "error": "insight_branch_source_mismatch",
@@ -2913,7 +3385,15 @@ def run_tool(
             row.content = content_s
             row.year_label = str(raw.get("year_label") or "").strip()[:50]
             row.source_url = source_url
-            row.source_title = str(raw.get("source_title") or "").strip()[:300]
+            normalized_source_url = _normalize_evidence_url(source_url)
+            trusted_source_title = str(
+                (source_document_records.get(normalized_source_url) or {}).get("title")
+                or ""
+            ).strip()
+            row.source_title = (
+                trusted_source_title
+                or str(raw.get("source_title") or "").strip()
+            )[:300]
             row.confidence = confidence
             row.created_by = "agent"
             row.sort_order = index
@@ -4009,6 +4489,9 @@ def run_tool(
                 ).first()
             queries = [query]
             if marker is not None:
+                coordinate_query = " ".join(str(marker.coordinate_query or "").split())
+                if _coordinate_identity_aliases(coordinate_query):
+                    queries.append(coordinate_query)
                 local = marker.title.split("(", 1)[0].strip()
                 if local and local.casefold() != query.casefold():
                     queries.append(local)
@@ -4017,6 +4500,9 @@ def run_tool(
                     queries.append(f"{city.slug} {local or query}")
                     if city.name_local not in query:
                         queries.append(f"{city.name_local} {local or query}")
+            # Preserve order so the caller's axis remains first, then the
+            # exact server-owned alias, before broader local/city variants.
+            queries = list(dict.fromkeys(value for value in queries if value))
             candidates: list[dict[str, Any]] = []
             errors: list[str] = []
             for candidate_query in queries[:3]:
@@ -4037,14 +4523,24 @@ def run_tool(
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"geosearch:{exc}"[:180])
             unique: dict[str, dict[str, Any]] = {}
+            rejected_subject_mismatch = 0
             for item in candidates:
                 url = str(item.get("image_url") or "")
                 if not url or url in unique:
                     continue
+                if marker is not None and not _image_candidate_matches_place(marker, item):
+                    rejected_subject_mismatch += 1
+                    continue
                 item["score"] = _image_relevance(item, query) + (5 if item.get("nearby") else 0)
                 unique[url] = item
             ranked = sorted(unique.values(), key=lambda item: item.get("score", 0), reverse=True)
-            return {"results": ranked[:limit], "pool_size": len(ranked), "queries": queries[:3], "warnings": errors[:4]}
+            return {
+                "results": ranked[:limit],
+                "pool_size": len(ranked),
+                "rejected_subject_mismatch": rejected_subject_mismatch,
+                "queries": queries[:3],
+                "warnings": errors[:4],
+            }
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)[:300], "results": []}
 
@@ -4066,7 +4562,7 @@ def run_tool(
         )
         if not m:
             return {"error": "not_found"}
-        if not _source_mentions_place(m, source, requested_url):
+        if not _image_source_mentions_place(m, source, requested_url):
             return {
                 "error": "image_source_subject_mismatch",
                 "detail": (

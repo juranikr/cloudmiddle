@@ -252,6 +252,24 @@ export interface AdminAgentProposal {
   decided_at: string | null;
 }
 
+export type AdminAgentOutcomeCategory =
+  | "traveler_visible_changed"
+  | "proposal_created"
+  | "verified_or_waived_no_change"
+  | "deferred_or_blocked"
+  | "no_yield"
+  | "failed";
+
+export interface AdminAgentNextCursor {
+  mission_id?: number;
+  work_item_id?: number;
+  target?: string;
+  stage?: string;
+  status?: string;
+  next_tool?: string;
+  wait_reason?: string;
+}
+
 export interface AdminAgentRunHistory {
   id: number;
   city_id: number;
@@ -264,6 +282,10 @@ export interface AdminAgentRunHistory {
   step_count: number;
   started_at: string;
   finished_at: string | null;
+  outcome_category: AdminAgentOutcomeCategory;
+  material_change_count: number;
+  next_work_item_id: number | null;
+  next_cursor: AdminAgentNextCursor;
 }
 
 export interface AdminAgentRunStep {

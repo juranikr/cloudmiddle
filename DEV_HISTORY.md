@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-23 (KST) — 도시별 다중 검색·신규 장소 발굴 연속성·품질 결손 종료 상태
+최종 갱신: 2026-08-23 (KST) — 수동 배치 실행 격리·성과 판정·후속 작업 연속성 보강
 
 ---
 
@@ -166,6 +166,14 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 7) 히스토리 타임라인
+
+### 2026-08-23 — 수동 배치 실행 격리 + 감사 가능한 성과·연속성
+- 관리자 수동 실행도 API 컨테이너 안의 background thread가 아니라 예약 배치와 같은 Step Functions/Fargate 경로로 통합하고, 도시별 실패 격리·AWS 실행 재연결·정확한 도시 결과 폴링을 추가
+- PostgreSQL 도시별 advisory lock으로 수동/예약/중복 클릭이 겹쳐도 같은 도시 에이전트는 하나만 실행하며, 중복 요청은 DB를 변경하지 않는 `already_running` 성과로 기록
+- `completed` 상태와 실제 여행자 가시 변경을 분리해 `traveler_visible_changed`, `proposal_created`, `verified_or_waived_no_change`, `deferred_or_blocked`, `no_yield`, `failed`로 관리자 화면에 표시하고 다음 대상·커서·행동도 함께 노출
+- 후보 미션은 여행 역할을 끝까지 고정하고 12시간 냉각 후 재개. 실패한 본문 URL은 실패 출처로 이관한 뒤 같은 후보의 다음 미열람 URL 또는 실패 호스트를 제외한 정확 검색으로 전환
+- 신규 장소/insight는 현재 실행에서 직접 읽은 대상 일치 본문만 근거로 사용하고, 구체 장소명·60자 이상 설명·역할·구조화 insight를 서버에서 검증. 잘못된 지점/주소·일반 라벨·Brave 단독 좌표는 제안 불가
+- 이미지 감사 규칙을 v2로 올려 과거 잘못된 `source_exhausted`를 재평가하고, 장소 불일치 사진은 일시 차단 후 다른 후보를 찾되 정확한 영문 별칭은 이미지 검색·첨부에만 제한적으로 허용
 
 ### 2026-08-23 — 다중 검색 발견 레인 + 연속성 있는 품질 종료
 - Brave Search Place Search를 기존 Yahoo/Yandex 웹 검색·ArcGIS/Nominatim/Wikidata 위치 검색 앞단의 **발견 단서**로 추가하고, 국가·도시별 언어/별칭/공식 도메인 프로필로 중국 외 도시도 같은 구조를 사용하도록 일반화

@@ -3,6 +3,8 @@ import * as api from "../api";
 import { useAuth } from "../auth";
 import type {
   AdminAgentAction,
+  AdminAgentNextCursor,
+  AdminAgentOutcomeCategory,
   AdminAgentProposal,
   AdminAgentRunHistory,
   AdminAgentRunStep,
@@ -33,6 +35,27 @@ const METRIC_LABEL: Record<string, string> = {
   completed_tasks: "과제 완료",
   role_diversity: "역할 다양성",
 };
+
+const OUTCOME_LABEL: Record<AdminAgentOutcomeCategory, string> = {
+  traveler_visible_changed: "여행자 화면 변경",
+  proposal_created: "승인 제안 생성",
+  verified_or_waived_no_change: "검증 완료 · 변경 불필요",
+  deferred_or_blocked: "조건 대기 · 차단",
+  no_yield: "성과 없음",
+  failed: "실행 실패",
+};
+
+function nextCursorLabel(cursor: AdminAgentNextCursor | undefined, workItemId: number | null | undefined): string {
+  const id = workItemId ?? cursor?.work_item_id;
+  const parts: string[] = [];
+  if (id) parts.push(`작업 #${id}`);
+  else if (cursor?.mission_id) parts.push(`미션 #${cursor.mission_id}`);
+  if (cursor?.target) parts.push(cursor.target);
+  if (cursor?.next_tool) parts.push(`다음 행동 ${cursor.next_tool}`);
+  if (cursor?.wait_reason) parts.push(`재개 조건 ${cursor.wait_reason}`);
+  if (parts.length) return parts.join(" · ");
+  return "저장된 후속 커서 없음";
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -146,18 +169,22 @@ export default function AdminPage() {
     setInfo("실행 중… (수 분 걸릴 수 있습니다)");
     try {
       await api.startAdminAgent(token, selectedCityId, researchMode);
-      // 백그라운드 실행 → 끝날 때까지 3초 간격 폴링 (최대 10분)
-      const deadline = Date.now() + 10 * 60 * 1000;
-      let status = await api.fetchAdminAgentStatus(token);
+      // Step Functions/Fargate 실행 → 3초 간격 폴링. 근거 수집과 모델
+      // 복구 재시도를 포함한 정상 장기 실행도 브라우저가 충분히 기다린다.
+      const deadline = Date.now() + 30 * 60 * 1000;
+      let status = await api.fetchAdminAgentStatus(token, selectedCityId);
       while (status.running && Date.now() < deadline) {
         await new Promise((res) => setTimeout(res, 3000));
-        status = await api.fetchAdminAgentStatus(token);
+        status = await api.fetchAdminAgentStatus(token, selectedCityId);
       }
       const r = status.result;
       if (r) {
         const resultLabel = r.status === "completed" ? "완료" : r.status === "partial" ? "부분 완료" : "실패";
+        const outcome = status.outcome_category ?? (r.status === "failed" ? "failed" : "no_yield");
         setInfo(
-          `${resultLabel} · 성과 ${r.score ?? 0}점 · 행동 라운드 ${r.steps} · 미처리 ${r.unread_before}→${r.unread_after}\n${r.message}`,
+          `${OUTCOME_LABEL[outcome]} · 실질 변경 ${status.material_change_count ?? 0}건\n` +
+          `다음 커서: ${nextCursorLabel(status.next_cursor, status.next_work_item_id)}\n` +
+          `시스템 ${resultLabel} · 성과 ${r.score ?? 0}점 · 행동 라운드 ${r.steps} · 미처리 ${r.unread_before}→${r.unread_after}\n${r.message}`,
         );
       } else if (status.running) {
         setInfo("아직 실행 중입니다. 잠시 후 새로고침으로 결과를 확인하세요.");
@@ -465,15 +492,24 @@ export default function AdminPage() {
               const discoveryFunnel = runDiscoveryFunnel(run);
               const steps = runSteps[run.id];
               const duration = Number(metrics.duration_seconds ?? 0);
+              const materialCount = Number(run.material_change_count ?? material.length);
+              const outcomeCategory = run.outcome_category ?? (run.status === "failed" ? "failed" : "no_yield");
               return (
                 <li key={run.id}>
-                  <div><strong>실행 #{run.id} · {run.score.toFixed(1)}점</strong><span className={`run-status run-status--${run.status}`}>{run.status}</span></div>
+                  <div className="admin__run-heading">
+                    <strong>실행 #{run.id} · {run.score.toFixed(1)}점</strong>
+                    <span className={`run-outcome run-outcome--${outcomeCategory}`}>{OUTCOME_LABEL[outcomeCategory]}</span>
+                  </div>
                   <p>{run.objective}</p>
                   <small>
-                    {new Date(run.started_at).toLocaleString("ko-KR")} · 도구 행동 {run.step_count}회
+                    {new Date(run.started_at).toLocaleString("ko-KR")} · 시스템 {run.status} · 도구 행동 {run.step_count}회
                     {duration > 0 ? ` · ${Math.round(duration / 60)}분` : ""}
                     {Number(metrics.repeated_calls_blocked ?? 0) > 0 ? ` · 반복 차단 ${metrics.repeated_calls_blocked}회` : ""}
                   </small>
+                  <div className="admin__run-outcome-summary">
+                    <strong>실질 변경 {Number.isFinite(materialCount) ? materialCount : material.length}건</strong>
+                    <span>다음 커서: {nextCursorLabel(run.next_cursor, run.next_work_item_id)}</span>
+                  </div>
                   <div className="admin__run-delta">
                     {delta.length ? delta.map(([key, value]) => (
                       <span key={key}>{METRIC_LABEL[key] ?? key} {value > 0 ? "+" : ""}{value}</span>

@@ -564,15 +564,18 @@ class TravelChatRoutingTests(unittest.TestCase):
             ),
         )
 
-    def test_optional_proposal_fields_accept_model_nulls(self) -> None:
+    def test_proposal_schema_requires_fields_enforced_by_runtime(self) -> None:
         proposal = next(tool for tool in TOOLS if tool["function"]["name"] == "propose_place")
         properties = proposal["function"]["parameters"]["properties"]
         required = proposal["function"]["parameters"]["required"]
 
         for field in ("zone_id", "branch_name", "coordinate_external_id", "coordinate_source_url"):
             self.assertIn("null", properties[field]["type"])
-        self.assertNotIn("confidence", required)
-        self.assertNotIn("evidence", required)
+        for field in ("description", "travel_role", "confidence", "evidence"):
+            self.assertIn(field, required)
+        self.assertEqual(properties["description"]["type"], "string")
+        self.assertEqual(properties["description"]["minLength"], 60)
+        self.assertEqual(properties["travel_role"]["type"], "string")
         self.assertIn("consumption_mode", properties)
         self.assertNotIn("confidence", properties["insights"]["items"]["required"])
 
@@ -690,7 +693,11 @@ class _ParseFailThenCurateCompletions:
                 "branch_name": "中街店",
                 "category": "shopping",
                 "travel_role": "food",
-                "description": "선양에서 포장 사탕을 살 수 있는 중제 지점입니다.",
+                "description": (
+                    "선양 중제 보행가에서 포장 사탕을 고를 수 있는 부라오린의 실제 지점입니다. "
+                    "상호와 지점 주소, 좌표 출처가 함께 확인되어 쇼핑 동선 중 간단한 현지 간식을 "
+                    "사거나 선물용 사탕을 고르기 좋은 후보입니다."
+                ),
                 "evidence": "보존된 후보의 상호와 주소, 좌표 출처를 확인했습니다.",
                 "confidence": 0.88,
                 "insights": [

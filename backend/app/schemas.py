@@ -254,6 +254,7 @@ class AgentRunResponse(BaseModel):
     performance: dict[str, int] = Field(default_factory=dict)
     remaining_gaps: list[str] = Field(default_factory=list)
     run_id: Optional[int] = None
+    outcome: Optional[str] = None
 
 
 class UserMessageOut(BaseModel):

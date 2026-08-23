@@ -70,9 +70,25 @@ def _compact_result(results: list[dict[str, Any]]) -> str:
                 "run_id": result.get("run_id"),
                 "ok": result.get("ok"),
                 "status": result.get("status"),
+                "outcome": result.get("outcome"),
                 "steps": result.get("steps"),
                 "score": result.get("score"),
                 "message": str(result.get("message") or "")[:4000],
+                "unread_before": result.get("unread_before", 0),
+                "unread_after": result.get("unread_after", 0),
+                "performance": (
+                    result.get("performance")
+                    if isinstance(result.get("performance"), dict)
+                    else {}
+                ),
+                "remaining_gaps": [
+                    str(gap)[:300]
+                    for gap in (
+                        result.get("remaining_gaps")
+                        if isinstance(result.get("remaining_gaps"), list)
+                        else []
+                    )[:20]
+                ],
             }
             for result in results
         ]

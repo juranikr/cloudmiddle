@@ -68,6 +68,22 @@ _LANDMARK_SUFFIXES = (
     "车站",
 )
 _BRANCH_SUFFIX_RE = re.compile(r"(?:旗舰店|总店|分店|门店|店|점)$", re.IGNORECASE)
+GENERIC_KOREAN_PLACE_NAMES = frozenset({
+    "관광지", "여행장소", "여행 장소", "장소", "명소", "공원",
+    "음식점", "식당", "맛집", "음료점", "카페", "숙소", "호텔",
+    "교통장소", "교통 장소", "쇼핑장소", "쇼핑 장소", "편의장소", "편의 장소",
+    "시장", "박물관", "미술관", "사원", "역", "터미널", "공항", "쇼핑몰",
+})
+
+
+def is_specific_korean_place_name(value: Any) -> bool:
+    """Return whether a Korean label identifies a place rather than its type."""
+
+    name = re.sub(r"\s+", " ", str(value or "")).strip()
+    return bool(
+        re.search(r"[\uac00-\ud7a3]", name)
+        and name not in GENERIC_KOREAN_PLACE_NAMES
+    )
 
 
 @dataclass(frozen=True)

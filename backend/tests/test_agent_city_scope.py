@@ -15,8 +15,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.agent.runner import (
+    CANDIDATE_DISCOVERY_COOLDOWN_HOURS,
     CANDIDATE_DISCOVERY_INTERVAL,
     CANDIDATE_DISCOVERY_KIND,
+    CANDIDATE_ROLE_TARGETS,
     CANDIDATE_DISCOVERY_TOOLS,
     DATA_INTEGRITY_TOOLS,
     RECOVERY_TOOLS_BY_TASK,
@@ -33,6 +35,7 @@ from app.agent.runner import (
     _performance_delta,
     _performance_score,
     _performance_snapshot,
+    _page_supports_coordinate_evidence,
     _new_evidence_keys,
     _normalize_research_query,
     _active_target_mismatch,
@@ -44,9 +47,13 @@ from app.agent.runner import (
     _canonical_quality_task,
     _candidate_discovery_research_refs,
     _candidate_discovery_due,
+    _candidate_mission_role,
+    _candidate_task_role,
     _fair_non_discovery_task,
     _persistable_tool_result,
     _select_autonomous_task,
+    _scoped_quality_block_evidence_refs,
+    _scoped_quality_tools,
     _sync_quality_tasks,
     _should_rotate_exhausted_image_target,
     _step_detail_json,
@@ -55,7 +62,7 @@ from app.agent.runner import (
     run_agent,
 )
 from app.agent.tools import TOOLS, run_tool
-from app.agent.tools import is_useful_fetched_page, _image_relevance
+from app.agent.tools import is_useful_fetched_page, _image_relevance, _matching_existing_place
 from app.db import Base
 from app.knowledge import rebuild_knowledge_base, upsert_knowledge
 from app.agent.memory import (
@@ -182,6 +189,38 @@ class AgentCityScopeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.engine.dispose()
+
+    def test_nearby_coordinate_from_different_page_is_not_exact_poi_evidence(self) -> None:
+        coordinate = {
+            "display_name": "沈阳故宫角楼咖啡",
+            "address": "沈河区沈阳路171号",
+            "lat": 41.7963,
+            "lng": 123.4552,
+        }
+        unrelated_page = {
+            "title": "老边饺子中街店",
+            "text": "老边饺子位于沈河区中街路，提供东北菜和饺子。" * 10,
+            "coordinate_candidates": [
+                {
+                    "lat": 41.7971,
+                    "lng": 123.4560,
+                    "source": "ctrip_embedded_gdcoord",
+                    "storage_allowed": True,
+                }
+            ],
+        }
+        matching_page = {
+            **unrelated_page,
+            "title": "沈阳故宫角楼咖啡",
+            "text": "沈阳故宫角楼咖啡位于沈河区沈阳路171号。" * 10,
+        }
+
+        self.assertFalse(
+            _page_supports_coordinate_evidence(unrelated_page, coordinate)
+        )
+        self.assertTrue(
+            _page_supports_coordinate_evidence(matching_page, coordinate)
+        )
 
     def _run_scripted_agent(
         self,
@@ -626,6 +665,179 @@ class AgentCityScopeTests(unittest.TestCase):
             outcome="ok", new_evidence_count=0, material_change=False,
         )
         self.assertEqual(seen_continuity["next_action"]["tool"], "choose_alternative_source")
+
+    def test_candidate_checkpoint_keeps_storable_exact_dossier_after_later_error(self) -> None:
+        task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="휴식 역할 후보",
+            detail="target_role: rest\n정확한 휴식 장소 후보 발굴",
+            success_metric="travel_role=rest 제안",
+            priority=88,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        run = AgentRun(
+            city_id=2,
+            mission_id=mission.id,
+            work_item_id=item.id,
+            status="running",
+        )
+        self.db.add(run)
+        self.db.commit()
+
+        item, continuity = checkpoint_after_tool(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=1,
+            tool="geocode_place",
+            args={"query": "沈阳 独立茶馆"},
+            result={"results": [{
+                "display_name": "独立茶馆, 沈河区中街路88号",
+                "address": "沈河区中街路88号",
+                "lat": 41.8012,
+                "lng": 123.4521,
+                "source": "nominatim",
+                "external_id": "node:123",
+                "source_url": "https://www.openstreetmap.org/node/123",
+                "storage_allowed": True,
+            }]},
+            outcome="ok",
+            new_evidence_count=1,
+            material_change=False,
+        )
+        dossier = continuity["next_action"]
+        self.assertEqual(dossier["handoff_version"], "candidate_dossier_v1")
+        self.assertEqual(dossier["tool"], "web_search")
+        self.assertEqual(dossier["candidate"]["external_id"], "node:123")
+        self.assertIn("独立茶馆", dossier["next_exact_query"])
+
+        item, continuity = checkpoint_after_tool(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=2,
+            tool="web_search",
+            args=dossier["args"],
+            result={
+                "error": "recent_duplicate_search",
+                "detail": "source axis already used",
+            },
+            outcome="error",
+            new_evidence_count=0,
+            material_change=False,
+        )
+
+        retained = continuity["next_action"]
+        self.assertEqual(retained["handoff_version"], "candidate_dossier_v1")
+        self.assertEqual(retained["candidate"]["external_id"], "node:123")
+        self.assertEqual(retained["last_error"], "recent_duplicate_search")
+        self.assertNotEqual(retained["tool"], "choose_alternative_source")
+
+    def test_candidate_fetch_failure_advances_to_unread_source_then_exact_alternative(self) -> None:
+        task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="휴식 역할 후보",
+            detail="target_role: rest\n정확한 휴식 장소 후보 발굴",
+            success_metric="travel_role=rest 제안",
+            priority=88,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        run = AgentRun(
+            city_id=2,
+            mission_id=mission.id,
+            work_item_id=item.id,
+            status="running",
+        )
+        self.db.add(run)
+        self.db.commit()
+
+        first_url = "https://first.example.test/tea-house"
+        second_url = "https://second.example.test/tea-house"
+        item, continuity = checkpoint_after_tool(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=1,
+            tool="web_search",
+            args={"query": '"独立茶馆" "沈河区中街路88号"'},
+            result={
+                "results": [
+                    {
+                        "href": first_url,
+                        "title": "独立茶馆 공식 안내",
+                        "body": "沈河区中街路88号",
+                        "seen": False,
+                    },
+                    {
+                        "href": second_url,
+                        "title": "独立茶馆 예약 안내",
+                        "body": "沈河区中街路88号",
+                        "seen": False,
+                    },
+                ]
+            },
+            outcome="ok",
+            new_evidence_count=2,
+            material_change=False,
+        )
+        dossier = continuity["next_action"]
+        self.assertEqual(dossier["args"]["url"], first_url)
+
+        item, continuity = checkpoint_after_tool(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=2,
+            tool="fetch_page",
+            args={"url": first_url},
+            result={"error": "fetch_failed: HTTP 403"},
+            outcome="error",
+            new_evidence_count=0,
+            material_change=False,
+        )
+        advanced = continuity["next_action"]
+        self.assertEqual(advanced["handoff_version"], "candidate_source_v1")
+        self.assertEqual(advanced["candidate"], dossier["candidate"])
+        self.assertEqual(advanced["failed_source"]["url"], first_url)
+        self.assertEqual(advanced["tool"], "fetch_page")
+        self.assertEqual(advanced["args"]["url"], second_url)
+        self.assertNotEqual(advanced["args"]["url"], first_url)
+
+        _item, continuity = checkpoint_after_tool(
+            self.db,
+            mission=mission,
+            work_item=item,
+            run_id=run.id,
+            sequence=3,
+            tool="fetch_page",
+            args={"url": second_url},
+            result={"error": "page_not_useful_evidence"},
+            outcome="error",
+            new_evidence_count=0,
+            material_change=False,
+        )
+        alternative = continuity["next_action"]
+        self.assertEqual(alternative["candidate"], dossier["candidate"])
+        self.assertEqual(alternative["failed_source"]["url"], second_url)
+        self.assertEqual(alternative["tool"], "web_search")
+        self.assertNotIn(first_url, alternative["args"]["query"])
+        self.assertNotIn(second_url, alternative["args"]["query"])
+        self.assertIn("-site:first.example.test", alternative["args"]["query"])
+        self.assertIn("-site:second.example.test", alternative["args"]["query"])
+        self.assertEqual(
+            {entry["url"] for entry in alternative["failed_sources"]},
+            {first_url, second_url},
+        )
 
     def test_integrity_policy_guards_do_not_consume_investigation_failure_budget(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
@@ -1087,6 +1299,62 @@ class AgentCityScopeTests(unittest.TestCase):
             self.db.query(AgentCheckpoint).filter(AgentCheckpoint.run_id == run.id).count(),
             0,
         )
+
+    def test_stalled_mission_returns_ready_resume_cursor_without_rewriting_run_target(self) -> None:
+        first = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        second = Marker(
+            city_id=2,
+            category=MarkerCategory.restaurant,
+            shape=MarkerShape.point,
+            title="resume sibling",
+            description="ready sibling",
+            lat=41.82,
+            lng=123.39,
+        )
+        self.db.add(second)
+        self.db.flush()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_information",
+            title="stalled cursor handoff",
+            detail=(
+                f"targets:\n- #{first.id} {first.title}\n"
+                f"- #{second.id} {second.title}"
+            ),
+            success_metric="resume the unprocessed sibling",
+            priority=90,
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, current = ensure_mission_for_task(self.db, task)
+        ready = self.db.query(AgentWorkItem).filter(
+            AgentWorkItem.mission_id == mission.id,
+            AgentWorkItem.status == "ready",
+        ).one()
+        run = AgentRun(
+            city_id=2,
+            mission_id=mission.id,
+            work_item_id=current.id,
+            status="running",
+        )
+        self.db.add(run)
+        self.db.commit()
+
+        resume = _halt_stalled_mission(
+            self.db,
+            mission=mission,
+            work_item=current,
+            run_id=run.id,
+            sequence=0,
+            reason="no progress",
+        )
+
+        self.assertEqual(resume.id, ready.id)
+        self.assertEqual(resume.status, "ready")
+        self.assertEqual(current.status, "blocked")
+        self.assertEqual(mission.status, "paused")
+        self.assertEqual(json.loads(mission.progress)["resume_work_item_id"], ready.id)
+        self.assertEqual(run.work_item_id, current.id)
 
     def test_first_lesson_observation_handles_database_defaults_before_commit(self) -> None:
         lesson = observe_lesson(
@@ -3997,9 +4265,14 @@ class AgentCityScopeTests(unittest.TestCase):
             self.db.commit()
         self.assertTrue(_candidate_discovery_due(self.db, city_id=2))
 
-    def test_blocked_discovery_resumes_the_same_mission_and_work_item(self) -> None:
+    def test_blocked_discovery_keeps_exact_cursor_and_rotates_role_during_cooldown(self) -> None:
+        self.assertEqual(CANDIDATE_DISCOVERY_COOLDOWN_HOURS, 12)
         task = _ensure_candidate_discovery_task(self.db, city=self.db.get(City, 2))
+        self.assertIsNotNone(task)
         mission, item = ensure_mission_for_task(self.db, task)
+        from app.agent.runner import _pin_candidate_mission_role
+        original_role = _pin_candidate_mission_role(mission, task)
+        self.db.commit()
         original = (task.id, mission.id, item.id)
         task.status = "blocked"
         task.result = "provider temporarily blocked"
@@ -4007,13 +4280,168 @@ class AgentCityScopeTests(unittest.TestCase):
 
         self.assertEqual(mission.status, "paused")
         self.assertEqual(item.status, "blocked")
-        resumed_task = _ensure_candidate_discovery_task(self.db, city=self.db.get(City, 2))
-        resumed_mission, resumed_item = ensure_mission_for_task(self.db, resumed_task)
+        self.assertIn("12시간 냉각", json.loads(mission.progress)["retry_condition"])
+        rotated_task = _ensure_candidate_discovery_task(self.db, city=self.db.get(City, 2))
+        self.assertIsNotNone(rotated_task)
 
-        self.assertEqual((resumed_task.id, resumed_mission.id, resumed_item.id), original)
-        self.assertEqual(resumed_task.status, "pending")
-        self.assertEqual(resumed_mission.status, "active")
+        self.assertNotEqual(rotated_task.id, original[0])
+        self.assertNotEqual(_candidate_task_role(rotated_task), original_role)
+        self.assertEqual((task.id, mission.id, item.id), original)
+        self.assertEqual(task.status, "blocked")
+        self.assertEqual(mission.status, "paused")
+        self.assertEqual(item.status, "blocked")
+
+    def test_discovery_returns_none_when_every_missing_role_frontier_is_cooling(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        for role in CANDIDATE_ROLE_TARGETS:
+            task = AgentTask(
+                city_id=2,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=f"cooling {role}",
+                detail=f"target_role: {role}\nexact role frontier",
+                status="blocked",
+            )
+            self.db.add(task)
+            self.db.flush()
+            mission = AgentMission(
+                city_id=2,
+                task_id=task.id,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=task.title,
+                objective=task.detail,
+                status="paused",
+                strategy=json.dumps({"target_role": role}),
+                updated_at=now,
+            )
+            self.db.add(mission)
+            self.db.flush()
+            self.db.add(AgentWorkItem(
+                mission_id=mission.id,
+                city_id=2,
+                target_type="task",
+                target_key=f"task:{task.id}",
+                title=task.title,
+                status="blocked",
+            ))
+        self.db.commit()
+
+        selected = _ensure_candidate_discovery_task(self.db, city=self.db.get(City, 2))
+
+        self.assertIsNone(selected)
+        self.assertTrue(all(
+            mission.status == "paused"
+            for mission in self.db.query(AgentMission).filter(
+                AgentMission.kind == CANDIDATE_DISCOVERY_KIND,
+            )
+        ))
+
+        with (
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=3,
+                autonomous_research=True,
+            )
+
+        self.assertEqual(result["steps"], 0)
+        self.assertEqual(result["outcome"], "deferred")
+        run = self.db.get(AgentRun, result["run_id"])
+        self.assertEqual(run.mode, "idle")
+        self.assertEqual(json.loads(run.metrics)["lane"], "discovery_deferred")
+
+    def test_role_frontier_is_fixed_in_task_and_mission_prompt(self) -> None:
+        from app.agent.runner import (
+            _candidate_discovery_system,
+            _candidate_proposal_role_error,
+            _pin_candidate_mission_role,
+            _scoped_mission_user_message,
+        )
+
+        task = _ensure_candidate_discovery_task(self.db, city=self.db.get(City, 2))
+        self.assertIsNotNone(task)
+        mission, item = ensure_mission_for_task(self.db, task)
+        role = _pin_candidate_mission_role(mission, task)
+        self.db.commit()
+
+        self.assertIn(role, CANDIDATE_ROLE_TARGETS)
+        self.assertEqual(_candidate_mission_role(mission), role)
+        self.assertIn(f"target_role={role}", _candidate_discovery_system(
+            self.db.get(City, 2), mission, item,
+        ))
+        self.assertIn(f"target_role={role}", _scoped_mission_user_message(
+            self.db.get(City, 2), mission, item, continuity_hint="{}",
+        ))
+        other_role = next(candidate for candidate in CANDIDATE_ROLE_TARGETS if candidate != role)
+        mismatch = _candidate_proposal_role_error(
+            "propose_place", {"travel_role": other_role}, mission,
+        )
+        self.assertEqual(mismatch["error"], "candidate_target_role_mismatch")
+
+    def test_expired_role_frontier_resumes_exact_cursor_after_other_roles_cool(self) -> None:
+        now = datetime.now(timezone.utc)
+        original: tuple[AgentTask, AgentMission, AgentWorkItem] | None = None
+        for index, role in enumerate(CANDIDATE_ROLE_TARGETS):
+            task = AgentTask(
+                city_id=2,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=f"frontier {role}",
+                detail=f"target_role: {role}\nexact role frontier",
+                status="blocked",
+            )
+            self.db.add(task)
+            self.db.flush()
+            mission = AgentMission(
+                city_id=2,
+                task_id=task.id,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=task.title,
+                objective=task.detail,
+                status="paused",
+                strategy=json.dumps({"target_role": role}),
+                updated_at=(
+                    now - timedelta(hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS + 1)
+                    if index == 0
+                    else now
+                ),
+            )
+            self.db.add(mission)
+            self.db.flush()
+            item = AgentWorkItem(
+                mission_id=mission.id,
+                city_id=2,
+                target_type="task",
+                target_key=f"task:{task.id}",
+                title=task.title,
+                status="blocked",
+                next_action=json.dumps({
+                    "handoff_version": "candidate_dossier_v1",
+                    "candidate": {"external_id": "keep-me"},
+                    "tool": "web_search",
+                }),
+            )
+            self.db.add(item)
+            if index == 0:
+                original = (task, mission, item)
+        self.db.commit()
+        self.assertIsNotNone(original)
+        original_task, original_mission, original_item = original
+
+        selected = _ensure_candidate_discovery_task(self.db, city=self.db.get(City, 2))
+        self.assertEqual(selected.id, original_task.id)
+        resumed_mission, resumed_item = ensure_mission_for_task(self.db, selected)
+
+        self.assertEqual(resumed_mission.id, original_mission.id)
+        self.assertEqual(resumed_item.id, original_item.id)
         self.assertEqual(resumed_item.status, "active")
+        self.assertEqual(
+            json.loads(resumed_item.next_action)["candidate"]["external_id"],
+            "keep-me",
+        )
 
     def test_scoped_blocked_discovery_is_completed_for_this_run_despite_city_gaps(self) -> None:
         for event in self.db.query(PlaceEvent).all():
@@ -4337,6 +4765,14 @@ class AgentCityScopeTests(unittest.TestCase):
                 rounds += 1
                 if rounds == 1:
                     call = SimpleNamespace(
+                        id="canonical-page",
+                        function=SimpleNamespace(
+                            name="fetch_page",
+                            arguments=json.dumps({"url": "https://example.test/cafe"}),
+                        ),
+                    )
+                elif rounds == 2:
+                    call = SimpleNamespace(
                         id="canonical-geocode",
                         function=SimpleNamespace(
                             name="geocode_place",
@@ -4350,7 +4786,11 @@ class AgentCityScopeTests(unittest.TestCase):
                             name="propose_place",
                             arguments=json.dumps({
                                 "title": title,
-                                "description": "독립 출처로 확인한 테스트 장소입니다.",
+                                "description": (
+                                    "선양 테스트로에 있는 카페로 독립 공개 본문과 저장 가능한 좌표에서 "
+                                    "같은 상호와 주소를 확인했습니다. 여행 중 차와 음료를 마시며 잠시 "
+                                    "쉬어 갈 수 있는 휴식 후보로 검토할 만합니다."
+                                ),
                                 "address": address,
                                 "category": "drink",
                                 "travel_role": "rest",
@@ -4358,6 +4798,7 @@ class AgentCityScopeTests(unittest.TestCase):
                                 "lng": 123.45,
                                 "evidence": "독립 좌표와 본문을 확인했습니다.",
                                 "source_urls": ["https://example.test/cafe"],
+                                "confidence": 0.9,
                                 "insights": [],
                             }),
                         ),
@@ -4379,6 +4820,12 @@ class AgentCityScopeTests(unittest.TestCase):
         }]}
 
         def fake_tool(_db, name, _args, **_kwargs):
+            if name == "fetch_page":
+                return {
+                    "url": "https://example.test/cafe",
+                    "title": "测试咖啡馆公开页面",
+                    "text": (f"测试咖啡馆位于{address}，提供茶饮和休息空间。" * 20),
+                }
             if name == "geocode_place":
                 return geocode_result
             if name == "propose_place":
@@ -4393,17 +4840,32 @@ class AgentCityScopeTests(unittest.TestCase):
         fake_groq.Groq = lambda **_kwargs: SimpleNamespace(
             chat=SimpleNamespace(completions=Completions())
         )
+        role_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="자동 신규 장소 발굴 [휴식]: 선양",
+            detail="target_role: rest\n선양에서 휴식 역할 후보만 탐색",
+            success_metric="travel_role=rest인 검증 후보 제안",
+            priority=88,
+            status="pending",
+        )
+        self.db.add(role_task)
+        self.db.commit()
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch("app.agent.runner.settings.groq_api_key", "test-key"),
             patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+            patch(
+                "app.agent.runner._select_autonomous_task",
+                return_value=(role_task, CANDIDATE_DISCOVERY_KIND, True),
+            ),
             patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
             patch("app.agent.runner.run_tool", side_effect=fake_tool),
         ):
             result = run_agent(
                 self.db,
                 city_id=2,
-                max_steps=2,
+                max_steps=3,
                 autonomous_research=True,
             )
 
@@ -4490,10 +4952,25 @@ class AgentCityScopeTests(unittest.TestCase):
         fake_groq.Groq = lambda **_kwargs: SimpleNamespace(
             chat=SimpleNamespace(completions=Completions())
         )
+        role_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="자동 신규 장소 발굴 [휴식]: 선양",
+            detail="target_role: rest\n선양에서 휴식 역할 후보만 탐색",
+            success_metric="travel_role=rest인 검증 후보 제안",
+            priority=88,
+            status="pending",
+        )
+        self.db.add(role_task)
+        self.db.commit()
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch("app.agent.runner.settings.groq_api_key", "test-key"),
             patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+            patch(
+                "app.agent.runner._select_autonomous_task",
+                return_value=(role_task, CANDIDATE_DISCOVERY_KIND, True),
+            ),
             patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
             patch("app.agent.runner.run_tool", side_effect=fake_tool),
         ):
@@ -4511,6 +4988,647 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertNotIn("승인 제안 #77 생성", task.result or "")
         self.assertEqual(mission.status, "active")
         self.assertIsNotNone(active_work_item_for_mission(self.db, mission))
+
+    def test_non_transient_proposal_receives_verified_page_docs_but_history_drops_them(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        title = "独立茶馆 (독립 차관)"
+        address = "沈河区中街路88号"
+        source_url = "https://example.test/independent-tea"
+        calls = [
+            ("fetch_page", {"url": source_url}),
+            ("geocode_place", {"query": f"{title} {address}"}),
+            ("propose_place", {
+                "title": title,
+                "description": "공개 본문으로 확인한 선양의 독립 찻집입니다.",
+                "address": address,
+                "category": "drink",
+                "travel_role": "rest",
+                "lat": 41.8012,
+                "lng": 123.4521,
+                "evidence": "공개 본문과 저장 가능한 좌표가 같은 지점을 확인합니다.",
+                "source_urls": [source_url],
+                "insights": [],
+            }),
+        ]
+        rounds = 0
+
+        class Completions:
+            def create(inner_self, **_kwargs):
+                nonlocal rounds
+                name, arguments = calls[rounds]
+                rounds += 1
+                call = SimpleNamespace(
+                    id=f"grounded-{rounds}",
+                    function=SimpleNamespace(
+                        name=name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
+                )
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=[call],
+                ))])
+
+        received_documents: list[dict] = []
+
+        def fake_tool(_db, name, args, **_kwargs):
+            if name == "fetch_page":
+                return {
+                    "url": source_url,
+                    "title": "独立茶馆公开页面",
+                    "text": (f"独立茶馆位于{address}，提供茶饮和到访信息。" * 20),
+                }
+            if name == "geocode_place":
+                return {"results": [{
+                    "display_name": title,
+                    "address": address,
+                    "lat": 41.8012,
+                    "lng": 123.4521,
+                    "source": "nominatim",
+                    "source_url": "https://www.openstreetmap.org/node/123",
+                    "external_id": "node/123",
+                    "confidence": 0.9,
+                    "storage_allowed": True,
+                }]}
+            if name == "propose_place":
+                received_documents.extend(args.get("_validated_source_documents") or [])
+                return {"ok": True, "proposal_created": True, "proposal_id": 700}
+            return {"ok": True}
+
+        role_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="자동 신규 장소 발굴 [휴식]: 선양",
+            detail="target_role: rest\n선양에서 휴식 역할 후보만 탐색",
+            success_metric="travel_role=rest인 검증 후보 제안",
+            priority=88,
+            status="pending",
+        )
+        self.db.add(role_task)
+        self.db.commit()
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        )
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+            patch(
+                "app.agent.runner._select_autonomous_task",
+                return_value=(role_task, CANDIDATE_DISCOVERY_KIND, True),
+            ),
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+            patch("app.agent.runner.run_tool", side_effect=fake_tool),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=3,
+                autonomous_research=True,
+            )
+
+        self.assertEqual(rounds, 3)
+        self.assertEqual(received_documents[0]["url"], source_url)
+        proposal_step = self.db.query(AgentRunStep).filter(
+            AgentRunStep.run_id == result["run_id"],
+            AgentRunStep.tool == "propose_place",
+        ).one()
+        persisted_args = json.loads(proposal_step.detail)["args"]
+        self.assertNotIn("_validated_source_documents", persisted_args)
+
+    def test_non_transient_proposal_rejects_a_fetched_page_for_another_poi(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        target_title = "独立茶馆 (독립 차관)"
+        target_address = "沈河区中街路88号"
+        wrong_url = "https://example.test/another-restaurant"
+        calls = [
+            ("fetch_page", {"url": wrong_url}),
+            ("geocode_place", {"query": f"{target_title} {target_address}"}),
+            ("propose_place", {
+                "title": target_title,
+                "description": (
+                    "선양 중제에서 차를 마시며 잠시 쉬기 좋은 독립 찻집 후보입니다. "
+                    "정확한 상호와 지점 주소, 좌표 및 공개 상세 페이지를 함께 확인해 "
+                    "여행자의 휴식 동선에 넣을 수 있도록 검토합니다."
+                ),
+                "address": target_address,
+                "category": "drink",
+                "travel_role": "rest",
+                "lat": 41.8012,
+                "lng": 123.4521,
+                "evidence": "본문과 저장 가능한 좌표가 같은 지점인지 확인합니다.",
+                "source_urls": [wrong_url],
+                "confidence": 0.9,
+                "insights": [],
+            }),
+        ]
+        rounds = 0
+
+        class Completions:
+            def create(inner_self, **_kwargs):
+                nonlocal rounds
+                name, arguments = calls[rounds]
+                rounds += 1
+                call = SimpleNamespace(
+                    id=f"wrong-page-{rounds}",
+                    function=SimpleNamespace(
+                        name=name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                    ),
+                )
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=[call],
+                ))])
+
+        proposal_executed = False
+
+        def fake_tool(_db, name, _args, **_kwargs):
+            nonlocal proposal_executed
+            if name == "fetch_page":
+                return {
+                    "url": wrong_url,
+                    "title": "完全不同餐厅公开页面",
+                    "text": ("另一家餐厅位于和平区青年大街999号，提供正餐。" * 20),
+                }
+            if name == "geocode_place":
+                return {"results": [{
+                    "display_name": target_title,
+                    "address": target_address,
+                    "lat": 41.8012,
+                    "lng": 123.4521,
+                    "source": "nominatim",
+                    "source_url": "https://www.openstreetmap.org/node/123",
+                    "external_id": "node/123",
+                    "confidence": 0.9,
+                    "storage_allowed": True,
+                }]}
+            if name == "propose_place":
+                proposal_executed = True
+                return {"ok": True, "proposal_created": True, "proposal_id": 999}
+            return {"ok": True}
+
+        role_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="자동 신규 장소 발굴 [휴식]: 선양",
+            detail="target_role: rest\n선양에서 휴식 역할 후보만 탐색",
+            success_metric="travel_role=rest인 검증 후보 제안",
+            priority=88,
+            status="pending",
+        )
+        self.db.add(role_task)
+        self.db.commit()
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        )
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+            patch(
+                "app.agent.runner._select_autonomous_task",
+                return_value=(role_task, CANDIDATE_DISCOVERY_KIND, True),
+            ),
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+            patch("app.agent.runner.run_tool", side_effect=fake_tool),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=3,
+                autonomous_research=True,
+            )
+
+        self.assertEqual(rounds, 3)
+        self.assertFalse(proposal_executed)
+        proposal_step = self.db.query(AgentRunStep).filter(
+            AgentRunStep.run_id == result["run_id"],
+            AgentRunStep.tool == "propose_place",
+        ).one()
+        self.assertEqual(
+            json.loads(proposal_step.detail)["result"]["error"],
+            "proposal_source_target_not_verified",
+        )
+
+    def test_scoped_quality_schema_pins_exact_task_and_blocked_terminal_shape(self) -> None:
+        tools = _scoped_quality_tools(
+            task_id=731,
+            tool_names=RECOVERY_TOOLS_BY_TASK["quality_information"],
+        )
+        task_tool = next(
+            tool for tool in tools
+            if tool["function"]["name"] == "upsert_agent_task"
+        )
+        schema = task_tool["function"]["parameters"]
+
+        self.assertEqual(schema["required"], ["task_id", "status", "result"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(schema["properties"]["task_id"]["enum"], [731])
+        self.assertEqual(schema["properties"]["status"]["enum"], ["blocked"])
+        self.assertNotIn("minLength", schema["properties"]["result"])
+
+    def test_information_blocker_requires_three_exact_subject_research_axes(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_information",
+            title="정보 차단 근거 테스트",
+            detail=f"대상:\n- #{place.id} {place.title} (현재: 구조화 정보 부족)",
+            success_metric="정확 장소의 정보 보완 또는 감사 가능한 차단",
+            priority=100,
+            status="pending",
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, item = ensure_mission_for_task(self.db, task)
+        run = AgentRun(city_id=2, mission_id=mission.id, work_item_id=item.id)
+        self.db.add(run)
+        self.db.flush()
+
+        def add_step(sequence: int, tool: str, args: dict, result: dict) -> None:
+            self.db.add(AgentRunStep(
+                run_id=run.id,
+                sequence=sequence,
+                tool=tool,
+                detail=json.dumps({"args": args, "result": result}),
+            ))
+
+        add_step(1, "get_place", {"place_id": place.id}, {"id": place.id})
+        # Three empty searches for another attraction must not block this one.
+        for sequence in range(2, 5):
+            add_step(
+                sequence,
+                "web_search",
+                {"query": f"完全不同景点 source axis {sequence}"},
+                {"results": []},
+            )
+        self.db.commit()
+        self.assertEqual(
+            _scoped_quality_block_evidence_refs(
+                self.db,
+                run_id=run.id,
+                mission=mission,
+                work_item=item,
+            ),
+            [],
+        )
+
+        # One matching search is still insufficient. Only three distinct,
+        # exact-subject axes authorize a temporary blocker.
+        for sequence in range(5, 8):
+            add_step(
+                sequence,
+                "web_search",
+                {"query": f"{place.title} official source axis {sequence}"},
+                {"results": []},
+            )
+            self.db.commit()
+            refs = _scoped_quality_block_evidence_refs(
+                self.db,
+                run_id=run.id,
+                mission=mission,
+                work_item=item,
+            )
+            if sequence < 7:
+                self.assertEqual(refs, [])
+        self.assertEqual(
+            refs,
+            [
+                f"run:{run.id}:step:1",
+                f"run:{run.id}:step:5",
+                f"run:{run.id}:step:6",
+                f"run:{run.id}:step:7",
+            ],
+        )
+
+    def test_first_scoped_material_change_skips_stale_parallel_calls_and_keeps_run_target(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        first = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        second = Marker(
+            city_id=2,
+            category=MarkerCategory.restaurant,
+            shape=MarkerShape.point,
+            title="第二目标餐厅 (두 번째 대상 식당)",
+            description="한국어 설명",
+            lat=41.81,
+            lng=123.44,
+        )
+        self.db.add(second)
+        self.db.flush()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_information",
+            title="정보 결손 커서 전환 테스트",
+            detail=(
+                "대상:\n"
+                f"- #{first.id} {first.title} (현재: 정보 부족)\n"
+                f"- #{second.id} {second.title} (현재: 정보 부족)"
+            ),
+            success_metric="장소별 설명 60자와 인사이트 2개",
+            priority=100,
+            status="pending",
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, initial_item = ensure_mission_for_task(self.db, task)
+        sibling = self.db.query(AgentWorkItem).filter(
+            AgentWorkItem.mission_id == mission.id,
+            AgentWorkItem.id != initial_item.id,
+        ).one()
+        source_url = "https://example.test/exact-first-place"
+        requests: list[dict] = []
+        rounds = 0
+
+        class Completions:
+            def create(inner_self, **kwargs):
+                nonlocal rounds
+                rounds += 1
+                requests.append(kwargs)
+                if rounds == 1:
+                    calls = [SimpleNamespace(
+                        id="read-source",
+                        function=SimpleNamespace(
+                            name="fetch_page",
+                            arguments=json.dumps({"url": source_url}),
+                        ),
+                    )]
+                elif rounds == 2:
+                    calls = [
+                        SimpleNamespace(
+                            id="write-current",
+                            function=SimpleNamespace(
+                                name="upsert_place_insights",
+                                arguments=json.dumps({
+                                    "place_id": first.id,
+                                    "insights": [{
+                                        "kind": "visit",
+                                        "title": "방문 정보",
+                                        "content": "공식 안내에서 운영 정보를 확인했습니다.",
+                                        "source_url": source_url,
+                                        "source_title": "공식 안내",
+                                        "confidence": 0.9,
+                                    }],
+                                }),
+                            ),
+                        ),
+                        SimpleNamespace(
+                            id="stale-next-target",
+                            function=SimpleNamespace(
+                                name="upsert_place_insights",
+                                arguments=json.dumps({
+                                    "place_id": second.id,
+                                    "insights": [{
+                                        "kind": "visit",
+                                        "title": "실행되면 안 됨",
+                                        "content": "오래된 프롬프트의 병렬 호출",
+                                        "source_url": source_url,
+                                    }],
+                                }),
+                            ),
+                        ),
+                    ]
+                else:
+                    self.fail("a scoped material change must halt before another provider round")
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=calls,
+                ))])
+
+        executed_writes: list[int] = []
+        injected_documents: list[dict] = []
+
+        def fake_tool(db, name, args, **kwargs):
+            if name == "fetch_page":
+                return {
+                    "url": source_url,
+                    "title": "공식 안내",
+                    "text": (f"{first.title}의 위치와 방문 정보를 안내합니다. " * 120),
+                }
+            if name == "upsert_place_insights":
+                executed_writes.append(int(args["place_id"]))
+                injected_documents.extend(args.get("_validated_source_documents") or [])
+                marker = db.get(Marker, int(args["place_id"]))
+                marker.description = (
+                    f"{marker.title}은 선양 여행자가 방문할 수 있는 장소이며 위치, 역사, "
+                    "운영 정보와 동선을 함께 확인할 수 있도록 충분히 정리된 한국어 설명입니다."
+                )
+                db.add_all([
+                    PlaceInsight(
+                        place_id=marker.id,
+                        kind="location",
+                        title="위치",
+                        content="중심가에서 접근할 수 있습니다.",
+                        source_url=source_url,
+                    ),
+                    PlaceInsight(
+                        place_id=marker.id,
+                        kind="visit",
+                        title="방문",
+                        content="방문 전 공식 안내를 확인합니다.",
+                        source_url=source_url,
+                    ),
+                ])
+                db.flush()
+                db.expire(marker, ["insights"])
+                return {"ok": True, "changed": 2, "place_id": marker.id}
+            return run_tool(db, name, args, **kwargs)
+
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        )
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._select_autonomous_task", return_value=(task, "quality_or_backlog", False)),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[task.id]),
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+            patch("app.agent.runner.run_tool", side_effect=fake_tool),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=8,
+                autonomous_research=True,
+            )
+
+        self.assertEqual(rounds, 2)
+        self.assertEqual(executed_writes, [first.id])
+        self.assertEqual(injected_documents[0]["url"], source_url)
+        run = self.db.get(AgentRun, result["run_id"])
+        metrics = json.loads(run.metrics)
+        self.assertEqual(run.work_item_id, initial_item.id)
+        self.assertEqual(metrics["work_item_id"], initial_item.id)
+        self.assertEqual(metrics["next_work_item_id"], sibling.id)
+        self.assertEqual(metrics["continuity"]["work_item_id"], sibling.id)
+        self.assertEqual(active_work_item_for_mission(self.db, mission).id, sibling.id)
+        write_step = self.db.query(AgentRunStep).filter(
+            AgentRunStep.run_id == run.id,
+            AgentRunStep.tool == "upsert_place_insights",
+        ).one()
+        persisted_args = json.loads(write_step.detail)["args"]
+        self.assertNotIn("_validated_source_documents", persisted_args)
+        self.assertEqual(result["status"], "completed")
+
+    def test_one_image_search_and_parallel_blocker_cannot_close_target(self) -> None:
+        for event in self.db.query(PlaceEvent).all():
+            event.groq_read_at = datetime.now(timezone.utc)
+        first = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        second = Marker(
+            city_id=2,
+            category=MarkerCategory.tourist,
+            shape=MarkerShape.point,
+            title="第二无图地点 (두 번째 무사진 장소)",
+            description="한국어 설명",
+            lat=41.82,
+            lng=123.42,
+        )
+        self.db.add(second)
+        self.db.flush()
+        task = AgentTask(
+            city_id=2,
+            kind="quality_images",
+            title="이미지 차단 커서 전환 테스트",
+            detail=(
+                "대상:\n"
+                f"- #{first.id} {first.title} (현재: 사진 없음)\n"
+                f"- #{second.id} {second.title} (현재: 사진 없음)"
+            ),
+            success_metric="장소별 정확한 사진 또는 감사 가능한 냉각 상태",
+            priority=100,
+            status="pending",
+        )
+        self.db.add(task)
+        self.db.commit()
+        mission, initial_item = ensure_mission_for_task(self.db, task)
+        sibling = self.db.query(AgentWorkItem).filter(
+            AgentWorkItem.mission_id == mission.id,
+            AgentWorkItem.id != initial_item.id,
+        ).one()
+        rounds = 0
+        executed: list[tuple[str, int | None]] = []
+
+        class Completions:
+            def create(inner_self, **kwargs):
+                nonlocal rounds
+                rounds += 1
+                task_schema = next(
+                    tool["function"]["parameters"]
+                    for tool in kwargs["tools"]
+                    if tool["function"]["name"] == "upsert_agent_task"
+                )
+                self.assertEqual(task_schema["properties"]["task_id"]["enum"], [task.id])
+                self.assertEqual(task_schema["properties"]["status"]["enum"], ["blocked"])
+                if rounds == 1:
+                    calls = [
+                        SimpleNamespace(
+                            id="exact-image-search-1",
+                            function=SimpleNamespace(
+                                name="search_place_images",
+                                arguments=json.dumps({
+                                    "place_id": first.id,
+                                    "query": f"{first.title} exact exterior photo axis 1",
+                                }),
+                            ),
+                        ),
+                        SimpleNamespace(
+                            id="premature-image-block",
+                            function=SimpleNamespace(
+                                name="upsert_agent_task",
+                                arguments=json.dumps({
+                                    "task_id": task.id,
+                                    "status": "blocked",
+                                    "result": "검색 한 번만 보고 자료가 없다고 성급히 판단",
+                                }),
+                            ),
+                        ),
+                    ]
+                elif rounds in {2, 3}:
+                    calls = [SimpleNamespace(
+                        id=f"exact-image-search-{rounds}",
+                        function=SimpleNamespace(
+                            name="search_place_images",
+                            arguments=json.dumps({
+                                "place_id": first.id,
+                                "query": f"{first.title} exact exterior photo axis {rounds}",
+                            }),
+                        ),
+                    )]
+                else:
+                    self.fail("three clean exact searches must terminate without another provider round")
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="", tool_calls=calls,
+                ))])
+
+        def fake_tool(db, name, args, **kwargs):
+            executed.append((name, int(args["place_id"]) if args.get("place_id") is not None else None))
+            if name == "search_place_images":
+                return {"results": []}
+            return run_tool(db, name, args, **kwargs)
+
+        fake_groq = types.ModuleType("groq")
+        fake_groq.Groq = lambda **_kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions())
+        )
+        with (
+            patch.dict(sys.modules, {"groq": fake_groq}),
+            patch("app.agent.runner.settings.groq_api_key", "test-key"),
+            patch("app.agent.runner._select_autonomous_task", return_value=(task, "quality_or_backlog", False)),
+            patch("app.agent.runner._sync_quality_tasks", return_value=[task.id]),
+            patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
+            patch("app.agent.runner.run_tool", side_effect=fake_tool),
+        ):
+            result = run_agent(
+                self.db,
+                city_id=2,
+                max_steps=8,
+                autonomous_research=True,
+            )
+
+        self.assertEqual(rounds, 3)
+        self.assertEqual(
+            [name for name, _place_id in executed],
+            ["search_place_images", "search_place_images", "search_place_images"],
+        )
+        run = self.db.get(AgentRun, result["run_id"])
+        metrics = json.loads(run.metrics)
+        disposition = self.db.query(AgentQualityGapDisposition).filter(
+            AgentQualityGapDisposition.place_id == first.id,
+            AgentQualityGapDisposition.gap_kind == "image",
+        ).one()
+        self.assertEqual(disposition.status, "source_exhausted")
+        self.assertEqual(
+            json.loads(disposition.evidence_refs),
+            [
+                "run:%s:step:1" % run.id,
+                "run:%s:step:3" % run.id,
+                "run:%s:step:4" % run.id,
+            ],
+        )
+        self.assertEqual(run.work_item_id, initial_item.id)
+        self.assertEqual(metrics["work_item_id"], initial_item.id)
+        self.assertEqual(metrics["next_work_item_id"], sibling.id)
+        self.assertEqual(metrics["continuity"]["work_item_id"], sibling.id)
+        self.assertEqual(active_work_item_for_mission(self.db, mission).id, sibling.id)
+        self.assertEqual(
+            self.db.query(AgentRunStep).filter(
+                AgentRunStep.run_id == run.id,
+                AgentRunStep.tool == "upsert_agent_task",
+            ).count(),
+            1,
+        )
+        rejected_block = self.db.query(AgentRunStep).filter(
+            AgentRunStep.run_id == run.id,
+            AgentRunStep.tool == "upsert_agent_task",
+        ).one()
+        self.assertEqual(
+            json.loads(rejected_block.detail)["result"]["error"],
+            "quality_task_block_evidence_required",
+        )
+        self.assertEqual(result["status"], "completed")
 
     def test_third_clean_empty_image_search_records_source_exhausted_immediately(self) -> None:
         for event in self.db.query(PlaceEvent).all():
@@ -5063,6 +6181,33 @@ class AgentCityScopeTests(unittest.TestCase):
         for unavailable in ("create_place", "merge_places", "attach_image_from_url"):
             self.assertNotIn(unavailable, prompt)
 
+    def test_propose_place_schema_advertises_its_runtime_required_fields(self) -> None:
+        proposal = next(
+            item for item in TOOLS
+            if item["function"]["name"] == "propose_place"
+        )
+        schema = proposal["function"]["parameters"]
+        required = set(schema["required"])
+
+        self.assertTrue({
+            "title", "description", "lat", "lng", "travel_role",
+            "evidence", "source_urls", "confidence", "insights",
+        }.issubset(required))
+        self.assertEqual(schema["properties"]["description"]["type"], "string")
+        self.assertEqual(schema["properties"]["description"]["minLength"], 60)
+        self.assertEqual(schema["properties"]["travel_role"]["type"], "string")
+        self.assertEqual(schema["properties"]["source_urls"]["minItems"], 1)
+
+        # The compatibility/direct-create contract remains permissive.
+        create = next(
+            item for item in TOOLS
+            if item["function"]["name"] == "create_place"
+        )
+        self.assertEqual(
+            create["function"]["parameters"]["properties"]["description"]["type"],
+            ["string", "null"],
+        )
+
     def test_brave_place_candidates_are_transient_in_run_history(self) -> None:
         for event in self.db.query(PlaceEvent).all():
             event.groq_read_at = datetime.now(timezone.utc)
@@ -5381,14 +6526,64 @@ class AgentCityScopeTests(unittest.TestCase):
         fake_groq.Groq = lambda **_kwargs: SimpleNamespace(
             chat=SimpleNamespace(completions=Completions())
         )
+        curated_args = {
+            "title": "独立茶馆 (두리 차관)",
+            "description": (
+                "중제에서 차와 가벼운 휴식을 즐길 수 있는 독립 찻집으로, 공개 본문과 "
+                "저장 가능한 지오코딩에서 같은 상호와 지점을 확인했습니다."
+            ),
+            "address": "沈河区中街路88号",
+            "category": "drink",
+            "travel_role": "rest",
+            "lat": 41.8012,
+            "lng": 123.4521,
+            "evidence": "독립 공개 본문과 좌표 근거가 같은 찻집을 가리킵니다.",
+            "source_urls": [independent_url],
+            "confidence": 0.9,
+            "insights": [
+                {
+                    "kind": "location",
+                    "title": "위치",
+                    "content": "沈河区中街路88号에 있는 독립 찻집입니다.",
+                    "source_url": independent_url,
+                    "confidence": 0.9,
+                },
+                {
+                    "kind": "visit",
+                    "title": "방문 성격",
+                    "content": "중제 동선에서 차를 마시며 쉬어 가기 좋은 곳입니다.",
+                    "source_url": independent_url,
+                    "confidence": 0.8,
+                },
+            ],
+        }
+        role_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="자동 신규 장소 발굴 [휴식]: 선양",
+            detail="target_role: rest\n선양에서 휴식 역할 후보만 탐색",
+            success_metric="travel_role=rest인 검증 후보 제안",
+            priority=88,
+            status="pending",
+        )
+        self.db.add(role_task)
+        self.db.commit()
         with (
             patch.dict(sys.modules, {"groq": fake_groq}),
             patch("app.agent.runner.settings.groq_api_key", "test-key"),
             patch("app.agent.runner.settings.agent_allow_auto_create", False),
             patch("app.agent.runner._sync_quality_tasks", return_value=[]),
+            patch(
+                "app.agent.runner._select_autonomous_task",
+                return_value=(role_task, CANDIDATE_DISCOVERY_KIND, True),
+            ),
             patch("app.agent.runner._ensure_gap_tasks", return_value=[]),
             patch("app.agent.runner.run_tool", side_effect=fake_tool),
             patch("app.agent.tools._extract_page_text", side_effect=fake_extract),
+            patch(
+                "app.agent.runner.curate_grounded_candidate",
+                return_value={"ok": True, "args": curated_args},
+            ) as curator,
         ):
             result = run_agent(
                 self.db,
@@ -5400,10 +6595,12 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         proposal = self.db.query(AgentProposal).one()
         payload = json.loads(proposal.payload)
-        self.assertEqual(proposal.title, "独立茶馆 (음료점)")
+        self.assertEqual(proposal.title, "独立茶馆 (두리 차관)")
         self.assertEqual(payload["address"], "沈河区中街路88号")
         self.assertEqual((payload["lat"], payload["lng"]), (41.8012, 123.4521))
         self.assertEqual(payload["category"], "drink")
+        self.assertEqual(payload["travel_role"], "rest")
+        self.assertEqual(curator.call_args.kwargs["target_role"], "rest")
         self.assertEqual(payload["coordinate_source"], "nominatim")
         self.assertEqual(json.loads(proposal.source_urls), [independent_url])
         self.assertEqual(self.db.query(AgentWebVisit).count(), 0)
@@ -5743,6 +6940,246 @@ class AgentCityScopeTests(unittest.TestCase):
         ).all()
         self.assertEqual(len(phone_rows), 1)
 
+    def test_place_insights_reject_placeholder_and_unsupported_precise_facts(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.title = "鸣记脆皮烤鱼 (밍지 바삭 구이생선)"
+        place.branch_name = "辽大店"
+        place.description = "辽大路8号에 있는 지점"
+        place.coordinate_query = "鸣记脆皮烤鱼 辽大店 辽大路8号"
+        self.db.commit()
+        source_url = "https://example.test/liaoda-branch"
+        source_document = {
+            "url": source_url,
+            "title": "鸣记脆皮烤鱼(辽大店)",
+            "text": "鸣记脆皮烤鱼辽大店位于辽大路8号，每日11:00营业。",
+        }
+        base = {
+            "place_id": place.id,
+            "_validated_source_urls": [source_url],
+            "_validated_source_documents": [source_document],
+        }
+
+        placeholder = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                **base,
+                "insights": [{
+                    "kind": "location",
+                    "title": "연락처",
+                    "content": "주소는 辽大路8号이며 전화는 024-xxxxxxx입니다.",
+                    "source_url": source_url,
+                    "confidence": 0.9,
+                }],
+            },
+            city_id=2,
+        )
+        self.assertEqual(placeholder["error"], "insight_placeholder_forbidden")
+
+        unsupported = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                **base,
+                "insights": [{
+                    "kind": "visit",
+                    "title": "다른 지점 정보",
+                    "content": "辽宁省沈阳市大悦城A馆4楼에 있으며 22시까지 영업합니다.",
+                    "source_url": source_url,
+                    "confidence": 0.9,
+                }],
+            },
+            city_id=2,
+        )
+        self.assertEqual(unsupported["error"], "insight_claim_not_supported")
+
+        supported = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                **base,
+                "insights": [{
+                    "kind": "visit",
+                    "title": "확인된 방문 정보",
+                    "content": "辽大路8号에 있으며 11:00부터 영업합니다.",
+                    "source_url": source_url,
+                    "source_title": "모델이 임의로 쓴 출처 제목",
+                    "confidence": 0.9,
+                }],
+            },
+            city_id=2,
+        )
+        self.assertEqual(supported["changed"], 1)
+        stored = self.db.query(PlaceInsight).filter(
+            PlaceInsight.place_id == place.id,
+            PlaceInsight.title == "확인된 방문 정보",
+        ).one()
+        self.assertEqual(stored.source_title, source_document["title"])
+
+    def test_branch_claim_cannot_spoof_source_title_or_borrow_matching_hours(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.title = "鸣记脆皮烤鱼 (밍지 바삭 구이생선)"
+        place.branch_name = "沈阳大悦城店"
+        place.description = "大悦城A馆4楼에 있는 지점"
+        place.coordinate_query = "鸣记脆皮烤鱼 沈阳大悦城店 大悦城A馆4楼"
+        self.db.commit()
+        source_url = "https://example.test/liaoda-branch"
+        base = {
+            "place_id": place.id,
+            "_validated_source_urls": [source_url],
+            "_validated_source_documents": [{
+                "url": source_url,
+                "title": "鸣记脆皮烤鱼(辽大店)",
+                "text": "鸣记脆皮烤鱼辽大店位于辽大路8号，每日11:00营业。",
+            }],
+        }
+
+        borrowed_hours = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                **base,
+                "insights": [{
+                    "kind": "visit",
+                    "title": "영업시간",
+                    "content": "이 지점은 매일 11:00부터 영업합니다.",
+                    "source_url": source_url,
+                    # Model-authored metadata must not override the fetched title.
+                    "source_title": "鸣记脆皮烤鱼(沈阳大悦城店)",
+                    "confidence": 0.9,
+                }],
+            },
+            city_id=2,
+        )
+        self.assertEqual(borrowed_hours["error"], "insight_claim_context_mismatch")
+
+        translated_wrong_location = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                **{
+                    **base,
+                    "_validated_source_documents": [{
+                        "url": source_url,
+                        "title": "鸣记脆皮烤鱼(辽大店)",
+                        "text": (
+                            "鸣记脆皮烤鱼辽大店位于辽大商场A馆4层，"
+                            "每日11:00营业。"
+                        ),
+                    }],
+                },
+                "insights": [{
+                    "kind": "location",
+                    "title": "위치",
+                    "content": "다웨청 A관 4층에 있으며 11:00부터 영업합니다.",
+                    "source_url": source_url,
+                    "source_title": "鸣记脆皮烤鱼(沈阳大悦城店)",
+                    "confidence": 0.9,
+                }],
+            },
+            city_id=2,
+        )
+        self.assertEqual(translated_wrong_location["error"], "insight_claim_context_mismatch")
+
+    def test_supported_korean_building_translation_matches_chinese_structure(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.title = "鸣记脆皮烤鱼 (밍지 바삭 구이생선)"
+        place.branch_name = "沈阳大悦城店"
+        place.description = "大悦城A馆4楼에 있는 지점"
+        place.coordinate_query = "鸣记脆皮烤鱼 沈阳大悦城店 大悦城A馆4楼"
+        self.db.commit()
+        for index, source_floor in enumerate(("4层", "4楼"), start=1):
+            with self.subTest(source_floor=source_floor):
+                source_url = f"https://example.test/dayuecheng-branch-{index}"
+                result = run_tool(
+                    self.db,
+                    "upsert_place_insights",
+                    {
+                        "place_id": place.id,
+                        "insights": [{
+                            "kind": "location",
+                            "title": f"매장 위치 {index}",
+                            "content": "다웨청 A관 4층에 있으며 매일 11:00부터 영업합니다.",
+                            "source_url": source_url,
+                            "confidence": 0.9,
+                        }],
+                        "_validated_source_urls": [source_url],
+                        "_validated_source_documents": [{
+                            "url": source_url,
+                            "title": "鸣记脆皮烤鱼(沈阳大悦城店)",
+                            "text": (
+                                "鸣记脆皮烤鱼沈阳大悦城店位于大悦城A馆"
+                                f"{source_floor}，每日11:00营业。"
+                            ),
+                        }],
+                    },
+                    city_id=2,
+                )
+
+                self.assertEqual(result["changed"], 1)
+
+    def test_official_hotel_name_and_exact_address_can_replace_missing_branch_token(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.title = "瀋陽中街故宮漫心酒店 (선양 중제 고궁 만신 호텔)"
+        place.branch_name = "中街故宫店"
+        place.description = "주소: 北中街路118号에 있는 숙소"
+        place.coordinate_query = "瀋陽中街故宮漫心酒店 北中街路118号"
+        self.db.commit()
+        source_url = "https://hotel.example.test/manxin"
+
+        result = run_tool(
+            self.db,
+            "upsert_place_insights",
+            {
+                "place_id": place.id,
+                "insights": [{
+                    "kind": "visit",
+                    "title": "체크인과 위치",
+                    "content": "北中街路118号에 있으며 체크인은 14:00부터입니다.",
+                    "source_url": source_url,
+                    "confidence": 0.9,
+                }],
+                "_validated_source_urls": [source_url],
+                "_validated_source_documents": [{
+                    "url": source_url,
+                    "title": "沈阳中街故宫漫心酒店",
+                    "text": "沈阳中街故宫漫心酒店位于北中街路118号，入住时间为14:00。",
+                }],
+            },
+            city_id=2,
+        )
+
+        self.assertEqual(result["changed"], 1)
+
+    def test_exact_name_large_public_feature_matches_across_representative_points(self) -> None:
+        place = self.db.query(Marker).filter(Marker.city_id == 2).one()
+        place.title = "民生大街 (민생대가)"
+        place.category = MarkerCategory.tourist
+        place.lat = 41.8000
+        place.lng = 123.4500
+        place.branch_name = ""
+        self.db.commit()
+
+        duplicate = _matching_existing_place(
+            self.db,
+            city_id=2,
+            title="民生大街 (산책 거리)",
+            lat=41.8028,
+            lng=123.4500,
+            category="tourist",
+        )
+        self.assertEqual(duplicate.id, place.id)
+
+        branch_sensitive = _matching_existing_place(
+            self.db,
+            city_id=2,
+            title="民生大街 (산책 거리)",
+            lat=41.8028,
+            lng=123.4500,
+            category="restaurant",
+        )
+        self.assertIsNone(branch_sensitive)
+
     def test_branch_insight_rejects_brand_general_source(self) -> None:
         place = self.db.query(Marker).filter(Marker.city_id == 2).one()
         place.branch_name = "沈阳大悦城店"
@@ -5945,7 +7382,10 @@ class AgentCityScopeTests(unittest.TestCase):
             "propose_place",
             {
                 "title": "北陵公园 (베이링 공원)",
-                "description": "청 황실 능원과 공원을 함께 보는 장소입니다.",
+                "description": (
+                    "청 황실 능원과 넓은 공원을 한 동선에서 둘러볼 수 있는 선양 북부의 역사 명소로, "
+                    "도심 관광 사이에 산책과 청대 문화 이해를 함께 하기 좋은 장소입니다."
+                ),
                 "category": "tourist",
                 "lat": 41.85,
                 "lng": 123.43,
@@ -5974,6 +7414,27 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertTrue(result["proposal_created"])
         self.assertEqual(self.db.query(AgentProposal).count(), 1)
 
+    def test_ordinary_proposal_rejects_generic_korean_place_type(self) -> None:
+        result = run_tool(
+            self.db,
+            "propose_place",
+            {
+                "title": "辽宁省博物馆 (박물관)",
+                "description": (
+                    "랴오닝 지역의 역사와 문화를 살펴볼 수 있는 전시 공간으로, 선양 여행에서 시대별 "
+                    "유물을 비교하고 지역 배경을 이해하기 위해 방문할 수 있는 장소입니다."
+                ),
+                "category": "tourist",
+                "lat": 41.68,
+                "lng": 123.46,
+                "source_urls": ["https://example.test/museum"],
+                "insights": [],
+            },
+            city_id=2,
+        )
+
+        self.assertEqual(result["error"], "specific_korean_name_required")
+
     def test_same_pending_place_title_is_deduplicated_and_completes_legacy_task(self) -> None:
         legacy_task = AgentTask(
             city_id=2,
@@ -5984,7 +7445,10 @@ class AgentCityScopeTests(unittest.TestCase):
         self.db.commit()
         base = {
             "title": "北陵公园 (베이링 공원)",
-            "description": "청 황실 능원과 공원을 함께 보는 장소입니다.",
+            "description": (
+                "청 황실 능원과 넓은 공원을 한 동선에서 둘러볼 수 있는 선양 북부의 역사 명소로, "
+                "도심 관광 사이에 산책과 청대 문화 이해를 함께 하기 좋은 장소입니다."
+            ),
             "category": "tourist",
             "lat": 41.85,
             "lng": 123.43,
@@ -6040,6 +7504,8 @@ class AgentCityScopeTests(unittest.TestCase):
             "propose_place",
             {
                 "title": "鸣记脆皮烤鱼 (밍지 바삭 구이생선)",
+                # Duplicate identity must short-circuit before proposal prose
+                # quality gates; no new row will store this thin description.
                 "description": "주소: 辽宁省沈阳市大东区小东路6号. 구이 생선 전문점입니다.",
                 "category": "restaurant",
                 "lat": 41.8007,

@@ -108,7 +108,8 @@ resource "aws_sfn_state_machine" "agent" {
         ItemsPath      = "$.city_ids"
         MaxConcurrency = 1
         ItemSelector = {
-          "city_id.$" = "$$.Map.Item.Value"
+          "city_id.$"             = "$$.Map.Item.Value"
+          "autonomous_research.$" = "$$.Execution.Input.autonomous_research"
         }
         ItemProcessor = {
           ProcessorConfig = {
@@ -144,6 +145,10 @@ resource "aws_sfn_state_machine" "agent" {
                           Name      = "AGENT_CITY_ID"
                           "Value.$" = "States.Format('{}', $.city_id)"
                         },
+                        {
+                          Name      = "AGENT_AUTONOMOUS_RESEARCH"
+                          "Value.$" = "States.Format('{}', $.autonomous_research)"
+                        },
                       ]
                     }
                   ]
@@ -157,6 +162,30 @@ resource "aws_sfn_state_machine" "agent" {
                   MaxAttempts     = 2
                 }
               ]
+              Catch = [
+                {
+                  ErrorEquals = ["States.ALL"]
+                  ResultPath  = "$.failure"
+                  Next        = "RecordCityFailure"
+                }
+              ]
+              End = true
+            }
+            RecordCityFailure = {
+              Type = "Pass"
+              Parameters = {
+                cities = [
+                  {
+                    "city_id.$" = "$.city_id"
+                    ok          = false
+                    status      = "failed"
+                    outcome     = "workflow_failed"
+                    steps       = 0
+                    score       = 0
+                    "message.$" = "States.Format('City agent failed after retries: {}', $.failure.Error)"
+                  }
+                ]
+              }
               End = true
             }
           }
@@ -167,6 +196,30 @@ resource "aws_sfn_state_machine" "agent" {
   })
 
   depends_on = [aws_iam_role_policy.agent_step_functions]
+}
+
+# The production admin API starts and polls the same workflow used by the
+# schedule. This avoids running an agent inside the long-lived API task, so
+# Step Functions retries receive a fresh Fargate ENI/public IP.
+resource "aws_iam_role_policy" "ecs_task_agent_state_machine" {
+  name = "${local.name_prefix}-ecs-task-agent-sfn"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["states:StartExecution", "states:ListExecutions"]
+        Resource = [aws_sfn_state_machine.agent.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["states:DescribeExecution"]
+        Resource = ["${replace(aws_sfn_state_machine.agent.arn, ":stateMachine:", ":execution:")}:*"]
+      },
+    ]
+  })
 }
 
 resource "aws_iam_role" "events_ecs" {
@@ -211,5 +264,8 @@ resource "aws_cloudwatch_event_target" "agent_daily" {
   target_id = "step-functions-agent"
   arn       = aws_sfn_state_machine.agent.arn
   role_arn  = aws_iam_role.events_ecs.arn
-  input     = jsonencode({ city_ids = [1, 2] })
+  input = jsonencode({
+    city_ids            = [1, 2]
+    autonomous_research = true
+  })
 }

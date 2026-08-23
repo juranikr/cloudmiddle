@@ -40,8 +40,13 @@ class AgentIntegrityIntegrationTests(unittest.TestCase):
     def _proposal_args(title, url, lat, lng, *, branch=""):
         return {
             "title": title,
-            "description": f"{title}의 선양 지점입니다.",
+            "description": (
+                f"{title}은 선양 도심에서 음료나 간식을 고를 수 있는 실제 지점입니다. "
+                "상세 페이지의 상호·지점·좌표 근거를 함께 확인했으며 여행 동선에서 잠시 "
+                "쉬어 가거나 포장 구매하기 좋은 후보로 검토할 수 있습니다."
+            ),
             "category": "drink",
+            "travel_role": "food",
             "branch_name": branch,
             "lat": lat + 0.05,  # model-provided location must be ignored
             "lng": lng + 0.05,

@@ -1,6 +1,8 @@
 import type {
   AdminAgentRunStep,
   AdminAgentAction,
+  AdminAgentNextCursor,
+  AdminAgentOutcomeCategory,
   AdminAgentProposal,
   AdminAgentRunHistory,
   AdminAgentTask,
@@ -281,13 +283,21 @@ export interface AgentRunResult {
   performance: Record<string, number>;
   remaining_gaps: string[];
   run_id: number | null;
+  outcome?: string | null;
 }
 
 export interface AgentRunStatus {
   running: boolean;
+  city_id: number | null;
   started_at: string | null;
   finished_at: string | null;
   result: AgentRunResult | null;
+  execution_arn: string | null;
+  backend: "local" | "step_functions" | string;
+  outcome_category: AdminAgentOutcomeCategory | null;
+  material_change_count: number;
+  next_work_item_id: number | null;
+  next_cursor: AdminAgentNextCursor;
 }
 
 export async function startAdminAgent(
@@ -303,8 +313,9 @@ export async function startAdminAgent(
   return handle(res);
 }
 
-export async function fetchAdminAgentStatus(token: string): Promise<AgentRunStatus> {
-  const res = await request("/api/admin/agent/run/status", {
+export async function fetchAdminAgentStatus(token: string, cityId?: number): Promise<AgentRunStatus> {
+  const query = cityId ? `?city_id=${encodeURIComponent(cityId)}` : "";
+  const res = await request(`/api/admin/agent/run/status${query}`, {
     headers: authHeaders(token),
   });
   return handle(res);

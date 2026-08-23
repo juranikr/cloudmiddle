@@ -1084,6 +1084,236 @@ def finish_model_recovery_attempt(
     return lesson
 
 
+def _candidate_structured_handoff(
+    tool: str,
+    args: dict[str, Any],
+    result: Any,
+    evidence_rows: list[AgentEvidence],
+) -> dict[str, Any] | None:
+    """Build a resumable action only from independently retainable evidence."""
+
+    if not isinstance(result, dict) or result.get("error"):
+        return None
+    if tool == "geocode_place":
+        for row in result.get("results") or []:
+            if (
+                not isinstance(row, dict)
+                or row.get("storage_allowed") is not True
+                or str(row.get("source") or "").casefold().startswith("brave")
+                or row.get("lat") is None
+                or row.get("lng") is None
+            ):
+                continue
+            identity = str(row.get("title") or row.get("display_name") or row.get("name") or "").strip()
+            address = str(row.get("address") or "").strip()
+            if not identity:
+                continue
+            exact_query = " ".join(
+                value for value in (f'"{identity[:160]}"', f'"{address[:180]}"' if address else "", "官方 地址 营业时间")
+                if value
+            )[:500]
+            return {
+                "handoff_version": "candidate_dossier_v1",
+                "tool": "web_search",
+                "args": {"query": exact_query},
+                "candidate": {
+                    "display_name": identity[:240],
+                    "address": address[:300],
+                    "lat": row.get("lat"),
+                    "lng": row.get("lng"),
+                    "source": str(row.get("source") or "")[:80],
+                    "external_id": str(row.get("external_id") or "")[:240],
+                    "source_url": str(row.get("source_url") or "")[:1000],
+                },
+                "source_axis": {
+                    "kind": "storable_geocoder",
+                    "provider": str(row.get("source") or "")[:80],
+                },
+                "next_exact_query": exact_query,
+                "purpose": "독립 좌표로 고정한 같은 지점의 공개 본문을 정확 검색",
+            }
+    if tool == "fetch_page" and evidence_rows:
+        source = next(
+            (row for row in reversed(evidence_rows) if row.source_status == "validated"),
+            evidence_rows[-1],
+        )
+        if not str(source.url or "").startswith(("http://", "https://")):
+            return None
+        identity = str(source.title or result.get("title") or "").strip()
+        if not identity:
+            return None
+        exact_query = identity[:300]
+        return {
+            "handoff_version": "candidate_source_v1",
+            "tool": "geocode_place",
+            "args": {"query": exact_query},
+            "candidate": {"display_name": identity[:240]},
+            "source_axis": {
+                "kind": "validated_public_page",
+                "host": _host(source.url),
+                "url": source.url[:1000],
+            },
+            "next_exact_query": exact_query,
+            "purpose": "검증한 공개 본문의 정확한 장소명을 저장 가능한 좌표 공급자로 확인",
+        }
+    if tool == "web_search" and evidence_rows:
+        source = next(
+            (row for row in evidence_rows if row.source_status == "discovered"),
+            None,
+        )
+        if source is None or not str(source.url or "").startswith(("http://", "https://")):
+            return None
+        return {
+            "handoff_version": "candidate_source_v1",
+            "tool": "fetch_page",
+            "args": {"url": source.url[:1000]},
+            "candidate": {"display_name": str(source.title or "")[:240]},
+            "source_axis": {
+                "kind": "search_result",
+                "host": _host(source.url),
+                "url": source.url[:1000],
+            },
+            "next_exact_query": str(args.get("query") or "")[:500],
+            "purpose": "검색 요약이 아닌 새 출처 본문 검증",
+        }
+    return None
+
+
+def _candidate_fetch_failure_handoff(
+    db: Session,
+    *,
+    mission: AgentMission,
+    item: AgentWorkItem,
+    prior_next_action: dict[str, Any],
+    args: dict[str, Any],
+    error: str,
+) -> dict[str, Any] | None:
+    """Advance a retained candidate dossier past one failed source URL.
+
+    Keeping the candidate is useful; keeping the exact failed ``fetch_page``
+    action is not.  Prefer another discovered-but-unread URL from this work
+    item.  When none remains, retain the identity and switch to an exact search
+    axis that excludes the failed hosts.
+    """
+
+    if (
+        not str(prior_next_action.get("handoff_version") or "").startswith("candidate_")
+        or prior_next_action.get("tool") != "fetch_page"
+    ):
+        return None
+    prior_args = (
+        prior_next_action.get("args")
+        if isinstance(prior_next_action.get("args"), dict)
+        else {}
+    )
+    failed_url = str(args.get("url") or prior_args.get("url") or "").strip()
+    if not failed_url.startswith(("http://", "https://")):
+        return None
+
+    evidence_rows = (
+        db.query(AgentEvidence)
+        .filter(
+            AgentEvidence.mission_id == mission.id,
+            AgentEvidence.work_item_id == item.id,
+        )
+        .order_by(AgentEvidence.id.asc())
+        .all()
+    )
+    unavailable_urls = {
+        str(row.url or "").strip()
+        for row in evidence_rows
+        if row.source_status in {"validated", "rejected", "blocked", "failed"}
+        and str(row.url or "").strip()
+    }
+    unavailable_urls.add(failed_url)
+
+    remaining_source: AgentEvidence | None = None
+    seen_urls: set[str] = set()
+    for row in evidence_rows:
+        source_url = str(row.url or "").strip()
+        if (
+            row.source_status != "discovered"
+            or not source_url.startswith(("http://", "https://"))
+            or source_url in unavailable_urls
+            or source_url in seen_urls
+        ):
+            continue
+        seen_urls.add(source_url)
+        remaining_source = row
+        break
+
+    failed_sources = [
+        dict(value)
+        for value in (prior_next_action.get("failed_sources") or [])
+        if isinstance(value, dict) and str(value.get("url") or "").strip()
+    ]
+    failed_record = {
+        "url": failed_url[:1000],
+        "host": _host(failed_url),
+        "error": str(error or "fetch_failed")[:160],
+    }
+    if not any(str(value.get("url") or "") == failed_url for value in failed_sources):
+        failed_sources.append(failed_record)
+    failed_sources = failed_sources[-8:]
+
+    next_action = dict(prior_next_action)
+    next_action.update({
+        "failed_source": failed_record,
+        "failed_sources": failed_sources,
+        "last_error": str(error or "fetch_failed")[:160],
+    })
+    if remaining_source is not None:
+        next_url = str(remaining_source.url)
+        next_action.update({
+            "tool": "fetch_page",
+            "args": {"url": next_url[:1000]},
+            "source_axis": {
+                "kind": "search_result",
+                "host": _host(next_url),
+                "url": next_url[:1000],
+            },
+            "purpose": "실패한 출처를 제외하고 같은 검색에서 발견한 미열람 본문 검증",
+        })
+        return next_action
+
+    candidate = (
+        prior_next_action.get("candidate")
+        if isinstance(prior_next_action.get("candidate"), dict)
+        else {}
+    )
+    identity = str(candidate.get("display_name") or "").strip()
+    address = str(candidate.get("address") or "").strip()
+    if not address and "," in identity:
+        _identity, _separator, display_address = identity.partition(",")
+        address = display_address.strip()
+    base_query = str(prior_next_action.get("next_exact_query") or "").strip()
+    query_parts = [
+        f'"{identity[:160]}"' if identity else base_query[:300],
+        f'"{address[:180]}"' if address and address.casefold() not in identity.casefold() else "",
+        "官方 地址 营业时间",
+    ]
+    failed_hosts = sorted({
+        str(value.get("host") or _host(str(value.get("url") or ""))).strip()
+        for value in failed_sources
+        if str(value.get("host") or _host(str(value.get("url") or ""))).strip()
+    })
+    query_parts.extend(f"-site:{host}" for host in failed_hosts[:3])
+    alternative_query = " ".join(value for value in query_parts if value).strip()[:500]
+    if not alternative_query:
+        return None
+    next_action.update({
+        "tool": "web_search",
+        "args": {"query": alternative_query},
+        "source_axis": {
+            "kind": "alternative_exact_search",
+            "excluded_hosts": failed_hosts[:3],
+        },
+        "next_exact_query": alternative_query,
+        "purpose": "보존된 정확 후보를 실패한 호스트가 아닌 독립 출처 축에서 재검증",
+    })
+    return next_action
+
+
 def checkpoint_after_tool(
     db: Session,
     *,
@@ -1126,6 +1356,7 @@ def checkpoint_after_tool(
     facts: list[str] = []
     rejected: list[str] = []
     failures = _json_list(item.failed_approaches)
+    prior_next_action = _json_dict(item.next_action)
     next_action: dict[str, Any]
 
     source_status, rejection_reason = _source_status(tool, result, outcome)
@@ -1161,6 +1392,12 @@ def checkpoint_after_tool(
             db.flush()
         evidence_rows.append(row)
 
+    candidate_handoff = (
+        _candidate_structured_handoff(tool, args, result, evidence_rows)
+        if mission.kind == "candidate_discovery"
+        else None
+    )
+
     if material_change:
         # Checkpoints and promoted lessons retain the historical failures, but
         # deliberate rotation is based on consecutive failures since the most
@@ -1175,14 +1412,26 @@ def checkpoint_after_tool(
         if unseen is not None:
             facts.append(f"새 출처 후보 {len([row for row in evidence_rows if row.source_status == 'discovered'])}건 발견")
             item.stage = "read"
-            next_action = {"tool": "fetch_page", "args": {"url": unseen.url}, "purpose": "검색 요약이 아닌 본문 검증"}
+            next_action = candidate_handoff or {
+                "tool": "fetch_page",
+                "args": {"url": unseen.url},
+                "purpose": "검색 요약이 아닌 본문 검증",
+            }
         else:
             item.stage = "research"
             next_action = {"tool": "choose_alternative_source", "purpose": "모든 결과가 기존 열람 항목이므로 다른 출처 축 선택"}
     elif tool == "fetch_page" and source_status == "validated" and evidence_rows:
         facts.append("출처 본문을 읽어 저장 판단이 가능함")
         item.stage = "decide"
-        next_action = {"tool": "decide", "source_url": evidence_rows[0].url, "purpose": "주장-대상 일치 확인 후 안전한 저장 또는 기각"}
+        next_action = candidate_handoff or {
+            "tool": "decide",
+            "source_url": evidence_rows[0].url,
+            "purpose": "주장-대상 일치 확인 후 안전한 저장 또는 기각",
+        }
+    elif candidate_handoff is not None:
+        facts.append("독립 보존 가능한 후보 식별자와 다음 정확 질의를 인계함")
+        item.stage = "research"
+        next_action = candidate_handoff
     elif is_policy_guard and guard_disposition == "decide":
         # Policy guards describe an invalid action choice, not a failed source
         # or investigation path. Keep the actual failure budget untouched and
@@ -1237,7 +1486,33 @@ def checkpoint_after_tool(
             failures.append(failure)
         rejected.append(failure)
         item.stage = "research"
-        next_action = {"tool": "choose_alternative_source", "purpose": "같은 호출을 반복하지 않고 다른 출처 축 선택"}
+        advanced_candidate_handoff = (
+            _candidate_fetch_failure_handoff(
+                db,
+                mission=mission,
+                item=item,
+                prior_next_action=prior_next_action,
+                args=args,
+                error=error,
+            )
+            if mission.kind == "candidate_discovery" and tool == "fetch_page"
+            else None
+        )
+        if advanced_candidate_handoff is not None:
+            next_action = advanced_candidate_handoff
+        elif (
+            mission.kind == "candidate_discovery"
+            and str(prior_next_action.get("handoff_version") or "").startswith("candidate_")
+        ):
+            # A later source/guard failure must not erase a retainable exact
+            # candidate dossier and turn the next run back into a broad search.
+            next_action = dict(prior_next_action)
+            next_action["last_error"] = error[:160]
+            next_action["purpose"] = (
+                "보존된 정확 후보를 유지하고 실패한 출처가 아닌 독립 출처 축으로 계속 검증"
+            )
+        else:
+            next_action = {"tool": "choose_alternative_source", "purpose": "같은 호출을 반복하지 않고 다른 출처 축 선택"}
     else:
         item.stage = "research" if tool in {"web_search", "fetch_page"} else item.stage
         next_action = _json_dict(item.next_action) or {"tool": "continue", "purpose": "현재 성공조건에 가장 가까운 행동"}
@@ -1563,17 +1838,37 @@ def finalize_mission(
             mission.status = "paused"
             mission.completed_at = None
             mission.updated_at = now
+            candidate_retry_after = (
+                now + timedelta(hours=12)
+                if mission.kind == "candidate_discovery"
+                else None
+            )
             for item in terminal_items:
                 item.status = "blocked"
                 item.blocked_reason = (task.result or "과제가 차단 상태로 종료됨")[:3000]
-                item.retry_condition = "다음 예약된 discovery slice에서 새 출처 조건으로 재평가"
+                item.retry_condition = (
+                    f"{candidate_retry_after.isoformat()} 이후 같은 체크포인트를 재평가"
+                    if candidate_retry_after is not None
+                    else "새 출처 조건이 생긴 뒤 재평가"
+                )
                 item.updated_at = now
-            mission.progress = _dump({
+            progress = _json_dict(mission.progress)
+            progress.update({
                 "active_work_item_id": None,
                 "resume_work_item_id": terminal_items[0].id if terminal_items else None,
                 "terminal_task_status": "blocked",
-                "retry_condition": "다음 예약된 discovery slice에서 같은 체크포인트로 재개",
+                "retry_condition": (
+                    "12시간 냉각 뒤 같은 체크포인트를 재개"
+                    if candidate_retry_after is not None
+                    else "새 출처 조건이 생긴 뒤 같은 체크포인트를 재개"
+                ),
+                "retry_after": (
+                    candidate_retry_after.isoformat()
+                    if candidate_retry_after is not None
+                    else None
+                ),
             })
+            mission.progress = _dump(progress)
     if commit:
         db.commit()
 
