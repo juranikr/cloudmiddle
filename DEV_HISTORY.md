@@ -4,7 +4,7 @@
 > Cursor 에이전트는 작업 시작 전 반드시 읽고, 요청·수정이 끝날 때마다 갱신한 뒤 GitHub `main`에 push 합니다.  
 > 규칙: `.cursor/rules/dev-history.mdc`
 
-최종 갱신: 2026-08-23 (KST) — 삭제 후에도 이어지는 도시별 이력·결정론적 큐 학습 보강
+최종 갱신: 2026-08-23 (KST) — 신규 장소 발굴을 역할 비중 기반의 연속 프런티어로 전환
 
 ---
 
@@ -77,6 +77,8 @@
   - 시스템 교정·관리자 롤백·동일한 영속 ID 또는 제목+위치 스냅샷으로 같은 실체임이 입증된 생성→삭제 이력은 모델이 재검색하지 않고 검증된 `AgentLesson`/`AgentKnowledge`로 승격한 뒤 읽음 처리하며, 일반 사용자 요청은 그대로 모델 큐에 보존
   - 동일 조사 호출 차단, 새 근거 없는 행동 감지, 측정 가능한 후속 과제와 자동 공백 해소로 고정 스텝 대신 성과 기반 종료
   - 신규 장소 발굴은 별도 `candidate_discovery` 미션으로 주기적 시간을 보장하고, 실제 검색·본문/좌표 검증 뒤 `agent_proposals`를 만든 경우에만 완료
+  - 역할 수치(역사2·음식3·시장/야간2·동네2·자연2·쇼핑1·휴식1·실용1)는 완료 최소선/상한이 아니라 지속 배분 **가중치**. 활성 체크포인트를 먼저 끝낸 뒤 `현재 장소·대기 제안 수 / 가중치`가 가장 낮은 실행 가능 역할로 공정 회전하며, 한 역할의 모든 프런티어가 실제 냉각 중일 때만 그 역할을 잠시 제외
+  - 후보 미션 냉각은 일반 `updated_at`이 아니라 `agent_missions.blocked_at`/`retry_after`에 UTC 절대시각으로 저장하고 progress에도 감사용으로 복제. 관리 이력에서 역할별 수·비중·냉각 역할·가장 빠른 재개 시각을 한국어로 표시
   - 사진·구역처럼 현재 해결 불가능한 결손은 `agent_quality_gap_dispositions`에 근거·조건 지문·냉각 시간을 남겨 같은 실패를 매 배치 반복하지 않고 조건이 바뀌면 자동 재개
   - Brave Place는 배치의 일시적 발견 단서로만 사용하며 응답 원문·ID·건수·후속 질의·모델 자유서술을 DB/실행 이력/로그에 보존하지 않음. 일반 대화에는 Brave를 노출하지 않고 독립 출처로 재검증된 canonical 값만 제안 가능
 - **메시지함** UI (상단) + 장소 상세/메시지에서 이의신청
@@ -167,6 +169,20 @@ IAM trust는 `repo:juranikr/cloudmiddle:*` **와** `repo:juranikr@*/cloudmiddle@
 ---
 
 ## 7) 히스토리 타임라인
+
+### 2026-08-23 — 역할 최소선 제거 + 가중 프런티어 운영 검증
+- 증상: `history=2, food=3, ...`를 최소 충족선으로 해석해 모든 역할이 작은 기준을 채우면 `_ensure_candidate_discovery_task`가 영구 `None`을 반환. 운영 run #145·#146의 `Defer candidate discovery until a role frontier becomes executable.`는 시간이 지나도 저절로 풀릴 조건이 아니었음
+- 수치를 지속 배분 가중치로 재정의하고 모든 역할을 항상 후보로 유지. 새 프런티어는 `role_count / weight` 최솟값을 고르고, 동률은 역할별 최근 유효 미션과 고정 순서로 결정론적 회전. 활성 pending/no-mission 커서는 완료·명시적 차단까지 먼저 재개해 실행 간 의식·근거 인계를 보존
+- 역할의 열린 프런티어가 **전부** 냉각 중일 때만 역할을 제외. active 또는 냉각 만료 paused 형제가 하나라도 있으면 실행 가능하며, 중복 cooling 행의 재개시각은 가장 먼저 풀리는 `min(retry_after)`. 모든 역할이 실제 냉각 중일 때만 0-step defer
+- `CANDIDATE_ROLE_TARGETS` 이름과 하드 목표 기반 research gap/프롬프트를 제거하고 `CANDIDATE_ROLE_WEIGHTS`로 통일. 역할 없는 task/mission, task·mission 역할 불일치 레거시는 체크포인트를 보존한 채 격리하고, 완료 task에 남은 active/paused 미션은 완료/done으로 정합화
+- `AgentMission.blocked_at`/`retry_after` 컬럼·인덱스를 추가. 레거시는 progress의 명시적 시각을 우선하고 없을 때만 기존 `updated_at+12h`를 일회성 백필하며, 이후 체크포인트/복구 메모 수정이 냉각을 연장하지 않음
+- 최초 운영 run #147에서 새 정책이 `neighborhood`(2/2=1.00) task #61·mission #31을 실제 29단계 조사한 것을 확인. 레거시 무역할 task #60/mission #29/work item #124도 `legacy_unscoped_task`로 격리. 제안은 `coordinate_target_not_verified` 안전 게이트로 저장되지 않아 `partial`·실질 변경 0건
+- #147 실측에서 무성과 회전 경로가 mission을 paused로 만들면서 새 deadline 컬럼을 비우는 추가 결함 발견. `finalize_mission`·`rotate_blocked_work_item`·`reconcile_work_items`가 같은 UTC pause helper를 쓰도록 보완하고, API 재기동 시 #147도 `blocked_at=2026-08-23T14:08:38Z`, `retry_after=2026-08-24T02:08:38Z`로 백필
+- 연속 실행: #148은 기존 품질 mission #2를 이어 장소 #112를 `verify_place`해 `completed`, score 4.5, 실질 변경 1건; #149도 같은 mission #2의 다음 work item #127을 이어 서버 종결조건으로 완료. 두 품질 슬롯 뒤 #150은 냉각 중인 동네 역할을 건너뛰고 동률의 다음 역할 `shopping`(1/1=1.00) task #62·mission #32를 선택
+- #150은 21단계 조사 후 좌표·독립본문 게이트를 넘지 못해 제안 없이 `partial`로 정직하게 종료했지만, 새 mission #32의 컬럼과 progress 양쪽에 정확한 `blocked_at=2026-08-23T14:32:02Z`, `retry_after=2026-08-24T02:32:02Z` 저장 확인. 이는 스케줄러 회전 성공과 후보 품질 미통과를 분리해 보여줌
+- 관리자 API/UI: 내부 영어 objective를 숨기고 `deferred_context`로 한국어 사유, 역할별 장소·대기 제안 수, 상대 비중(%), 냉각 상태, 최초 재개시각을 현재 실행과 이력에 표시. 오래되거나 오염된 metrics도 허용 목록·타입 변환으로 안전 정규화
+- 검증: 백엔드 376개 테스트, 프런트 production build, Python compileall, Docker PostgreSQL 마이그레이션·API health/login/cities를 포함한 `dev/predeploy.ps1` 전체 통과. 최종 운영 미읽음 이벤트 0, 열린 이의 0, 영구 running run 0
+- 운영 배포: 정책 commit `77d3c4e` / Actions `32644133204`, 회전 deadline 보완 commit `88cb97f` / Actions `32645158246` 성공. ECS steady state 및 `/api/health` 정상
 
 ### 2026-08-23 — 삭제된 장소 이력 복구 + 정정 이력의 결정론적 학습
 - 운영 수동 run #136·#137과 정기 run #139를 추적한 결과, 선양의 시스템 정정 3건을 모델이 새 수정 요청으로 오해해 매번 19~24라운드 검색하면서도 `Partial`, 미읽음 `3→3`, 실제 변경 0건으로 끝나는 문제를 재현
