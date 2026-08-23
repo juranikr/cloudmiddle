@@ -272,6 +272,14 @@ export interface AdminAgentNextCursor {
   wait_reason?: string;
 }
 
+export interface AdminAgentDeferredContext {
+  reason: string;
+  role_counts: Record<string, number>;
+  role_weights: Record<string, number>;
+  cooling_roles: string[];
+  next_retry_at: string | null;
+}
+
 export interface AdminAgentRunHistory {
   id: number;
   city_id: number;
@@ -288,6 +296,7 @@ export interface AdminAgentRunHistory {
   material_change_count: number;
   next_work_item_id: number | null;
   next_cursor: AdminAgentNextCursor;
+  deferred_context?: AdminAgentDeferredContext | null;
 }
 
 export interface AdminAgentRunStep {

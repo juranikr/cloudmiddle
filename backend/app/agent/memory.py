@@ -67,10 +67,15 @@ QUALITY_GAPS_BY_TASK_KIND = {
     "quality_information": frozenset({"description", "insights"}),
     "quality_drafts": QUALITY_GAP_KINDS,
 }
+CANDIDATE_MISSION_COOLDOWN_HOURS = 12
 
 
 def _utc(value: datetime) -> datetime:
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return (
+        value.astimezone(timezone.utc)
+        if value.tzinfo is not None
+        else value.replace(tzinfo=timezone.utc)
+    )
 
 
 def quality_gaps_for_marker(marker: Marker) -> list[str]:
@@ -439,6 +444,11 @@ def ensure_mission_for_task(db: Session, task: AgentTask) -> tuple[AgentMission,
         mission.success_metric = task.success_metric
         mission.priority = task.priority
         mission.status = "active"
+        # The scheduler must already have established that the explicit retry
+        # condition is due before resuming a paused mission. Clear the active
+        # pause fields now; the prior checkpoint/progress remains auditable.
+        mission.blocked_at = None
+        mission.retry_after = None
 
     targets = _place_targets(db, task)
     live_keys: set[str] = set()
@@ -1814,22 +1824,25 @@ def finalize_mission(
     task: Optional[AgentTask],
     run_id: int,
     commit: bool = True,
+    now: Optional[datetime] = None,
 ) -> None:
     if mission is None:
         return
     mission.last_run_id = run_id
     if task is not None and task.status in {"completed", "blocked"}:
-        now = datetime.now(timezone.utc)
+        timestamp = _utc(now or datetime.now(timezone.utc))
         terminal_items = db.query(AgentWorkItem).filter(
             AgentWorkItem.mission_id == mission.id,
             AgentWorkItem.status.in_(("ready", "active", "blocked")),
         ).all()
         if task.status == "completed":
             mission.status = "completed"
-            mission.completed_at = now
+            mission.completed_at = timestamp
+            mission.blocked_at = None
+            mission.retry_after = None
             for item in terminal_items:
                 item.status = "done"
-                item.completed_at = now
+                item.completed_at = timestamp
         else:
             # A blocked discovery slice is a durable pause, not an abandoned
             # active cursor. The periodic discovery scheduler reopens the same
@@ -1837,12 +1850,14 @@ def finalize_mission(
             # its checkpoint/evidence history intact.
             mission.status = "paused"
             mission.completed_at = None
-            mission.updated_at = now
+            mission.updated_at = timestamp
             candidate_retry_after = (
-                now + timedelta(hours=12)
+                timestamp + timedelta(hours=CANDIDATE_MISSION_COOLDOWN_HOURS)
                 if mission.kind == "candidate_discovery"
                 else None
             )
+            mission.blocked_at = timestamp
+            mission.retry_after = candidate_retry_after
             for item in terminal_items:
                 item.status = "blocked"
                 item.blocked_reason = (task.result or "과제가 차단 상태로 종료됨")[:3000]
@@ -1851,7 +1866,7 @@ def finalize_mission(
                     if candidate_retry_after is not None
                     else "새 출처 조건이 생긴 뒤 재평가"
                 )
-                item.updated_at = now
+                item.updated_at = timestamp
             progress = _json_dict(mission.progress)
             progress.update({
                 "active_work_item_id": None,
@@ -1867,6 +1882,7 @@ def finalize_mission(
                     if candidate_retry_after is not None
                     else None
                 ),
+                "blocked_at": timestamp.isoformat(),
             })
             mission.progress = _dump(progress)
     if commit:

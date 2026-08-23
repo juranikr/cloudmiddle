@@ -18,7 +18,7 @@ from app.agent.runner import (
     CANDIDATE_DISCOVERY_COOLDOWN_HOURS,
     CANDIDATE_DISCOVERY_INTERVAL,
     CANDIDATE_DISCOVERY_KIND,
-    CANDIDATE_ROLE_TARGETS,
+    CANDIDATE_ROLE_WEIGHTS,
     CANDIDATE_DISCOVERY_TOOLS,
     DATA_INTEGRITY_TOOLS,
     RECOVERY_TOOLS_BY_TASK,
@@ -4291,11 +4291,246 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(mission.status, "paused")
         self.assertEqual(item.status, "blocked")
 
-    def test_discovery_returns_none_when_every_missing_role_frontier_is_cooling(self) -> None:
+    def test_weighted_discovery_continues_above_former_baselines(self) -> None:
+        role_counts = {
+            role: weight * 4
+            for role, weight in CANDIDATE_ROLE_WEIGHTS.items()
+        }
+        # Every role is well above the former 2/3/2/... hard minimum, but food
+        # has the lowest count/weight ratio and must remain discoverable.
+        role_counts["food"] = CANDIDATE_ROLE_WEIGHTS["food"] * 3
+
+        with patch(
+            "app.agent.runner._candidate_role_counts",
+            return_value=role_counts,
+        ):
+            task = _ensure_candidate_discovery_task(
+                self.db,
+                city=self.db.get(City, 2),
+            )
+
+        self.assertIsNotNone(task)
+        self.assertEqual(_candidate_task_role(task), "food")
+        self.assertIn("최소선이나 상한이 아닙니다", task.detail)
+        self.assertIn("9개 ÷ 가중치 3 = 3.00", task.detail)
+
+    def test_active_frontier_resumes_then_weighted_tie_rotates_after_terminal(self) -> None:
+        role_counts = {
+            role: weight * 2
+            for role, weight in CANDIDATE_ROLE_WEIGHTS.items()
+        }
+        with patch(
+            "app.agent.runner._candidate_role_counts",
+            return_value=role_counts,
+        ):
+            first = _ensure_candidate_discovery_task(
+                self.db,
+                city=self.db.get(City, 2),
+            )
+            first_mission, _item = ensure_mission_for_task(self.db, first)
+            from app.agent.runner import _pin_candidate_mission_role
+            _pin_candidate_mission_role(first_mission, first)
+            self.db.commit()
+            resumed = _ensure_candidate_discovery_task(
+                self.db,
+                city=self.db.get(City, 2),
+            )
+            first.status = "completed"
+            finalize_mission(
+                self.db,
+                mission=first_mission,
+                task=first,
+                run_id=71,
+            )
+            second = _ensure_candidate_discovery_task(
+                self.db,
+                city=self.db.get(City, 2),
+            )
+
+        self.assertEqual(_candidate_task_role(first), "history")
+        self.assertEqual(resumed.id, first.id)
+        self.assertEqual(_candidate_task_role(second), "food")
+        self.assertNotEqual(first.id, second.id)
+
+    def test_legacy_unscoped_task_or_mission_is_quarantined_before_allocation(self) -> None:
+        legacy_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="legacy unscoped task",
+            detail="broad city discovery",
+            status="pending",
+        )
+        mismatched_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="legacy unscoped mission",
+            detail="target_role: food\nrole-fixed task",
+            status="pending",
+        )
+        self.db.add_all([legacy_task, mismatched_task])
+        self.db.flush()
+        legacy_mission = AgentMission(
+            city_id=2,
+            task_id=legacy_task.id,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title=legacy_task.title,
+            objective="broad city discovery",
+            strategy=json.dumps({"target_role": "history"}),
+            status="active",
+        )
+        mismatched_mission = AgentMission(
+            city_id=2,
+            task_id=mismatched_task.id,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title=mismatched_task.title,
+            objective="legacy mission without role",
+            strategy="{}",
+            status="active",
+        )
+        self.db.add_all([legacy_mission, mismatched_mission])
+        self.db.flush()
+        legacy_item = AgentWorkItem(
+            mission_id=legacy_mission.id,
+            city_id=2,
+            target_type="task",
+            target_key=f"task:{legacy_task.id}",
+            title=legacy_task.title,
+            status="active",
+        )
+        mismatched_item = AgentWorkItem(
+            mission_id=mismatched_mission.id,
+            city_id=2,
+            target_type="task",
+            target_key=f"task:{mismatched_task.id}",
+            title=mismatched_task.title,
+            status="active",
+        )
+        self.db.add_all([legacy_item, mismatched_item])
+        self.db.commit()
+
+        selected = _ensure_candidate_discovery_task(
+            self.db,
+            city=self.db.get(City, 2),
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertNotIn(selected.id, {legacy_task.id, mismatched_task.id})
+        for task, mission, item in (
+            (legacy_task, legacy_mission, legacy_item),
+            (mismatched_task, mismatched_mission, mismatched_item),
+        ):
+            self.db.refresh(task)
+            self.db.refresh(mission)
+            self.db.refresh(item)
+            self.assertEqual(task.status, "blocked")
+            self.assertEqual(mission.status, "paused")
+            self.assertEqual(item.status, "blocked")
+            self.assertIn(
+                json.loads(mission.progress)["scheduler_disposition"],
+                {"legacy_unscoped_task", "legacy_mismatched_role_frontier"},
+            )
+
+    def test_completed_candidate_parent_reconciles_open_missions_without_losing_cursor(self) -> None:
+        terminal_at = datetime.now(timezone.utc) - timedelta(hours=3)
+        prior_run = AgentRun(
+            city_id=2,
+            mode="research",
+            status="completed",
+            objective="prior candidate slice",
+            finished_at=terminal_at,
+        )
+        self.db.add(prior_run)
+        self.db.flush()
+        rows: list[tuple[AgentTask, AgentMission, AgentWorkItem, str, str]] = []
+        for index, mission_status in enumerate(("active", "paused")):
+            role = ("history", "food")[index]
+            task = AgentTask(
+                city_id=2,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=f"completed parent {role}",
+                detail=f"target_role: {role}\nterminal parent",
+                result="immutable terminal result",
+                status="completed",
+                completed_at=terminal_at,
+            )
+            self.db.add(task)
+            self.db.flush()
+            progress = json.dumps({
+                "active_work_item_id": 999 + index,
+                "checkpoint": f"preserve-{role}",
+            })
+            strategy = json.dumps({
+                "target_role": role,
+                "frontier_policy": "role_fixed_until_terminal",
+            })
+            mission = AgentMission(
+                city_id=2,
+                task_id=task.id,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=task.title,
+                objective=task.detail,
+                status=mission_status,
+                strategy=strategy,
+                progress=progress,
+                last_run_id=prior_run.id,
+                blocked_at=terminal_at if mission_status == "paused" else None,
+                retry_after=(
+                    terminal_at + timedelta(hours=12)
+                    if mission_status == "paused"
+                    else None
+                ),
+            )
+            self.db.add(mission)
+            self.db.flush()
+            next_action = json.dumps({
+                "tool": "web_search",
+                "args": {"query": f"resume {role}"},
+            })
+            item = AgentWorkItem(
+                mission_id=mission.id,
+                city_id=2,
+                target_type="task",
+                target_key=f"task:{task.id}",
+                title=task.title,
+                status="active" if mission_status == "active" else "blocked",
+                next_action=next_action,
+                blocked_reason="preserve prior evidence",
+                retry_condition="preserve retry note",
+            )
+            self.db.add(item)
+            rows.append((task, mission, item, progress, next_action))
+        self.db.commit()
+
+        selected = _ensure_candidate_discovery_task(
+            self.db,
+            city=self.db.get(City, 2),
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertNotIn(selected.id, {task.id for task, *_rest in rows})
+        for task, mission, item, progress, next_action in rows:
+            self.db.refresh(task)
+            self.db.refresh(mission)
+            self.db.refresh(item)
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(task.result, "immutable terminal result")
+            self.assertEqual(mission.status, "completed")
+            self.assertEqual(mission.last_run_id, prior_run.id)
+            self.assertEqual(mission.progress, progress)
+            self.assertEqual(json.loads(mission.strategy)["target_role"], _candidate_task_role(task))
+            self.assertIsNone(mission.blocked_at)
+            self.assertIsNone(mission.retry_after)
+            self.assertEqual(item.status, "done")
+            self.assertEqual(item.next_action, next_action)
+            self.assertEqual(item.blocked_reason, "preserve prior evidence")
+            self.assertEqual(item.retry_condition, "preserve retry note")
+            self.assertIsNotNone(item.completed_at)
+
+    def test_discovery_returns_none_only_when_every_role_frontier_is_cooling(self) -> None:
         for event in self.db.query(PlaceEvent).all():
             event.groq_read_at = datetime.now(timezone.utc)
         now = datetime.now(timezone.utc)
-        for role in CANDIDATE_ROLE_TARGETS:
+        for role in CANDIDATE_ROLE_WEIGHTS:
             task = AgentTask(
                 city_id=2,
                 kind=CANDIDATE_DISCOVERY_KIND,
@@ -4313,7 +4548,9 @@ class AgentCityScopeTests(unittest.TestCase):
                 objective=task.detail,
                 status="paused",
                 strategy=json.dumps({"target_role": role}),
-                updated_at=now,
+                blocked_at=now,
+                retry_after=now + timedelta(hours=8 if role == "rest" else 10),
+                updated_at=now + timedelta(days=20),
             )
             self.db.add(mission)
             self.db.flush()
@@ -4325,6 +4562,38 @@ class AgentCityScopeTests(unittest.TestCase):
                 title=task.title,
                 status="blocked",
             ))
+        # A duplicate rest cursor expires first. The role, and therefore the
+        # city, becomes executable at +1h rather than the sibling's +8h.
+        early_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="cooling rest early sibling",
+            detail="target_role: rest\nexact role frontier",
+            status="blocked",
+        )
+        self.db.add(early_task)
+        self.db.flush()
+        early_mission = AgentMission(
+            city_id=2,
+            task_id=early_task.id,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title=early_task.title,
+            objective=early_task.detail,
+            status="paused",
+            strategy=json.dumps({"target_role": "rest"}),
+            blocked_at=now,
+            retry_after=now + timedelta(hours=1),
+        )
+        self.db.add(early_mission)
+        self.db.flush()
+        self.db.add(AgentWorkItem(
+            mission_id=early_mission.id,
+            city_id=2,
+            target_type="task",
+            target_key=f"task:{early_task.id}",
+            title=early_task.title,
+            status="blocked",
+        ))
         self.db.commit()
 
         selected = _ensure_candidate_discovery_task(self.db, city=self.db.get(City, 2))
@@ -4352,7 +4621,26 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "deferred")
         run = self.db.get(AgentRun, result["run_id"])
         self.assertEqual(run.mode, "idle")
-        self.assertEqual(json.loads(run.metrics)["lane"], "discovery_deferred")
+        metrics = json.loads(run.metrics)
+        self.assertEqual(metrics["lane"], "discovery_deferred")
+        self.assertEqual(metrics["deferred_reason"], "all_role_frontiers_cooling")
+        self.assertEqual(metrics["role_weights"], CANDIDATE_ROLE_WEIGHTS)
+        self.assertEqual(
+            metrics["cooling_roles"],
+            list(CANDIDATE_ROLE_WEIGHTS),
+        )
+        self.assertEqual(
+            datetime.fromisoformat(metrics["next_retry_at"]),
+            now + timedelta(hours=1),
+        )
+        self.assertEqual(
+            datetime.fromisoformat(metrics["cooling_until_by_role"]["rest"]),
+            now + timedelta(hours=1),
+        )
+        self.assertIn("모든 여행 역할", result["message"])
+        self.assertIn(metrics["next_retry_at"], result["message"])
+        self.assertNotIn("covered", run.objective.casefold())
+        self.assertNotIn("Defer candidate", run.objective)
 
     def test_role_frontier_is_fixed_in_task_and_mission_prompt(self) -> None:
         from app.agent.runner import (
@@ -4368,7 +4656,7 @@ class AgentCityScopeTests(unittest.TestCase):
         role = _pin_candidate_mission_role(mission, task)
         self.db.commit()
 
-        self.assertIn(role, CANDIDATE_ROLE_TARGETS)
+        self.assertIn(role, CANDIDATE_ROLE_WEIGHTS)
         self.assertEqual(_candidate_mission_role(mission), role)
         self.assertIn(f"target_role={role}", _candidate_discovery_system(
             self.db.get(City, 2), mission, item,
@@ -4376,16 +4664,75 @@ class AgentCityScopeTests(unittest.TestCase):
         self.assertIn(f"target_role={role}", _scoped_mission_user_message(
             self.db.get(City, 2), mission, item, continuity_hint="{}",
         ))
-        other_role = next(candidate for candidate in CANDIDATE_ROLE_TARGETS if candidate != role)
+        other_role = next(candidate for candidate in CANDIDATE_ROLE_WEIGHTS if candidate != role)
         mismatch = _candidate_proposal_role_error(
             "propose_place", {"travel_role": other_role}, mission,
         )
         self.assertEqual(mismatch["error"], "candidate_target_role_mismatch")
 
+    def test_expired_duplicate_keeps_role_executable_while_sibling_is_cooling(self) -> None:
+        now = datetime.now(timezone.utc)
+        future_by_role: dict[str, AgentTask] = {}
+        for role in CANDIDATE_ROLE_WEIGHTS:
+            task = AgentTask(
+                city_id=2,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=f"future {role}",
+                detail=f"target_role: {role}\nfuture exact frontier",
+                status="blocked",
+            )
+            self.db.add(task)
+            self.db.flush()
+            future_by_role[role] = task
+            self.db.add(AgentMission(
+                city_id=2,
+                task_id=task.id,
+                kind=CANDIDATE_DISCOVERY_KIND,
+                title=task.title,
+                objective=task.detail,
+                status="paused",
+                strategy=json.dumps({"target_role": role}),
+                blocked_at=now,
+                retry_after=now + timedelta(hours=12),
+            ))
+
+        expired_task = AgentTask(
+            city_id=2,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title="expired rest sibling",
+            detail="target_role: rest\nexpired exact frontier",
+            status="blocked",
+        )
+        self.db.add(expired_task)
+        self.db.flush()
+        expired_mission = AgentMission(
+            city_id=2,
+            task_id=expired_task.id,
+            kind=CANDIDATE_DISCOVERY_KIND,
+            title=expired_task.title,
+            objective=expired_task.detail,
+            status="paused",
+            strategy=json.dumps({"target_role": "rest"}),
+            blocked_at=now - timedelta(hours=13),
+            retry_after=now - timedelta(hours=1),
+            updated_at=now + timedelta(days=30),
+        )
+        self.db.add(expired_mission)
+        self.db.commit()
+
+        selected = _ensure_candidate_discovery_task(
+            self.db,
+            city=self.db.get(City, 2),
+        )
+
+        self.assertEqual(selected.id, expired_task.id)
+        self.db.refresh(future_by_role["rest"])
+        self.assertEqual(future_by_role["rest"].status, "blocked")
+
     def test_expired_role_frontier_resumes_exact_cursor_after_other_roles_cool(self) -> None:
         now = datetime.now(timezone.utc)
         original: tuple[AgentTask, AgentMission, AgentWorkItem] | None = None
-        for index, role in enumerate(CANDIDATE_ROLE_TARGETS):
+        for index, role in enumerate(CANDIDATE_ROLE_WEIGHTS):
             task = AgentTask(
                 city_id=2,
                 kind=CANDIDATE_DISCOVERY_KIND,
@@ -4403,11 +4750,19 @@ class AgentCityScopeTests(unittest.TestCase):
                 objective=task.detail,
                 status="paused",
                 strategy=json.dumps({"target_role": role}),
-                updated_at=(
+                blocked_at=(
                     now - timedelta(hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS + 1)
                     if index == 0
                     else now
                 ),
+                retry_after=(
+                    now - timedelta(hours=1)
+                    if index == 0
+                    else now + timedelta(hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS)
+                ),
+                # Generic checkpoint bookkeeping must not extend an explicit
+                # cooldown deadline, even when updated_at is much newer.
+                updated_at=now + timedelta(days=30),
             )
             self.db.add(mission)
             self.db.flush()

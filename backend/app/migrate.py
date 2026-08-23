@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from sqlalchemy import inspect, text
@@ -36,6 +37,82 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    """Parse DB/JSON timestamps without allowing naive local-time semantics."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _backfill_agent_mission_cooldowns(conn: Connection) -> int:
+    """Promote legacy candidate cooldown hints to durable scheduler columns.
+
+    Older deployments used ``updated_at`` as the scheduler clock.  We use it
+    only once during migration (or the explicit JSON ``retry_after`` when
+    present), after which unrelated mission updates cannot extend the pause.
+    Invalid/missing JSON is deliberately harmless.
+    """
+
+    rows = conn.execute(text("""
+        SELECT id, progress, updated_at, blocked_at, retry_after
+        FROM agent_missions
+        WHERE kind = 'candidate_discovery'
+          AND status = 'paused'
+          AND (blocked_at IS NULL OR retry_after IS NULL)
+    """)).mappings().all()
+    updated = 0
+    for row in rows:
+        progress = _json_object(row.get("progress"))
+        existing_retry = _utc_datetime(row.get("retry_after"))
+        progress_retry = _utc_datetime(progress.get("retry_after"))
+        existing_blocked = _utc_datetime(row.get("blocked_at"))
+        progress_blocked = _utc_datetime(progress.get("blocked_at"))
+        legacy_updated = _utc_datetime(row.get("updated_at"))
+        retry_hint = existing_retry or progress_retry
+
+        blocked_at = (
+            existing_blocked
+            or progress_blocked
+            or (retry_hint - timedelta(hours=12) if retry_hint is not None else None)
+            or legacy_updated
+        )
+        if blocked_at is None:
+            # ``updated_at`` is non-null in the model, but fail closed if a
+            # hand-built legacy table contains an invalid value.
+            continue
+        retry_after = retry_hint or (blocked_at + timedelta(hours=12))
+        conn.execute(
+            text("""
+                UPDATE agent_missions
+                SET blocked_at = :blocked_at,
+                    retry_after = :retry_after
+                WHERE id = :mission_id
+            """),
+            {
+                "blocked_at": blocked_at,
+                "retry_after": retry_after,
+                "mission_id": row["id"],
+            },
+        )
+        updated += 1
+    return updated
 
 
 _PLACE_EVENT_CITY_TRIGGER_FUNCTION_SQL = """
@@ -243,6 +320,7 @@ def ensure_schema() -> None:
     tables = set(insp.get_table_names())
 
     with engine.begin() as conn:
+        transaction_inspector = inspect(conn)
         # This repository uses an idempotent bootstrap migration instead of
         # Alembic. Normal API/agent startup calls Base.metadata.create_all
         # before ensure_schema, while this explicit create also covers an
@@ -257,7 +335,7 @@ def ensure_schema() -> None:
             tables.add("agent_quality_gap_dispositions")
 
         if "cities" in tables:
-            city_cols = {c["name"] for c in insp.get_columns("cities")}
+            city_cols = {c["name"] for c in transaction_inspector.get_columns("cities")}
             if "search_context" not in city_cols:
                 conn.execute(text("ALTER TABLE cities ADD COLUMN search_context VARCHAR(200) DEFAULT '' NOT NULL"))
 
@@ -295,7 +373,7 @@ def ensure_schema() -> None:
             conn.execute(text("UPDATE cities SET search_context = '济南市 山东省 中国' WHERE id = 1"))
             conn.execute(text("UPDATE cities SET search_context = '沈阳市 辽宁省 中国' WHERE id = 2"))
         if "markers" in tables:
-            cols = {c["name"] for c in insp.get_columns("markers")}
+            cols = {c["name"] for c in transaction_inspector.get_columns("markers")}
             if "city_id" not in cols:
                 conn.execute(text("ALTER TABLE markers ADD COLUMN city_id INTEGER DEFAULT 1"))
                 conn.execute(text("UPDATE markers SET city_id = 1 WHERE city_id IS NULL"))
@@ -373,7 +451,9 @@ def ensure_schema() -> None:
                 )
 
         if "agent_knowledge" in tables:
-            knowledge_cols = {c["name"] for c in insp.get_columns("agent_knowledge")}
+            knowledge_cols = {
+                c["name"] for c in transaction_inspector.get_columns("agent_knowledge")
+            }
             if "scope" not in knowledge_cols:
                 conn.execute(text("ALTER TABLE agent_knowledge ADD COLUMN scope VARCHAR(20) DEFAULT 'global' NOT NULL"))
             if "city_id" not in knowledge_cols:
@@ -404,25 +484,31 @@ def ensure_schema() -> None:
                     conn.execute(text(f"ALTER TABLE agent_knowledge ADD COLUMN {column} {ddl}"))
 
         if "agent_search_logs" in tables:
-            search_cols = {c["name"] for c in insp.get_columns("agent_search_logs")}
+            search_cols = {
+                c["name"] for c in transaction_inspector.get_columns("agent_search_logs")
+            }
             if "city_id" not in search_cols:
                 conn.execute(text("ALTER TABLE agent_search_logs ADD COLUMN city_id INTEGER"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_search_logs_city_id ON agent_search_logs (city_id)"))
 
         if "agent_search_results" in tables:
-            result_cols = {c["name"] for c in insp.get_columns("agent_search_results")}
+            result_cols = {
+                c["name"] for c in transaction_inspector.get_columns("agent_search_results")
+            }
             if "city_id" not in result_cols:
                 conn.execute(text("ALTER TABLE agent_search_results ADD COLUMN city_id INTEGER"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_search_results_city_id ON agent_search_results (city_id)"))
 
         if "agent_web_visits" in tables:
-            visit_cols = {c["name"] for c in insp.get_columns("agent_web_visits")}
+            visit_cols = {
+                c["name"] for c in transaction_inspector.get_columns("agent_web_visits")
+            }
             if "city_id" not in visit_cols:
                 conn.execute(text("ALTER TABLE agent_web_visits ADD COLUMN city_id INTEGER"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_web_visits_city_id ON agent_web_visits (city_id)"))
 
         if "agent_runs" in tables:
-            run_cols = {c["name"] for c in insp.get_columns("agent_runs")}
+            run_cols = {c["name"] for c in transaction_inspector.get_columns("agent_runs")}
             if "mission_id" not in run_cols:
                 conn.execute(text("ALTER TABLE agent_runs ADD COLUMN mission_id INTEGER"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_runs_mission_id ON agent_runs (mission_id)"))
@@ -430,8 +516,33 @@ def ensure_schema() -> None:
                 conn.execute(text("ALTER TABLE agent_runs ADD COLUMN work_item_id INTEGER"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_runs_work_item_id ON agent_runs (work_item_id)"))
 
+        if "agent_missions" in tables:
+            mission_cols = {
+                c["name"] for c in transaction_inspector.get_columns("agent_missions")
+            }
+            timestamp_type = (
+                "TIMESTAMP WITH TIME ZONE"
+                if engine.dialect.name == "postgresql"
+                else "TIMESTAMP"
+            )
+            if "blocked_at" not in mission_cols:
+                conn.execute(text(f"ALTER TABLE agent_missions ADD COLUMN blocked_at {timestamp_type}"))
+            if "retry_after" not in mission_cols:
+                conn.execute(text(f"ALTER TABLE agent_missions ADD COLUMN retry_after {timestamp_type}"))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_missions_blocked_at "
+                "ON agent_missions (blocked_at)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_missions_retry_after "
+                "ON agent_missions (retry_after)"
+            ))
+            _backfill_agent_mission_cooldowns(conn)
+
         if "travel_chat_messages" in tables:
-            chat_cols = {c["name"] for c in insp.get_columns("travel_chat_messages")}
+            chat_cols = {
+                c["name"] for c in transaction_inspector.get_columns("travel_chat_messages")
+            }
             if "candidates" not in chat_cols:
                 conn.execute(
                     text("ALTER TABLE travel_chat_messages ADD COLUMN candidates TEXT DEFAULT '[]' NOT NULL")
@@ -465,11 +576,14 @@ def ensure_schema() -> None:
             """))
 
         # 기여자 백필: 기존 markers.user_id → place_contributors
-        tables_now = set(inspect(engine).get_table_names())
+        # Reuse the migration transaction. A second Engine-level inspection can
+        # roll back the same SQLite in-memory connection and cannot observe
+        # uncommitted PostgreSQL DDL reliably during rolling upgrades.
+        tables_now = set(transaction_inspector.get_table_names())
 
         if "place_events" in tables_now and "cities" in tables_now:
             event_cols = {
-                c["name"] for c in inspect(engine).get_columns("place_events")
+                c["name"] for c in transaction_inspector.get_columns("place_events")
             }
             if "city_id" not in event_cols:
                 conn.execute(
@@ -492,7 +606,9 @@ def ensure_schema() -> None:
         # publishable itinerary document. Existing day/slot values are retained
         # as migration hints until a collaborator chooses a real date/time.
         if "travel_plan_items" in tables_now and "travel_plans" in tables_now:
-            plan_item_cols = {c["name"] for c in inspect(engine).get_columns("travel_plan_items")}
+            plan_item_cols = {
+                c["name"] for c in transaction_inspector.get_columns("travel_plan_items")
+            }
             if "plan_id" not in plan_item_cols:
                 conn.execute(
                     text(

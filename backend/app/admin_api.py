@@ -154,6 +154,16 @@ def admin_status(
     )
 
 
+class AgentDeferredContextOut(BaseModel):
+    """Inspectable reason and role allocation for a deferred discovery run."""
+
+    reason: str = ""
+    role_counts: dict[str, int] = Field(default_factory=dict)
+    role_weights: dict[str, int] = Field(default_factory=dict)
+    cooling_roles: list[str] = Field(default_factory=list)
+    next_retry_at: Optional[datetime] = None
+
+
 class AgentRunStatusOut(BaseModel):
     running: bool
     city_id: Optional[int] = None
@@ -166,6 +176,7 @@ class AgentRunStatusOut(BaseModel):
     material_change_count: int = 0
     next_work_item_id: Optional[int] = None
     next_cursor: dict[str, Any] = Field(default_factory=dict)
+    deferred_context: Optional[AgentDeferredContextOut] = None
 
 
 # Gateway timeout avoidance: production delegates to Step Functions and the UI
@@ -552,6 +563,7 @@ class AgentRunHistoryOut(BaseModel):
     material_change_count: int = 0
     next_work_item_id: Optional[int] = None
     next_cursor: dict[str, Any] = Field(default_factory=dict)
+    deferred_context: Optional[AgentDeferredContextOut] = None
 
 
 class AgentRunStepOut(BaseModel):
@@ -575,11 +587,84 @@ _TRAVELER_VISIBLE_CHANGE_TOOLS = frozenset({
     "assign_place_chain",
 })
 _AUDITED_NO_CHANGE_DISPOSITIONS = frozenset({"waived", "source_exhausted", "resolved"})
+_AGENT_TRAVEL_ROLES = frozenset({
+    "history",
+    "food",
+    "market_night",
+    "neighborhood",
+    "nature",
+    "shopping",
+    "rest",
+    "practical",
+})
 
 
 def _positive_int_or_none(value: Any) -> Optional[int]:
     parsed = _safe_int(value)
     return parsed if parsed > 0 else None
+
+
+def _agent_deferred_context(metrics: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Normalize optional scheduler diagnostics from new and legacy runs.
+
+    Metrics are durable JSON and older rows can contain missing or malformed
+    values.  Keep the public response small and typed so the admin UI never has
+    to render an internal objective (or blindly trust arbitrary metric data).
+    """
+
+    if not isinstance(metrics, dict):
+        return None
+
+    reason = str(metrics.get("deferred_reason") or "").strip()[:120]
+
+    def role_numbers(raw: Any) -> dict[str, int]:
+        if not isinstance(raw, dict):
+            return {}
+        output: dict[str, int] = {}
+        for raw_role, raw_value in raw.items():
+            role = str(raw_role or "").strip().casefold()
+            if role not in _AGENT_TRAVEL_ROLES:
+                continue
+            value = _safe_int(raw_value, -1)
+            if value < 0:
+                continue
+            output[role] = min(value, 1_000_000)
+        return output
+
+    role_counts = role_numbers(metrics.get("role_counts"))
+    role_weights = role_numbers(metrics.get("role_weights"))
+
+    cooling_roles: list[str] = []
+    raw_cooling_roles = metrics.get("cooling_roles")
+    if isinstance(raw_cooling_roles, (list, tuple, set)):
+        for raw_role in raw_cooling_roles:
+            role = str(raw_role or "").strip().casefold()
+            if role in _AGENT_TRAVEL_ROLES and role not in cooling_roles:
+                cooling_roles.append(role)
+
+    next_retry_at: Optional[datetime] = None
+    raw_next_retry_at = metrics.get("next_retry_at")
+    if isinstance(raw_next_retry_at, datetime):
+        next_retry_at = raw_next_retry_at
+    elif isinstance(raw_next_retry_at, str) and raw_next_retry_at.strip():
+        try:
+            next_retry_at = datetime.fromisoformat(
+                raw_next_retry_at.strip().replace("Z", "+00:00")
+            )
+        except ValueError:
+            next_retry_at = None
+    if next_retry_at is not None and next_retry_at.tzinfo is None:
+        next_retry_at = next_retry_at.replace(tzinfo=timezone.utc)
+
+    if not any((reason, role_counts, role_weights, cooling_roles, next_retry_at)):
+        return None
+    return {
+        "reason": reason,
+        "role_counts": role_counts,
+        "role_weights": role_weights,
+        "cooling_roles": cooling_roles,
+        "next_retry_at": next_retry_at,
+    }
 
 
 def _agent_next_cursor(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -743,6 +828,7 @@ def _agent_run_reporting(*, status: str, metrics: dict[str, Any]) -> dict[str, A
         "material_change_count": material_change_count,
         "next_work_item_id": _positive_int_or_none(next_cursor.get("work_item_id")),
         "next_cursor": next_cursor,
+        "deferred_context": _agent_deferred_context(metrics),
     }
 
 

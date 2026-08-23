@@ -24,6 +24,7 @@ from app.agent.candidate_curator import curate_grounded_candidate
 from app.agent.model_recovery import classify_failure, make_recovery_plan
 from app.config import settings
 from app.agent.memory import (
+    CANDIDATE_MISSION_COOLDOWN_HOURS,
     CORRECTIVE_POLICY_GUARD_ERRORS,
     QUALITY_GAPS_BY_TASK_KIND,
     checkpoint_after_tool,
@@ -234,7 +235,8 @@ def _research_themes(city: City) -> str:
     if city.slug == "shenyang":
         return (
             "서탑·중가·노북시장·채탑야시장 같은 먹거리/야간, 오래 걷기 좋은 동네, 공원과 강변, "
-            "현지 쇼핑·카페·휴식, 교통/예약 실용정보를 우선한다. 고궁·박물관은 이미 충분하면 추가하지 않는다"
+            "현지 쇼핑·카페·휴식, 교통/예약 실용정보를 우선한다. 고궁·박물관처럼 현재 가중 비중이 "
+            "높은 역할은 중단선으로 삼지 말고 상대적으로 후순위에 둔다"
         )
     return f"{city.name_local} 대표 명소·현지 음식·역사·교통·야간 동선"
 
@@ -983,22 +985,10 @@ def _research_gaps(
         gaps.append(f"구역 미배정 실제 장소 {snapshot['unzoned_places']}곳")
     if snapshot.get("unverified_places", 0):
         gaps.append(f"운영·존재 미검증 {snapshot['unverified_places']}곳")
-    targets = {
-        "history": 2, "food": 3, "market_night": 2, "neighborhood": 2,
-        "nature": 2, "shopping": 1, "rest": 1, "practical": 1,
-    }
-    labels = {
-        "history": "역사", "food": "음식", "market_night": "시장·야간",
-        "neighborhood": "동네 산책", "nature": "자연·공원", "shopping": "쇼핑",
-        "rest": "휴식", "practical": "교통·실용",
-    }
-    missing = [
-        f"{labels[role]} {snapshot.get(f'role_{role}', 0)}/{target}"
-        for role, target in targets.items()
-        if snapshot.get(f"role_{role}", 0) < target
-    ]
-    if missing:
-        gaps.append("여행 역할 균형: " + ", ".join(missing))
+    # Travel-role numbers are a continuing weighted allocation, not a
+    # city-wide completion threshold. Candidate discovery owns that rotation;
+    # reporting a role as a finite "gap" here used to create vague backlog
+    # tasks and stopped discovery as soon as every small baseline was reached.
     return gaps
 
 
@@ -1022,8 +1012,10 @@ CANDIDATE_DISCOVERY_KIND = "candidate_discovery"
 # more often when there is no executable non-discovery work, but a large quality
 # backlog can never push it out of the schedule indefinitely.
 CANDIDATE_DISCOVERY_INTERVAL = 3
-CANDIDATE_DISCOVERY_COOLDOWN_HOURS = 12
-CANDIDATE_ROLE_TARGETS = {
+CANDIDATE_DISCOVERY_COOLDOWN_HOURS = CANDIDATE_MISSION_COOLDOWN_HOURS
+# These values are relative allocation weights, not minimums or caps.  A role
+# with the lowest ``current_count / weight`` is the next discovery frontier.
+CANDIDATE_ROLE_WEIGHTS = {
     "history": 2,
     "food": 3,
     "market_night": 2,
@@ -3743,7 +3735,7 @@ def _candidate_role_from_text(value: str) -> str:
         key, separator, raw_role = line.partition(":")
         if separator and f"{key.strip().casefold()}:" == _CANDIDATE_ROLE_PREFIX:
             role = raw_role.strip().casefold()
-            return role if role in CANDIDATE_ROLE_TARGETS else ""
+            return role if role in CANDIDATE_ROLE_WEIGHTS else ""
     return ""
 
 
@@ -3761,7 +3753,7 @@ def _candidate_mission_role(mission: AgentMission | None) -> str:
     except (TypeError, json.JSONDecodeError):
         strategy = {}
     role = str(strategy.get("target_role") or "").strip().casefold() if isinstance(strategy, dict) else ""
-    if role in CANDIDATE_ROLE_TARGETS:
+    if role in CANDIDATE_ROLE_WEIGHTS:
         return role
     return _candidate_role_from_text(mission.objective)
 
@@ -3796,8 +3788,22 @@ def _candidate_mission_is_cooling(
 ) -> bool:
     if mission is None or mission.status != "paused":
         return False
+    observed_at = _aware_utc(cutoff) + timedelta(
+        hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS
+    )
+    explicit_retry_after = getattr(mission, "retry_after", None)
+    if explicit_retry_after is not None:
+        return _aware_utc(explicit_retry_after) > observed_at
+    explicit_blocked_at = getattr(mission, "blocked_at", None)
+    if explicit_blocked_at is not None:
+        return (
+            _aware_utc(explicit_blocked_at)
+            + timedelta(hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS)
+        ) > observed_at
     # Let each database compare timestamps. SQLite fixtures can be naive while
-    # PostgreSQL production rows are timezone-aware.
+    # PostgreSQL production rows are timezone-aware. This is a legacy fallback
+    # only; ordinary checkpoint edits to updated_at must not extend an explicit
+    # cooldown deadline.
     return db.query(AgentMission.id).filter(
         AgentMission.id == mission.id,
         AgentMission.updated_at > cutoff,
@@ -3823,71 +3829,273 @@ def _quarantine_legacy_candidate_frontier(
     *,
     task: AgentTask,
     mission: AgentMission | None,
-) -> None:
+    reason: str = "legacy_unscoped_frontier",
+) -> bool:
     """Preserve an old unscoped cursor without allowing another broad search."""
 
-    task.status = "blocked"
-    task.completed_at = None
+    changed = False
+    if task.status != "blocked":
+        task.status = "blocked"
+        changed = True
+    if task.completed_at is not None:
+        task.completed_at = None
+        changed = True
     if not (task.result or "").strip():
         task.result = (
             "역할 고정 정책 이전에 생성된 광역 발굴 프런티어입니다. 기존 체크포인트는 보존하지만 "
             "자동 재개하지 않으며, 역할이 고정된 새 프런티어로 회전합니다."
         )
+        changed = True
     if mission is None:
-        return
-    mission.status = "paused"
-    mission.completed_at = None
+        return changed
+    if mission.status != "paused":
+        mission.status = "paused"
+        changed = True
+    if mission.completed_at is not None:
+        mission.completed_at = None
+        changed = True
     try:
         progress = json.loads(mission.progress or "{}")
     except (TypeError, json.JSONDecodeError):
         progress = {}
     if not isinstance(progress, dict):
         progress = {}
-    progress.update({
+    quarantined_progress = {
+        **progress,
         "active_work_item_id": None,
-        "scheduler_disposition": "legacy_unscoped_frontier",
+        "scheduler_disposition": reason,
         "retry_condition": "target_role을 명시적으로 지정하기 전에는 자동 재개하지 않음",
-    })
-    mission.progress = json.dumps(progress, ensure_ascii=False)
+    }
+    serialized_progress = json.dumps(quarantined_progress, ensure_ascii=False)
+    if mission.progress != serialized_progress:
+        mission.progress = serialized_progress
+        changed = True
     for item in db.query(AgentWorkItem).filter(
         AgentWorkItem.mission_id == mission.id,
         AgentWorkItem.status.in_(("ready", "active", "blocked")),
     ).all():
-        item.status = "blocked"
-        item.retry_condition = "target_role을 명시적으로 지정하기 전에는 자동 재개하지 않음"
+        if item.status != "blocked":
+            item.status = "blocked"
+            changed = True
+        retry_condition = "target_role을 명시적으로 지정하기 전에는 자동 재개하지 않음"
+        if item.retry_condition != retry_condition:
+            item.retry_condition = retry_condition
+            changed = True
+    return changed
+
+
+def _quarantine_legacy_candidate_mission(
+    db: Session,
+    *,
+    mission: AgentMission,
+    reason: str = "legacy_unscoped_mission",
+) -> bool:
+    """Quarantine a mission that has no valid role-scoped parent task."""
+
+    changed = False
+    if mission.status != "paused":
+        mission.status = "paused"
+        changed = True
+    if mission.completed_at is not None:
+        mission.completed_at = None
+        changed = True
+    try:
+        progress = json.loads(mission.progress or "{}")
+    except (TypeError, json.JSONDecodeError):
+        progress = {}
+    if not isinstance(progress, dict):
+        progress = {}
+    quarantined_progress = {
+        **progress,
+        "active_work_item_id": None,
+        "scheduler_disposition": reason,
+        "retry_condition": "target_role을 명시적으로 지정하기 전에는 자동 재개하지 않음",
+    }
+    serialized_progress = json.dumps(quarantined_progress, ensure_ascii=False)
+    if mission.progress != serialized_progress:
+        mission.progress = serialized_progress
+        changed = True
+    for item in db.query(AgentWorkItem).filter(
+        AgentWorkItem.mission_id == mission.id,
+        AgentWorkItem.status.in_(("ready", "active", "blocked")),
+    ).all():
+        if item.status != "blocked":
+            item.status = "blocked"
+            changed = True
+        retry_condition = "target_role을 명시적으로 지정하기 전에는 자동 재개하지 않음"
+        if item.retry_condition != retry_condition:
+            item.retry_condition = retry_condition
+            changed = True
+    return changed
+
+
+def _complete_terminal_candidate_mission(
+    db: Session,
+    *,
+    task: AgentTask,
+    mission: AgentMission,
+) -> bool:
+    """Reconcile an open legacy cursor whose parent task already completed.
+
+    The task is the authoritative terminal state. Keep the mission checkpoint,
+    strategy and last run intact for audit while making its scheduler state and
+    open work items agree with that completed parent.
+    """
+
+    changed = False
+    completed_at = (
+        task.completed_at
+        or mission.completed_at
+        or datetime.now(timezone.utc)
+    )
+    if mission.status != "completed":
+        mission.status = "completed"
+        changed = True
+    if mission.completed_at != completed_at:
+        mission.completed_at = completed_at
+        changed = True
+    if mission.blocked_at is not None:
+        mission.blocked_at = None
+        changed = True
+    if mission.retry_after is not None:
+        mission.retry_after = None
+        changed = True
+    for item in db.query(AgentWorkItem).filter(
+        AgentWorkItem.mission_id == mission.id,
+        AgentWorkItem.status.in_(("ready", "active", "blocked")),
+    ).all():
+        if item.status != "done":
+            item.status = "done"
+            changed = True
+        if item.completed_at != completed_at:
+            item.completed_at = completed_at
+            changed = True
+    return changed
+
+
+def _quarantine_legacy_candidate_frontiers(db: Session, *, city_id: int) -> bool:
+    """Make every open legacy/mismatched discovery cursor non-executable.
+
+    Coverage no longer has a finite completion line, so an unscoped legacy
+    cursor must never become eligible merely because one role's allocation is
+    low. Both task and mission must carry the same durable role identity.
+    """
+
+    changed = False
+    open_tasks = (
+        db.query(AgentTask)
+        .filter(
+            AgentTask.city_id == city_id,
+            AgentTask.kind == CANDIDATE_DISCOVERY_KIND,
+            AgentTask.status.in_(("pending", "blocked")),
+        )
+        .all()
+    )
+    inspected_mission_ids: set[int] = set()
+    for task in open_tasks:
+        mission = _latest_candidate_mission(db, task)
+        task_role = _candidate_task_role(task)
+        mission_role = _candidate_mission_role(mission)
+        if mission is not None:
+            inspected_mission_ids.add(mission.id)
+        if not task_role:
+            changed = _quarantine_legacy_candidate_frontier(
+                db,
+                task=task,
+                mission=mission,
+                reason="legacy_unscoped_task",
+            ) or changed
+        elif mission is not None and (
+            not mission_role or mission_role != task_role
+        ):
+            changed = _quarantine_legacy_candidate_frontier(
+                db,
+                task=task,
+                mission=mission,
+                reason="legacy_mismatched_role_frontier",
+            ) or changed
+
+    # Catch orphaned or task-first legacy missions that are not reachable from
+    # the open-task query above. They retain their checkpoints for audit but
+    # cannot influence allocation history or become an executable cursor.
+    open_missions = (
+        db.query(AgentMission)
+        .filter(
+            AgentMission.city_id == city_id,
+            AgentMission.kind == CANDIDATE_DISCOVERY_KIND,
+            AgentMission.status.in_(("active", "paused")),
+        )
+        .all()
+    )
+    for mission in open_missions:
+        if mission.id in inspected_mission_ids:
+            continue
+        task = db.get(AgentTask, mission.task_id) if mission.task_id is not None else None
+        task_role = _candidate_task_role(task)
+        mission_role = _candidate_mission_role(mission)
+        if task is None or not task_role or not mission_role or task_role != mission_role:
+            changed = _quarantine_legacy_candidate_mission(
+                db,
+                mission=mission,
+            ) or changed
+        elif task.status == "completed":
+            changed = _complete_terminal_candidate_mission(
+                db,
+                task=task,
+                mission=mission,
+            ) or changed
+    return changed
 
 
 def _candidate_role_counts(db: Session, *, city_id: int) -> dict[str, int]:
     snapshot = _performance_snapshot(db, city_id)
     return {
         role: int(snapshot.get(f"role_{role}", 0) or 0)
-        for role in CANDIDATE_ROLE_TARGETS
+        for role in CANDIDATE_ROLE_WEIGHTS
     }
 
 
-def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | None:
-    """Select a role-scoped frontier without reopening a fresh blocked slice.
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
-    A paused exact slice stays intact for at least 12 hours. During that window
-    discovery rotates to another missing travel role. When every missing role
-    already has a cooling frontier, ``None`` tells the caller to defer without
-    spending a model call.
-    """
 
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS)
-    role_counts = _candidate_role_counts(db, city_id=city.id)
-    missing_roles = [
-        role for role, target in CANDIDATE_ROLE_TARGETS.items()
-        if role_counts.get(role, 0) < target
-    ]
-    if not missing_roles:
-        return None
+def _candidate_retry_after(mission: AgentMission) -> datetime:
+    explicit_retry_after = getattr(mission, "retry_after", None)
+    if explicit_retry_after is not None:
+        return _aware_utc(explicit_retry_after)
+    explicit_blocked_at = getattr(mission, "blocked_at", None)
+    if explicit_blocked_at is not None:
+        return _aware_utc(explicit_blocked_at) + timedelta(
+            hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS
+        )
+    # Legacy rows are backfilled by migration. Keep this narrow fallback for
+    # SQLite fixtures and an in-flight deployment where old application code
+    # may have paused a mission before the new columns existed.
+    return _aware_utc(mission.updated_at) + timedelta(
+        hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS
+    )
 
+
+def _candidate_frontier_state(
+    db: Session,
+    *,
+    city_id: int,
+    now: datetime | None = None,
+) -> tuple[
+    list[tuple[AgentTask, AgentMission | None, str]],
+    dict[str, Any],
+]:
+    """Return executable allocation state and exact cooldown diagnostics."""
+
+    observed_at = _aware_utc(now or datetime.now(timezone.utc))
+    cutoff = observed_at - timedelta(hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS)
+    role_counts = _candidate_role_counts(db, city_id=city_id)
     tasks = (
         db.query(AgentTask)
         .filter(
-            AgentTask.city_id == city.id,
+            AgentTask.city_id == city_id,
             AgentTask.kind == CANDIDATE_DISCOVERY_KIND,
             AgentTask.status.in_(("pending", "blocked")),
         )
@@ -3895,35 +4103,114 @@ def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | 
         .all()
     )
     entries: list[tuple[AgentTask, AgentMission | None, str]] = []
-    changed = False
+    retry_times_by_role: dict[str, list[datetime]] = {
+        role: [] for role in CANDIDATE_ROLE_WEIGHTS
+    }
+    executable_frontier_roles: set[str] = set()
     for task in tasks:
+        task_role = _candidate_task_role(task)
+        if not task_role:
+            continue
         mission = _latest_candidate_mission(db, task)
-        role = _candidate_task_role(task) or _candidate_mission_role(mission)
-        if not role:
-            _quarantine_legacy_candidate_frontier(db, task=task, mission=mission)
-            changed = True
+        if mission is not None and _candidate_mission_role(mission) != task_role:
             continue
-        entries.append((task, mission, role))
+        entries.append((task, mission, task_role))
+        is_cooling = (
+            mission is not None
+            and mission.status == "paused"
+            and _candidate_mission_is_cooling(db, mission, cutoff=cutoff)
+        )
+        if is_cooling:
+            retry_times_by_role[task_role].append(
+                _candidate_retry_after(mission)
+            )
+        else:
+            # Active, expired-paused, and not-yet-instantiated exact cursors are
+            # executable continuity. One such cursor is enough to keep the role
+            # in rotation even if a duplicate frontier for it is still cooling.
+            executable_frontier_roles.add(task_role)
 
-    cooling_roles: set[str] = set()
+    # A role is excluded only when every one of its concrete role-fixed
+    # frontiers is cooling. With duplicate historical rows, its first cursor
+    # becomes executable at the earliest expiry; the city's next executable
+    # frontier is the earliest such per-role expiry when every role is cooling.
+    cooling_until_by_role = {
+        role: min(retry_times)
+        for role, retry_times in retry_times_by_role.items()
+        if retry_times and role not in executable_frontier_roles
+    }
+    cooling_roles = [
+        role for role in CANDIDATE_ROLE_WEIGHTS
+        if role in cooling_until_by_role
+    ]
+    executable_roles = [
+        role for role in CANDIDATE_ROLE_WEIGHTS
+        if role not in cooling_until_by_role
+    ]
+    next_retry_at = (
+        min(cooling_until_by_role.values())
+        if not executable_roles and cooling_until_by_role
+        else None
+    )
+    role_ratios = {
+        role: round(role_counts.get(role, 0) / weight, 6)
+        for role, weight in CANDIDATE_ROLE_WEIGHTS.items()
+    }
+    diagnostics: dict[str, Any] = {
+        "role_counts": role_counts,
+        "role_weights": dict(CANDIDATE_ROLE_WEIGHTS),
+        "role_allocation_ratios": role_ratios,
+        "cooling_roles": cooling_roles,
+        "cooling_until_by_role": {
+            role: retry_at.isoformat()
+            for role, retry_at in cooling_until_by_role.items()
+        },
+        "executable_roles": executable_roles,
+        "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+    }
+    return entries, diagnostics
+
+
+def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | None:
+    """Select the least-filled executable weighted role frontier.
+
+    A paused exact slice stays intact for at least 12 hours. During that window
+    discovery rotates to another travel role. Counts divided by allocation
+    weights drive the order forever; the weights are neither minimums nor caps.
+    Only when every role has a concrete cooling frontier does ``None`` tell the
+    caller to defer without spending a model call.
+    """
+
+    changed = _quarantine_legacy_candidate_frontiers(db, city_id=city.id)
+    entries, diagnostics = _candidate_frontier_state(db, city_id=city.id)
+    role_counts = diagnostics["role_counts"]
+    cooling_roles = set(diagnostics["cooling_roles"])
+    available_roles = list(diagnostics["executable_roles"])
+    if not available_roles:
+        if changed:
+            db.commit()
+        return None
+
     resumable: list[tuple[AgentTask, AgentMission, str]] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        hours=CANDIDATE_DISCOVERY_COOLDOWN_HOURS
+    )
     for task, mission, role in entries:
-        if role not in missing_roles or mission is None or mission.status != "paused":
-            continue
-        if _candidate_mission_is_cooling(db, mission, cutoff=cutoff):
-            cooling_roles.add(role)
+        if (
+            role in cooling_roles
+            or mission is None
+            or mission.status != "paused"
+            or _candidate_mission_is_cooling(db, mission, cutoff=cutoff)
+        ):
             continue
         resumable.append((task, mission, role))
 
-    # An unfinished active frontier represents substantive continuity and wins
-    # before creating another task, except when another exact slice for the same
-    # role is cooling. This closes duplicate legacy/race rows without defeating
-    # the role rotation promised by a fresh pause.
+    # A selected pending task / active mission is a durable commitment, not a
+    # fresh allocation decision. Finish or explicitly pause that exact cursor
+    # before weighted rotation so cross-run consciousness is not discarded.
     active_entries = [
         entry for entry in entries
         if entry[0].status == "pending"
-        and entry[2] in missing_roles
-        and entry[2] not in cooling_roles
         and (entry[1] is None or entry[1].status == "active")
     ]
     if active_entries:
@@ -3939,8 +4226,10 @@ def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | 
             db.commit()
         return task
 
-    # Rotate roles by least-recent candidate mission, then by relative coverage.
-    last_role_mission_id = {role: 0 for role in missing_roles}
+    # Ratio is the primary allocation key. Least-recent valid role mission and
+    # the fixed mapping order make fresh/resumable frontier ties fair,
+    # deterministic, and reproducible.
+    last_role_mission_id = {role: 0 for role in CANDIDATE_ROLE_WEIGHTS}
     history_missions = (
         db.query(AgentMission)
         .filter(
@@ -3956,27 +4245,27 @@ def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | 
             if history_mission.task_id is not None
             else None
         )
-        role = _candidate_mission_role(history_mission) or _candidate_task_role(history_task)
-        if role in last_role_mission_id:
+        role = _candidate_mission_role(history_mission)
+        if role and _candidate_task_role(history_task) == role:
             last_role_mission_id[role] = history_mission.id
-
-    available_roles = [role for role in missing_roles if role not in cooling_roles]
-    if not available_roles:
-        if changed:
-            db.commit()
-        return None
 
     target_role = min(
         available_roles,
         key=lambda role: (
+            role_counts.get(role, 0) / CANDIDATE_ROLE_WEIGHTS[role],
             last_role_mission_id.get(role, 0),
-            role_counts.get(role, 0) / CANDIDATE_ROLE_TARGETS[role],
-            tuple(CANDIDATE_ROLE_TARGETS).index(role),
+            tuple(CANDIDATE_ROLE_WEIGHTS).index(role),
         ),
     )
-    exact_resume = next(
+
+    exact_resume = min(
         (entry for entry in resumable if entry[2] == target_role),
-        None,
+        key=lambda entry: (
+            int(entry[1].last_run_id or 0),
+            int(entry[0].attempts or 0),
+            entry[0].id,
+        ),
+        default=None,
     )
     if exact_resume is not None:
         task, _mission, _role = exact_resume
@@ -3987,6 +4276,8 @@ def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | 
         return task
 
     label = CANDIDATE_ROLE_LABELS[target_role]
+    weight = CANDIDATE_ROLE_WEIGHTS[target_role]
+    allocation_ratio = role_counts[target_role] / weight
     task = AgentTask(
         city_id=city.id,
         kind=CANDIDATE_DISCOVERY_KIND,
@@ -3994,7 +4285,8 @@ def _ensure_candidate_discovery_task(db: Session, *, city: City) -> AgentTask | 
         detail=(
             f"{_CANDIDATE_ROLE_PREFIX} {target_role}\n"
             f"{city.name_ko}({city.name_local})에서 여행 역할 '{target_role}'({label})만 탐색하세요. "
-            f"현재 역할 커버리지는 {role_counts[target_role]}/{CANDIDATE_ROLE_TARGETS[target_role]}입니다. "
+            f"현재 가중 배분 지수는 장소·대기 제안 {role_counts[target_role]}개 ÷ "
+            f"가중치 {weight} = {allocation_ratio:.2f}이며, 최소선이나 상한이 아닙니다. "
             "서로 다른 출처의 본문으로 정확한 상호·지점·주소를 확인하고 기존 장소와 중복되지 않는 "
             "후보만 좌표 검증 후 관리자 승인 제안으로 남기세요. 다른 역할 후보로 바꾸지 마세요. "
             "안전한 후보가 없으면 조사한 출처 축과 탈락 사유, 다음의 정확한 검증 질의를 기록하세요."
@@ -4593,15 +4885,33 @@ def _run_agent_impl(
         )
         if primary_task is None:
             performance = _performance_snapshot(db, city_id)
+            _frontier_entries, frontier_diagnostics = _candidate_frontier_state(
+                db,
+                city_id=city_id,
+            )
+            cooling_labels = [
+                CANDIDATE_ROLE_LABELS[role]
+                for role in frontier_diagnostics["cooling_roles"]
+            ]
+            allocation_text = ", ".join(
+                f"{CANDIDATE_ROLE_LABELS[role]} "
+                f"{frontier_diagnostics['role_counts'][role]}/"
+                f"{frontier_diagnostics['role_weights'][role]}"
+                for role in CANDIDATE_ROLE_WEIGHTS
+            )
+            next_retry_at = frontier_diagnostics.get("next_retry_at")
             deferred_reason = (
-                "현재 부족한 모든 여행 역할의 후보 발굴 프런티어가 12시간 냉각 중이거나 "
-                "역할별 목표 커버리지가 이미 충족되어 모델 호출을 유예했습니다."
+                "모든 여행 역할의 역할 고정 후보 발굴 프런티어가 현재 냉각 중이라 "
+                "이번 모델 호출을 유예했습니다. "
+                f"냉각 역할: {', '.join(cooling_labels)}. "
+                f"가장 빠른 재개 시각: {next_retry_at}. "
+                f"현재 개수/가중치: {allocation_text}."
             )
             deferred_run = AgentRun(
                 city_id=city_id,
                 mode="idle",
                 status="completed",
-                objective="Defer candidate discovery until a role frontier becomes executable.",
+                objective="모든 역할별 후보 발굴 프런티어의 명시적 냉각 만료까지 실행 유예",
                 score=0,
                 metrics=json.dumps({
                     "before": performance,
@@ -4613,8 +4923,9 @@ def _run_agent_impl(
                     "lane": "discovery_deferred",
                     "discovery_reserved": discovery_reserved,
                     "outcome": "deferred",
-                    "deferred_reason": "all_missing_role_frontiers_cooling_or_covered",
+                    "deferred_reason": "all_role_frontiers_cooling",
                     "cooldown_hours": CANDIDATE_DISCOVERY_COOLDOWN_HOURS,
+                    **frontier_diagnostics,
                     "quality_task_ids_before": quality_task_ids_before,
                 }, ensure_ascii=False),
                 summary=deferred_reason,
@@ -4637,6 +4948,7 @@ def _run_agent_impl(
                 "run_id": deferred_run.id,
                 "city_id": city_id,
                 "outcome": "deferred",
+                "defer_diagnostics": frontier_diagnostics,
             }
         primary_task.attempts += 1
         active_mission, active_work_item = ensure_mission_for_task(db, primary_task)
@@ -4832,8 +5144,9 @@ def _run_agent_impl(
             "필수: 시작 list_knowledge·list_agent_tasks·list_zones. 재사용 가능한 새 원칙이 실제로 생겼을 때만 "
             "upsert_knowledge를 호출하고, 실행 요약을 지식으로 저장하지 마세요.\n"
             "1) list_knowledge / list_agent_tasks / list_zones / list_places로 현황을 읽고, "
-            "history·food·market_night·neighborhood·nature·shopping·rest·practical 역할별 보유 수를 센다. "
-            "이미 충분한 역할(특히 박물관/역사)은 신규 발굴을 중단하고 부족 역할만 조사한다.\n"
+            "history·food·market_night·neighborhood·nature·shopping·rest·practical 역할별 보유 수와 "
+            "가중치(2·3·2·2·2·1·1·1)의 비율을 비교한다. 이는 최소선이나 상한이 아니며, "
+            "현재 수/가중치 비율이 낮은 역할을 우선하고 과대표된 역할은 후순위로 돌린다.\n"
             "2) 언어 정비: list_places에서 설명에 한국어가 없거나 중국어/영어 위주인 장소를 "
             "전부 찾아 언어 규칙대로 재작성 — 설명에 한국어가 전혀 없으면(사용자 작성 포함) "
             "replace_description으로 원문 정보를 번역해 한국어 재작성(중국어 주소·명칭은 병기 유지). "
@@ -4847,8 +5160,9 @@ def _run_agent_impl(
             "小红书·Bilibili·개인 블로그는 현지 팁 보조 근거로만 사용한다. web_search에서 seen=false 결과 위주로 "
             "fetch_page 4~8개 정독 (이미 본 페이지는 다시 열지 말 것)\n"
             "5) 여러 글에서 반복 추천되는 미등록 장소를 list_places 중복 확인 후 "
-            "geocode_place → propose_place 승인 제안. 건수 할당량을 채우지 말고 역할별 목표 "
-            "(역사2·음식3·시장/야간2·동네2·자연2·쇼핑1·휴식1·실용1)의 부족분만 제안하며 travel_role을 반드시 지정한다. "
+            "geocode_place → propose_place 승인 제안. 건수 할당량을 채우지 말고 역할별 가중 비중 "
+            "(역사2·음식3·시장/야간2·동네2·자연2·쇼핑1·휴식1·실용1)에 따라 "
+            "현재 수/가중치 비율이 낮은 역할부터 제안하며 travel_role을 반드시 지정한다. "
             "제목은 '中文名 (한국어 명칭)', 설명은 한국어+중국어 주소 형식으로 작성한다. "
             "propose_place는 즉시 생성이 아니라 승인 대기 저장이므로 망설이지 말 것. 신규 장소 후보를 "
             "upsert_agent_task에 '승인 제안'으로 대신 적으면 실패이며 도구도 거부한다. "

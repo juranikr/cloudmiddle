@@ -1,6 +1,7 @@
 import type {
   AdminAgentRunStep,
   AdminAgentAction,
+  AdminAgentDeferredContext,
   AdminAgentNextCursor,
   AdminAgentOutcomeCategory,
   AdminAgentProposal,
@@ -298,6 +299,7 @@ export interface AgentRunStatus {
   material_change_count: number;
   next_work_item_id: number | null;
   next_cursor: AdminAgentNextCursor;
+  deferred_context?: AdminAgentDeferredContext | null;
 }
 
 export async function startAdminAgent(

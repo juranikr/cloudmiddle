@@ -670,6 +670,15 @@ class AgentMission(Base):
     last_run_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
     )
+    # Explicit scheduling state. ``updated_at`` changes for checkpoints,
+    # recovery notes and strategy edits, so it must never double as a cooldown
+    # clock. These nullable fields describe only the currently active pause.
+    blocked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=True
+    )
+    retry_after: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=True
+    )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True

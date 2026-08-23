@@ -3,6 +3,7 @@ import * as api from "../api";
 import { useAuth } from "../auth";
 import type {
   AdminAgentAction,
+  AdminAgentDeferredContext,
   AdminAgentNextCursor,
   AdminAgentOutcomeCategory,
   AdminAgentProposal,
@@ -46,6 +47,86 @@ const OUTCOME_LABEL: Record<AdminAgentOutcomeCategory, string> = {
   failed: "실행 실패",
 };
 
+const FRONTIER_ROLE_ORDER = [
+  "history",
+  "food",
+  "market_night",
+  "neighborhood",
+  "nature",
+  "shopping",
+  "rest",
+  "practical",
+] as const;
+
+const FRONTIER_ROLE_LABEL: Record<(typeof FRONTIER_ROLE_ORDER)[number], string> = {
+  history: "역사",
+  food: "음식",
+  market_night: "시장·야간",
+  neighborhood: "동네 산책",
+  nature: "자연·공원",
+  shopping: "쇼핑",
+  rest: "휴식",
+  practical: "교통·실용",
+};
+
+const DEFERRED_REASON_LABEL: Record<string, string> = {
+  all_role_frontiers_cooling: "각 역할의 최근 후보 조사가 중복 조사 방지 대기시간 안에 있습니다.",
+  // Compatibility for runs persisted before role targets became weights.
+  all_frontiers_cooling: "각 역할의 최근 후보 조사가 중복 조사 방지 대기시간 안에 있습니다.",
+};
+
+function deferredReasonLabel(reason: string | undefined): string {
+  if (!reason) return "역할별 후보 조사가 다음 실행 조건을 기다리고 있습니다.";
+  return DEFERRED_REASON_LABEL[reason] ?? "역할별 후보 조사가 다음 실행 조건을 기다리고 있습니다.";
+}
+
+function formatRetryAt(value: string | null | undefined): string {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toLocaleString("ko-KR", {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function deferredStatusText(context: AdminAgentDeferredContext | null | undefined): string {
+  if (!context) return "";
+  const retryAt = formatRetryAt(context.next_retry_at);
+  return `${deferredReasonLabel(context.reason)}${retryAt ? ` 다음 재개 가능: ${retryAt}` : ""}`;
+}
+
+function frontierRoleRows(context: AdminAgentDeferredContext): Array<{
+  key: string;
+  label: string;
+  count: number;
+  weight: number;
+  share: number;
+  cooling: boolean;
+}> {
+  const totalWeight = FRONTIER_ROLE_ORDER.reduce(
+    (sum, role) => sum + Math.max(0, Number(context.role_weights[role] ?? 0)),
+    0,
+  );
+  const cooling = new Set(context.cooling_roles);
+  return FRONTIER_ROLE_ORDER
+    .filter((role) => role in context.role_counts || role in context.role_weights || cooling.has(role))
+    .map((role) => {
+      const weight = Math.max(0, Number(context.role_weights[role] ?? 0));
+      return {
+        key: role,
+        label: FRONTIER_ROLE_LABEL[role],
+        count: Math.max(0, Number(context.role_counts[role] ?? 0)),
+        weight,
+        share: totalWeight > 0 ? Math.round((weight / totalWeight) * 100) : 0,
+        cooling: cooling.has(role),
+      };
+    });
+}
+
 function nextCursorLabel(cursor: AdminAgentNextCursor | undefined, workItemId: number | null | undefined): string {
   const id = workItemId ?? cursor?.work_item_id;
   const parts: string[] = [];
@@ -53,7 +134,10 @@ function nextCursorLabel(cursor: AdminAgentNextCursor | undefined, workItemId: n
   else if (cursor?.mission_id) parts.push(`미션 #${cursor.mission_id}`);
   if (cursor?.target) parts.push(cursor.target);
   if (cursor?.next_tool) parts.push(`다음 행동 ${cursor.next_tool}`);
-  if (cursor?.wait_reason) parts.push(`재개 조건 ${cursor.wait_reason}`);
+  if (cursor?.wait_reason) {
+    const waitReason = DEFERRED_REASON_LABEL[cursor.wait_reason] ?? cursor.wait_reason;
+    parts.push(`재개 조건 ${waitReason}`);
+  }
   if (parts.length) return parts.join(" · ");
   return "저장된 후속 커서 없음";
 }
@@ -182,8 +266,10 @@ export default function AdminPage() {
       if (r) {
         const resultLabel = r.status === "completed" ? "완료" : r.status === "partial" ? "부분 완료" : "실패";
         const outcome = status.outcome_category ?? (r.status === "failed" ? "failed" : "no_yield");
+        const deferredLine = deferredStatusText(status.deferred_context);
         setInfo(
           `${OUTCOME_LABEL[outcome]} · 실질 변경 ${status.material_change_count ?? 0}건\n` +
+          (deferredLine ? `${deferredLine}\n` : "") +
           `다음 커서: ${nextCursorLabel(status.next_cursor, status.next_work_item_id)}\n` +
           `시스템 ${resultLabel} · 성과 ${r.score ?? 0}점 · 행동 라운드 ${r.steps} · 미처리 ${r.unread_before}→${r.unread_after}\n${r.message}`,
         );
@@ -506,18 +592,44 @@ export default function AdminPage() {
               const duration = Number(metrics.duration_seconds ?? 0);
               const materialCount = Number(run.material_change_count ?? material.length);
               const outcomeCategory = run.outcome_category ?? (run.status === "failed" ? "failed" : "no_yield");
+              const deferredContext = run.deferred_context ?? null;
+              const roleRows = deferredContext ? frontierRoleRows(deferredContext) : [];
+              const retryAt = formatRetryAt(deferredContext?.next_retry_at);
               return (
                 <li key={run.id}>
                   <div className="admin__run-heading">
                     <strong>실행 #{run.id} · {run.score.toFixed(1)}점</strong>
                     <span className={`run-outcome run-outcome--${outcomeCategory}`}>{OUTCOME_LABEL[outcomeCategory]}</span>
                   </div>
-                  <p>{run.objective}</p>
+                  <p>{deferredContext ? "역할 비중에 따라 다음 신규 장소 후보 조사를 대기 중입니다." : run.objective}</p>
                   <small>
                     {new Date(run.started_at).toLocaleString("ko-KR")} · 시스템 {run.status} · 도구 행동 {run.step_count}회
                     {duration > 0 ? ` · ${Math.round(duration / 60)}분` : ""}
                     {Number(metrics.repeated_calls_blocked ?? 0) > 0 ? ` · 반복 차단 ${metrics.repeated_calls_blocked}회` : ""}
                   </small>
+                  {deferredContext ? (
+                    <div className="admin__run-deferred" aria-label="후보 조사 대기 상세">
+                      <div className="admin__run-deferred-heading">
+                        <strong>{deferredReasonLabel(deferredContext.reason)}</strong>
+                        {retryAt ? <span>다음 재개 가능 {retryAt}</span> : null}
+                      </div>
+                      {roleRows.length ? (
+                        <>
+                          <p>개수는 종료 기준이 아니며, 비중은 다음 조사 역할을 고르는 상대 배분값입니다.</p>
+                          <ul className="admin__role-allocation">
+                            {roleRows.map((role) => (
+                              <li key={role.key} className={role.cooling ? "is-cooling" : ""}>
+                                <strong>{role.label}</strong>
+                                <span>장소·후보 {role.count}개</span>
+                                <span>비중 {role.weight}{role.share ? ` · ${role.share}%` : ""}</span>
+                                {role.cooling ? <em>재시도 대기</em> : null}
+                              </li>
+                            ))}
+                          </ul>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <div className="admin__run-outcome-summary">
                     <strong>실질 변경 {Number.isFinite(materialCount) ? materialCount : material.length}건</strong>
                     <span>다음 커서: {nextCursorLabel(run.next_cursor, run.next_work_item_id)}</span>

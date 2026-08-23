@@ -61,7 +61,11 @@ class AgentRunOutcomeReportingTests(unittest.TestCase):
             metrics={
                 "outcome": "deferred",
                 "lane": "discovery_deferred",
-                "deferred_reason": "all_frontiers_cooling",
+                "deferred_reason": "all_role_frontiers_cooling",
+                "role_counts": {"history": 4, "food": 12},
+                "role_weights": {"history": 2, "food": 3},
+                "cooling_roles": ["food", "history"],
+                "next_retry_at": "2026-08-24T03:30:00+00:00",
                 "next_work_item_id": 124,
                 "continuity": {
                     "mission_id": 29,
@@ -81,6 +85,62 @@ class AgentRunOutcomeReportingTests(unittest.TestCase):
             report["next_cursor"]["next_tool"],
             "choose_alternative_source",
         )
+        self.assertEqual(
+            report["deferred_context"]["reason"],
+            "all_role_frontiers_cooling",
+        )
+        self.assertEqual(
+            report["deferred_context"]["role_counts"],
+            {"history": 4, "food": 12},
+        )
+        self.assertEqual(
+            report["deferred_context"]["role_weights"],
+            {"history": 2, "food": 3},
+        )
+        self.assertEqual(
+            report["deferred_context"]["cooling_roles"],
+            ["food", "history"],
+        )
+        self.assertEqual(
+            report["deferred_context"]["next_retry_at"].isoformat(),
+            "2026-08-24T03:30:00+00:00",
+        )
+
+    def test_deferred_context_safely_normalizes_durable_metrics(self) -> None:
+        report = _agent_run_reporting(
+            status="completed",
+            metrics={
+                "outcome": "deferred",
+                "deferred_reason": "all_frontiers_cooling",
+                "role_counts": {
+                    "food": "7",
+                    "history": -2,
+                    "unknown": 99,
+                },
+                "role_weights": {"food": "3", "nature": "not-a-number"},
+                "cooling_roles": ["food", "food", "unknown", None],
+                "next_retry_at": "not-a-date",
+            },
+        )
+
+        self.assertEqual(
+            report["deferred_context"],
+            {
+                "reason": "all_frontiers_cooling",
+                "role_counts": {"food": 7},
+                "role_weights": {"food": 3},
+                "cooling_roles": ["food"],
+                "next_retry_at": None,
+            },
+        )
+
+    def test_legacy_run_without_scheduler_metrics_has_no_deferred_context(self) -> None:
+        report = _agent_run_reporting(
+            status="completed",
+            metrics={"outcome": "already_running"},
+        )
+
+        self.assertIsNone(report["deferred_context"])
 
     def test_deterministic_queue_ack_has_its_own_outcome(self) -> None:
         for metrics in (
