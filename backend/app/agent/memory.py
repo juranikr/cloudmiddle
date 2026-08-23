@@ -78,6 +78,40 @@ def _utc(value: datetime) -> datetime:
     )
 
 
+def _pause_mission_with_explicit_deadline(
+    mission: AgentMission,
+    *,
+    progress: dict[str, Any],
+    now: datetime,
+    record_non_candidate_blocked_at: bool = False,
+) -> tuple[datetime, Optional[datetime]]:
+    """Pause a mission without deriving its retry clock from ``updated_at``.
+
+    Candidate discovery always receives an explicit, UTC-normalized cooldown
+    window in both scheduling columns and the auditable progress snapshot.
+    Other mission kinds retain their existing behavior; ``finalize_mission``
+    may still record their terminal blocked timestamp without assigning an
+    automatic retry deadline.
+    """
+
+    timestamp = _utc(now)
+    mission.status = "paused"
+    mission.completed_at = None
+    retry_after: Optional[datetime] = None
+    if mission.kind == "candidate_discovery":
+        retry_after = timestamp + timedelta(hours=CANDIDATE_MISSION_COOLDOWN_HOURS)
+        mission.blocked_at = timestamp
+        mission.retry_after = retry_after
+        progress.update({
+            "blocked_at": timestamp.isoformat(),
+            "retry_after": retry_after.isoformat(),
+        })
+    elif record_non_candidate_blocked_at:
+        mission.blocked_at = timestamp
+        mission.retry_after = None
+    return timestamp, retry_after
+
+
 def quality_gaps_for_marker(marker: Marker) -> list[str]:
     """Return the physical DB gaps understood by managed quality missions."""
 
@@ -1613,14 +1647,19 @@ def checkpoint_after_tool(
     return item, continuity
 
 
-def reconcile_work_items(db: Session, *, mission: Optional[AgentMission]) -> Optional[AgentWorkItem]:
+def reconcile_work_items(
+    db: Session,
+    *,
+    mission: Optional[AgentMission],
+    now: Optional[datetime] = None,
+) -> Optional[AgentWorkItem]:
     """Measure exact place gaps and move completed targets out of the active queue."""
 
     if mission is None:
         return None
     task = db.get(AgentTask, mission.task_id) if mission.task_id else None
     items = db.query(AgentWorkItem).filter(AgentWorkItem.mission_id == mission.id).all()
-    now = datetime.now(timezone.utc)
+    timestamp = _utc(now or datetime.now(timezone.utc))
     for item in items:
         if item.place_id is None or item.status in {"done", "superseded"}:
             continue
@@ -1649,7 +1688,7 @@ def reconcile_work_items(db: Session, *, mission: Optional[AgentMission]) -> Opt
             item.status = "done"
             item.stage = "complete"
             item.state_summary = "운영 DB 성공조건 재측정 완료"
-            item.completed_at = now
+            item.completed_at = timestamp
 
     active = next((item for item in items if item.status == "active"), None)
     if active is None:
@@ -1663,21 +1702,28 @@ def reconcile_work_items(db: Session, *, mission: Optional[AgentMission]) -> Opt
     blocked = [item for item in items if item.status == "blocked"]
     remaining = [*executable, *blocked]
     if not executable and blocked:
-        mission.status = "paused"
-        mission.progress = _dump({
+        progress = {
             "active_work_item_id": None,
             "done": len([item for item in items if item.status == "done"]),
             "ready": 0,
             "blocked": len(blocked),
             "total": len([item for item in items if item.status != "superseded"]),
             "retry_condition": "새 출처 또는 냉각 시간 경과 후 재평가",
-        })
+        }
+        _pause_mission_with_explicit_deadline(
+            mission,
+            progress=progress,
+            now=timestamp,
+        )
+        mission.progress = _dump(progress)
     elif not remaining:
         mission.status = "completed"
-        mission.completed_at = now
+        mission.completed_at = timestamp
+        mission.blocked_at = None
+        mission.retry_after = None
         if task is not None:
             task.status = "completed"
-            task.completed_at = now
+            task.completed_at = timestamp
             if mission.kind != "candidate_discovery" or not (task.result or "").strip():
                 task.result = "모든 세부 대상의 운영 DB 성공조건을 재측정해 완료했습니다."
     if mission.status not in {"paused", "completed"}:
@@ -1707,6 +1753,7 @@ def rotate_blocked_work_item(
     quality_evidence_refs: Iterable[str] = (),
     quality_source_revision: str = "",
     quality_cooldown_hours: float = 24,
+    now: Optional[datetime] = None,
 ) -> Optional[AgentWorkItem]:
     """Block the current cursor and optionally activate its ready successor.
 
@@ -1742,6 +1789,7 @@ def rotate_blocked_work_item(
                 source_revision=quality_source_revision,
                 cooldown_hours=quality_cooldown_hours,
             ))
+    timestamp = _utc(now or datetime.now(timezone.utc))
     current.status = "blocked"
     current.blocked_reason = reason[:3000]
     current.retry_condition = (
@@ -1751,7 +1799,7 @@ def rotate_blocked_work_item(
         if quality_disposition == "blocked"
         else "새 출처·인증 가능한 접근·사용자 근거 중 하나가 생길 때 재개"
     )
-    current.updated_at = datetime.now(timezone.utc)
+    current.updated_at = timestamp
     next_item = db.query(AgentWorkItem).filter(
         AgentWorkItem.mission_id == mission.id,
         AgentWorkItem.status == "ready",
@@ -1768,7 +1816,6 @@ def rotate_blocked_work_item(
         })
         mission.progress = _dump(progress)
     else:
-        mission.status = "paused"
         progress.update({
             "active_work_item_id": None,
             "resume_work_item_id": next_item.id if next_item is not None else None,
@@ -1779,6 +1826,11 @@ def rotate_blocked_work_item(
             ).count(),
             "retry_condition": "새 출처 또는 12시간 냉각 후 재평가",
         })
+        _pause_mission_with_explicit_deadline(
+            mission,
+            progress=progress,
+            now=timestamp,
+        )
         mission.progress = _dump(progress)
     if disposition_rows:
         progress = _json_dict(mission.progress)
@@ -1848,16 +1900,14 @@ def finalize_mission(
             # active cursor. The periodic discovery scheduler reopens the same
             # task and ``ensure_mission_for_task`` resumes this exact item with
             # its checkpoint/evidence history intact.
-            mission.status = "paused"
-            mission.completed_at = None
-            mission.updated_at = timestamp
-            candidate_retry_after = (
-                timestamp + timedelta(hours=CANDIDATE_MISSION_COOLDOWN_HOURS)
-                if mission.kind == "candidate_discovery"
-                else None
+            progress = _json_dict(mission.progress)
+            timestamp, candidate_retry_after = _pause_mission_with_explicit_deadline(
+                mission,
+                progress=progress,
+                now=timestamp,
+                record_non_candidate_blocked_at=True,
             )
-            mission.blocked_at = timestamp
-            mission.retry_after = candidate_retry_after
+            mission.updated_at = timestamp
             for item in terminal_items:
                 item.status = "blocked"
                 item.blocked_reason = (task.result or "과제가 차단 상태로 종료됨")[:3000]
@@ -1867,7 +1917,6 @@ def finalize_mission(
                     else "새 출처 조건이 생긴 뒤 재평가"
                 )
                 item.updated_at = timestamp
-            progress = _json_dict(mission.progress)
             progress.update({
                 "active_work_item_id": None,
                 "resume_work_item_id": terminal_items[0].id if terminal_items else None,
@@ -1877,13 +1926,12 @@ def finalize_mission(
                     if candidate_retry_after is not None
                     else "새 출처 조건이 생긴 뒤 같은 체크포인트를 재개"
                 ),
-                "retry_after": (
-                    candidate_retry_after.isoformat()
-                    if candidate_retry_after is not None
-                    else None
-                ),
-                "blocked_at": timestamp.isoformat(),
             })
+            if candidate_retry_after is None:
+                progress.update({
+                    "retry_after": None,
+                    "blocked_at": timestamp.isoformat(),
+                })
             mission.progress = _dump(progress)
     if commit:
         db.commit()

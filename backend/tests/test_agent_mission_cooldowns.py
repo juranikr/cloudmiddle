@@ -8,7 +8,12 @@ from unittest.mock import patch
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
-from app.agent.memory import ensure_mission_for_task, finalize_mission
+from app.agent.memory import (
+    ensure_mission_for_task,
+    finalize_mission,
+    reconcile_work_items,
+    rotate_blocked_work_item,
+)
 from app.db import Base
 from app.migrate import ensure_schema
 from app.models import AgentMission, AgentTask, AgentWorkItem, City
@@ -92,6 +97,80 @@ class AgentMissionCooldownTests(unittest.TestCase):
         self.mission.updated_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
         self.db.commit()
         self.assertEqual(self.mission.retry_after, explicit_retry)
+
+    def test_candidate_rotation_pause_uses_the_same_explicit_clock(self) -> None:
+        blocked_at_kst = datetime(2026, 8, 23, 14, 15, tzinfo=timezone(timedelta(hours=9)))
+
+        next_item = rotate_blocked_work_item(
+            self.db,
+            mission=self.mission,
+            current=self.item,
+            run_id=77,
+            reason="all source axes exhausted",
+            now=blocked_at_kst,
+        )
+
+        blocked_at_utc = datetime(2026, 8, 23, 5, 15, tzinfo=timezone.utc)
+        retry_after_utc = blocked_at_utc + timedelta(hours=12)
+        self.assertIsNone(next_item)
+        self.assertEqual(self.mission.status, "paused")
+        self.assertEqual(self.mission.blocked_at.replace(tzinfo=timezone.utc), blocked_at_utc)
+        self.assertEqual(self.mission.retry_after.replace(tzinfo=timezone.utc), retry_after_utc)
+        progress = json.loads(self.mission.progress)
+        self.assertEqual(progress["blocked_at"], blocked_at_utc.isoformat())
+        self.assertEqual(progress["retry_after"], retry_after_utc.isoformat())
+
+        explicit_retry = self.mission.retry_after
+        self.mission.updated_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.db.commit()
+        self.assertEqual(self.mission.retry_after, explicit_retry)
+
+    def test_candidate_reconcile_blocked_only_uses_the_same_explicit_clock(self) -> None:
+        blocked_at = datetime(2026, 8, 23, 6, 45, tzinfo=timezone.utc)
+        self.item.status = "blocked"
+        self.db.commit()
+
+        active = reconcile_work_items(
+            self.db,
+            mission=self.mission,
+            now=blocked_at,
+        )
+
+        retry_after = blocked_at + timedelta(hours=12)
+        self.assertIsNone(active)
+        self.assertEqual(self.mission.status, "paused")
+        self.assertEqual(self.mission.blocked_at.replace(tzinfo=timezone.utc), blocked_at)
+        self.assertEqual(self.mission.retry_after.replace(tzinfo=timezone.utc), retry_after)
+        progress = json.loads(self.mission.progress)
+        self.assertEqual(progress["blocked_at"], blocked_at.isoformat())
+        self.assertEqual(progress["retry_after"], retry_after.isoformat())
+
+        explicit_retry = self.mission.retry_after
+        self.mission.updated_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.db.commit()
+        self.assertEqual(self.mission.retry_after, explicit_retry)
+
+    def test_reconcile_completion_clears_pause_columns_and_uses_injected_clock(self) -> None:
+        completed_at = datetime(2026, 8, 23, 8, 20, tzinfo=timezone.utc)
+        self.item.status = "done"
+        self.mission.status = "paused"
+        self.mission.blocked_at = completed_at - timedelta(hours=1)
+        self.mission.retry_after = completed_at + timedelta(hours=11)
+        self.db.commit()
+
+        active = reconcile_work_items(
+            self.db,
+            mission=self.mission,
+            now=completed_at,
+        )
+
+        self.assertIsNone(active)
+        self.assertEqual(self.mission.status, "completed")
+        self.assertEqual(self.mission.completed_at.replace(tzinfo=timezone.utc), completed_at)
+        self.assertIsNone(self.mission.blocked_at)
+        self.assertIsNone(self.mission.retry_after)
+        self.assertEqual(self.task.status, "completed")
+        self.assertEqual(self.task.completed_at.replace(tzinfo=timezone.utc), completed_at)
 
     def test_resuming_due_mission_clears_only_active_pause_columns(self) -> None:
         blocked_at = datetime(2026, 8, 23, 3, tzinfo=timezone.utc)
