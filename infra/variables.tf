@@ -10,6 +10,17 @@ variable "environment" {
   default     = "dev"
 }
 
+variable "deployment_mode" {
+  type        = string
+  description = "active는 tourmiddle 앱을 실행하고 paused는 공유 기반을 보존한 채 앱만 중지"
+  default     = "active"
+
+  validation {
+    condition     = contains(["active", "paused"], var.deployment_mode)
+    error_message = "deployment_mode must be either active or paused."
+  }
+}
+
 variable "aws_region" {
   type        = string
   description = "배포 리전 (한국 사용자면 ap-northeast-2 권장)"
@@ -63,14 +74,14 @@ variable "api_desired_count" {
 }
 
 variable "db_instance_class" {
-  type        = string
-  default     = "db.t4g.micro"
+  type    = string
+  default = "db.t4g.micro"
 }
 
 variable "enable_deletion_protection" {
   type        = bool
-  description = "prod에서 true 권장"
-  default     = false
+  description = "공유 RDS 삭제 방지. 명시적인 폐기 작업 전까지 true 유지"
+  default     = true
 }
 
 variable "jwt_secret" {

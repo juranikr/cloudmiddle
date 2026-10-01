@@ -6,6 +6,16 @@ output "aws_region" {
   value = var.aws_region
 }
 
+output "deployment_mode" {
+  value       = var.deployment_mode
+  description = "active 또는 paused. paused는 공유 기반을 유지하고 tourmiddle 런타임만 중지"
+}
+
+output "api_runtime_enabled" {
+  value       = local.runtime_enabled
+  description = "tourmiddle API desired count와 정기 agent schedule의 활성 여부"
+}
+
 output "vpc_id" {
   value = aws_vpc.main.id
 }

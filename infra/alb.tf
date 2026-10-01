@@ -1,10 +1,16 @@
 resource "aws_lb" "api" {
-  name               = "${local.name_prefix}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  idle_timeout       = 180
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
+  name                       = "${local.name_prefix}-alb"
+  internal                   = false
+  load_balancer_type         = "application"
+  enable_deletion_protection = true
+  idle_timeout               = 180
+  security_groups            = [aws_security_group.alb.id]
+  subnets                    = aws_subnet.public[*].id
+
+  lifecycle {
+    # Other applications route through this shared load balancer.
+    prevent_destroy = true
+  }
 
   tags = {
     Name = "${local.name_prefix}-alb"
@@ -17,6 +23,11 @@ resource "aws_lb_target_group" "api" {
   protocol    = "HTTP"
   target_type = "ip"
   vpc_id      = aws_vpc.main.id
+
+  lifecycle {
+    # This is the shared listener's default target group.
+    prevent_destroy = true
+  }
 
   health_check {
     enabled             = true
@@ -38,6 +49,11 @@ resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.api.arn
   port              = 80
   protocol          = "HTTP"
+
+  lifecycle {
+    # Listener rules owned by other states are attached here.
+    prevent_destroy = true
+  }
 
   default_action {
     type             = "forward"

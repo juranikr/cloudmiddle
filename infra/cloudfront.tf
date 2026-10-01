@@ -14,6 +14,8 @@ data "aws_ec2_managed_prefix_list" "cloudfront" {
 }
 
 resource "aws_cloudfront_distribution" "app" {
+  # /cashcow and other shared routes use this as their public ingress even
+  # while the tourmiddle service itself is paused.
   enabled             = true
   is_ipv6_enabled     = true
   comment             = "${local.name_prefix} https frontend+api"

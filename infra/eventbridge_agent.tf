@@ -257,6 +257,7 @@ resource "aws_cloudwatch_event_rule" "agent_daily" {
   name                = "${local.name_prefix}-agent-daily"
   description         = "Outcome-driven map curator, three times daily"
   schedule_expression = "cron(0 2,10,18 * * ? *)" # KST 11:00 / 19:00 / 03:00
+  state               = local.runtime_enabled ? "ENABLED" : "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "agent_daily" {

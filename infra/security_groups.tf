@@ -3,6 +3,11 @@ resource "aws_security_group" "alb" {
   description = "ALB ingress"
   vpc_id      = aws_vpc.main.id
 
+  lifecycle {
+    # Shared listener rules and services rely on this ALB security group.
+    prevent_destroy = true
+  }
+
   # CloudFront → ALB (HTTP origin). 인터넷 직접속은 막고 HTTPS는 CloudFront에서 처리
   ingress {
     description     = "HTTP from CloudFront only"
@@ -28,6 +33,11 @@ resource "aws_security_group" "ecs" {
   name        = "${local.name_prefix}-ecs-sg"
   description = "ECS tasks"
   vpc_id      = aws_vpc.main.id
+
+  lifecycle {
+    # More than one service uses this task security group.
+    prevent_destroy = true
+  }
 
   ingress {
     description     = "From ALB"
@@ -76,6 +86,14 @@ resource "aws_security_group" "rds" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle {
+    # cloudbali 등 다른 state가 이 공유 DB SG에 접근 규칙을 추가한다.
+    # 외부 관리 규칙을 삭제하지 않기 위한 임시 안전장치이며 장기적으로
+    # standalone aws_vpc_security_group_ingress_rule 소유권을 분리해야 한다.
+    prevent_destroy = true
+    ignore_changes  = [ingress]
   }
 
   tags = {

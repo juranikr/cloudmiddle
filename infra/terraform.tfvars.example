@@ -2,11 +2,17 @@ project_name = "tourmiddle"
 environment  = "dev"
 aws_region   = "ap-northeast-2"
 
+# active: 전체 실행 / paused: 공유 기반을 보존하고 tourmiddle 앱·배치만 중지
+deployment_mode = "active"
+
 github_org  = "juranikr"
-github_repo = "tourmiddle"
+github_repo = "cloudmiddle"
 
 api_desired_count = 1
 db_instance_class = "db.t4g.micro"
+
+# 공유 ALB/RDS를 AWS API의 직접 삭제에서도 보호
+enable_deletion_protection = true
 
 # 같은 오리진(CloudFront) 사용 시 * 로 충분. 커스텀 도메인 쓰면 해당 URL
 cors_origins = "*"

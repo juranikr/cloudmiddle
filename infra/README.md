@@ -19,7 +19,7 @@
 | 4 | **Terraform** | [설치](https://developer.hashicorp.com/terraform/install) `terraform version` ≥ 1.5 | ☐ |
 | 5 | **권한** | 해당 IAM에 대략 `AdministratorAccess` (처음) 또는 VPC/ECS/RDS/IAM/ECR/ELB/Secrets 생성 권한 | ☐ |
 | 6 | **리전 결정** | 기본값 `ap-northeast-2` (서울). 바꾸려면 `terraform.tfvars` | ☐ |
-| 7 | **GitHub 레포** | 이미 `juranikr/tourmiddle` — Actions 쓰기 권한 있는 계정 | ☐ |
+| 7 | **GitHub 레포** | 이미 `juranikr/cloudmiddle` — Actions 쓰기 권한 있는 계정 | ☐ |
 
 ### 권장 (나중에 해도 됨)
 
@@ -87,7 +87,7 @@ docker push <ecr-url>:latest
 aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment
 ```
 
-2. GitHub 설정 (`juranikr/tourmiddle` → Settings)
+2. GitHub 설정 (`juranikr/cloudmiddle` → Settings)
 
 **Secret**
 - `AWS_ROLE_ARN` = `terraform output -raw github_actions_role_arn`
@@ -119,3 +119,42 @@ aws ecs update-service --cluster <cluster> --service <service> --force-new-deplo
 - CloudWatch 로그 조회 커맨드 작성
 - 도메인 + ACM HTTPS 리스너 추가
 - 프론트 S3/CloudFront 스택 추가
+
+---
+
+## 5) 장기 미사용 시 안전하게 일시정지
+
+이 state의 ALB, listener, target group, VPC, ECS cluster, RDS는 다른 앱도
+참조하는 공유 기반입니다. `terraform destroy` 또는 해당 리소스의 targeted
+destroy를 실행하면 안 됩니다. 특히 RDS에는 다른 앱의 운영 데이터도 함께
+있으므로 이 프로젝트를 쉬는 동안에도 유지합니다.
+
+`terraform.tfvars`에서 아래 값만 바꿉니다.
+
+```hcl
+deployment_mode = "paused"
+```
+
+그 후 반드시 plan에서 다음 변경만 있는지 확인하고 apply합니다.
+
+- `tourmiddle-dev-api` ECS service의 `desired_count`: `1 -> 0`
+- `tourmiddle-dev-agent-daily` EventBridge rule: `ENABLED -> DISABLED`
+- 이미지 bucket versioning 활성화 및 ECR 보존 이미지 수 `10 -> 2`
+
+앱 CloudFront는 `/cashcow` 등 공유 경로의 공개 진입점이므로 paused에서도
+활성 상태로 유지합니다. ALB/listener/target group/VPC/ECS cluster/RDS/S3
+bucket/Secrets/ECR repository가 삭제 또는 교체로 표시되면 apply하지
+않습니다. 코드 push가 불필요한 배포를 일으키지 않도록 GitHub Actions
+repository variable `ENABLE_AWS_DEPLOY`도 `false`로 바꿉니다.
+
+공유 ALB와 RDS는 Terraform의 `prevent_destroy`와 AWS 서비스 측 deletion
+protection을 함께 사용합니다. 이를 해제하기 전에는 cloudbali/cashcow를 포함한
+공유 의존성을 다시 확인해야 합니다. RDS SG의 `ignore_changes = [ingress]`는
+다른 state가 관리하는 접근 규칙을 이 state가 삭제하지 않게 하는 임시 안전장치입니다.
+
+재개할 때는 `deployment_mode = "active"`로 되돌려 plan/apply하고,
+ECS service가 정상 상태가 된 뒤 `ENABLE_AWS_DEPLOY=true`와 health
+endpoint를 확인합니다.
+
+2026-10-01 백업 자산과 검증 결과는 [COLD_STORAGE.md](./COLD_STORAGE.md)에
+기록되어 있습니다.

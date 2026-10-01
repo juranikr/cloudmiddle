@@ -1,6 +1,8 @@
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
 
+  runtime_enabled = var.deployment_mode == "active"
+
   github_repo_full = "${var.github_org}/${var.github_repo}"
 
   # ECS가 ECR pull / outbound 할 수 있도록 public subnet + public IP 사용 (NAT 비용 절감)

@@ -3,6 +3,11 @@ resource "aws_db_subnet_group" "main" {
   # 외부 PC 접속용 public subnet (비밀번호로 인증)
   subnet_ids = aws_subnet.public[*].id
 
+  lifecycle {
+    # The subnet group belongs to the shared RDS instance.
+    prevent_destroy = true
+  }
+
   tags = {
     Name = "${local.name_prefix}-db-public"
   }
@@ -11,12 +16,12 @@ resource "aws_db_subnet_group" "main" {
 resource "aws_db_instance" "main" {
   identifier = "${local.name_prefix}-postgres"
 
-  engine               = "postgres"
-  engine_version       = "16"
-  instance_class       = var.db_instance_class
-  allocated_storage    = 20
+  engine                = "postgres"
+  engine_version        = "16"
+  instance_class        = var.db_instance_class
+  allocated_storage     = 20
   max_allocated_storage = 100
-  storage_type         = "gp3"
+  storage_type          = "gp3"
 
   db_name  = var.db_name
   username = var.db_username
@@ -30,6 +35,11 @@ resource "aws_db_instance" "main" {
   backup_retention_period = var.environment == "prod" ? 7 : 1
   skip_final_snapshot     = var.environment != "prod"
   deletion_protection     = var.enable_deletion_protection
+
+  lifecycle {
+    # This instance contains databases used by more than one application.
+    prevent_destroy = true
+  }
 
   tags = {
     Name = "${local.name_prefix}-postgres"

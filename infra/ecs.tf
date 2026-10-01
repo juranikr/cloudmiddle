@@ -11,6 +11,11 @@ resource "aws_ecs_cluster" "main" {
     value = "disabled"
   }
 
+  lifecycle {
+    # The cluster also hosts services managed outside this Terraform state.
+    prevent_destroy = true
+  }
+
   tags = {
     Name = "${local.name_prefix}-cluster"
   }
@@ -211,7 +216,7 @@ resource "aws_ecs_service" "api" {
   name            = "${local.name_prefix}-api"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.api.arn
-  desired_count   = var.api_desired_count
+  desired_count   = local.runtime_enabled ? var.api_desired_count : 0
   launch_type     = "FARGATE"
 
   network_configuration {
@@ -231,12 +236,6 @@ resource "aws_ecs_service" "api" {
     aws_iam_role_policy.ecs_task_execution_secrets,
     aws_iam_role_policy.ecs_task_agent_state_machine,
   ]
-
-  lifecycle {
-    # desired_count는 운영 중 수동 스케일링을 보존한다. 작업 정의는 Terraform이
-    # 최신 리비전으로 연결해야 새 환경 변수·Secrets 변경이 서비스에 반영된다.
-    ignore_changes = [desired_count]
-  }
 
   tags = {
     Name = "${local.name_prefix}-api"

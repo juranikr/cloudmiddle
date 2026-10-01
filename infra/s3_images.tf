@@ -1,8 +1,20 @@
 resource "aws_s3_bucket" "images" {
   bucket = "${local.name_prefix}-place-images-${data.aws_caller_identity.current.account_id}"
 
+  lifecycle {
+    prevent_destroy = true
+  }
+
   tags = {
     Name = "${local.name_prefix}-place-images"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "images" {
+  bucket = aws_s3_bucket.images.id
+
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
