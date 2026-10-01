@@ -19,7 +19,7 @@ Tourmiddle만 쉬는 상황에서 이 리소스를 정지하거나 삭제하면 
 - GitHub: `juranikr/cloudmiddle`, 일시정지 전 애플리케이션 HEAD `796093983b25328c37d29ffde44630ec83b7ab80`
 - 전용 비공개 보관 버킷: `s3://tourmiddle-archive-155557574983/archives/20261001-002542/`
 - 암호화 RDS 스냅샷: `tourmiddle-cold-encrypted-20261001-002542`
-- 원본 수동 스냅샷: `tourmiddle-cold-20261001-002542`
+- 임시 미암호화 원본 스냅샷은 암호화 복사 완료 후 중복 비용 방지를 위해 제거
 - 원본 이미지 버킷: `tourmiddle-dev-place-images-155557574983` (versioning enabled)
 - 이미지 사본: 보관 버킷의 `place-images/` prefix
 - DB 논리 백업: 보관 버킷의 `artifacts/tourmiddle.dump` 및 `artifacts/cloudbali.dump`
@@ -41,8 +41,8 @@ PostgreSQL 16 새 컨테이너에 두 custom-format dump를 각각
 | cloudbali | 36 | 3,683 | `CF65C60EBEDB4670D0F58FA82E9DE46F6C9C2642F272D00919528B4AF6BAD277` | 테이블별 행 수 일치 |
 
 RDS 스냅샷은 PostgreSQL 16.13, 20 GiB이며 암호화 사본이 `available`인 것을
-확인했다. 논리 백업과 검증 CSV의 전체 파일 해시는 같은 archive prefix의
-`manifest.json`을 기준으로 한다.
+확인한 뒤 임시 미암호화 원본만 제거했다. 논리 백업과 검증 CSV의 전체 파일
+해시는 같은 archive prefix의 `manifest.json`을 기준으로 한다.
 
 ## 정상 재개
 
