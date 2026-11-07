@@ -8,8 +8,8 @@ resource "aws_ecs_task_definition" "agent" {
   family                   = "${local.name_prefix}-agent"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
+  cpu                      = var.agent_backend == "codex" ? "512" : "256"
+  memory                   = var.agent_backend == "codex" ? "1024" : "512"
   execution_role_arn       = aws_iam_role.ecs_task_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
@@ -20,6 +20,10 @@ resource "aws_ecs_task_definition" "agent" {
       essential = true
       command   = ["python", "-m", "app.agent"]
       environment = [
+        { name = "AGENT_BACKEND", value = var.agent_backend },
+        { name = "CODEX_MODEL", value = var.codex_model },
+        { name = "CODEX_TIMEOUT_SECONDS", value = tostring(var.codex_timeout_seconds) },
+        { name = "CODEX_BATCH_TIMEOUT_SECONDS", value = tostring(var.codex_batch_timeout_seconds) },
         { name = "AWS_REGION", value = var.aws_region },
         { name = "S3_BUCKET", value = aws_s3_bucket.images.bucket },
         { name = "S3_PUBLIC_BASE_URL", value = "https://${aws_cloudfront_distribution.images.domain_name}" },
@@ -28,14 +32,16 @@ resource "aws_ecs_task_definition" "agent" {
         { name = "BRAVE_PLACE_ENABLED", value = "true" },
         { name = "BRAVE_SEARCH_STORAGE_RIGHTS", value = "false" },
       ]
-      secrets = [
+      secrets = concat([
         { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.app.arn}:DATABASE_URL::" },
         { name = "JWT_SECRET", valueFrom = "${aws_secretsmanager_secret.app.arn}:JWT_SECRET::" },
         { name = "GROQ_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_API_KEY::" },
         { name = "GROQ_MODEL", valueFrom = "${aws_secretsmanager_secret.app.arn}:GROQ_MODEL::" },
         { name = "ARCGIS_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:ARCGIS_API_KEY::" },
         { name = "BRAVE_SEARCH_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:BRAVE_SEARCH_API_KEY::" },
-      ]
+        ], var.agent_backend == "codex" ? [
+        { name = "CODEX_API_KEY", valueFrom = "${aws_secretsmanager_secret.app.arn}:OPENAI_API_KEY::" },
+      ] : [])
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -257,7 +263,7 @@ resource "aws_cloudwatch_event_rule" "agent_daily" {
   name                = "${local.name_prefix}-agent-daily"
   description         = "Outcome-driven map curator, three times daily"
   schedule_expression = "cron(0 2,10,18 * * ? *)" # KST 11:00 / 19:00 / 03:00
-  state               = local.runtime_enabled ? "ENABLED" : "DISABLED"
+  state               = local.runtime_enabled && var.agent_schedule_enabled ? "ENABLED" : "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "agent_daily" {

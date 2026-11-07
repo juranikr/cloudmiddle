@@ -1,9 +1,11 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +18,15 @@ from app.agent.runner import run_agent
 from app.agent.tools import reconcile_proposal_tasks
 from app.auth import create_access_token, get_admin_user, get_current_user, verify_password
 from app.config import settings
+from app.chat_jobs import (
+    ACTIVE_STATUSES,
+    ChatJobConflict,
+    TravelChatJobOut,
+    chat_job_to_out,
+    create_chat_job,
+    fail_stale_chat_jobs,
+    run_chat_job,
+)
 from app.db import Base, SessionLocal, engine, get_db
 from app.events import (
     changes_from_payload,
@@ -43,6 +54,7 @@ from app.models import (
     PlaceNote,
     PlaceChain,
     TravelChatMessage,
+    TravelChatJob,
     TravelChatWork,
     TravelPlan,
     TravelPlanDay,
@@ -102,6 +114,14 @@ from app import storage
 app = FastAPI(title="Cloudmiddle China Travel Map API", version="0.3.0")
 app.include_router(admin_router)
 
+# Codex waits must not consume the shared sync-HTTP thread pool used by auth,
+# map requests and polling. Bound the number of harnesses on a small ECS task.
+_chat_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="travel-chat")
+
+
+async def _dispatch_chat_job(job_id: str) -> None:
+    await asyncio.get_running_loop().run_in_executor(_chat_workers, run_chat_job, job_id)
+
 @app.middleware("http")
 async def enforce_production_readonly(request: Request, call_next):
     """Expose diagnostics as reads only; the database also enforces this."""
@@ -152,6 +172,7 @@ def on_startup() -> None:
     db = SessionLocal()
     try:
         seed_data(db)
+        fail_stale_chat_jobs(db)
         for city_id, in db.query(City.id).filter(City.status == "active").all():
             reconcile_proposal_tasks(db, city_id=city_id)
     finally:
@@ -1713,6 +1734,18 @@ def clear_travel_chat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Response:
+    fail_stale_chat_jobs(db)
+    active_job = db.query(TravelChatJob.id).filter(
+        TravelChatJob.user_id == current_user.id,
+        TravelChatJob.city_id == city_id,
+        TravelChatJob.status.in_(ACTIVE_STATUSES),
+    ).first()
+    if active_job is not None:
+        raise HTTPException(status_code=409, detail="진행 중인 답변이 끝난 뒤 대화를 지워 주세요.")
+    db.query(TravelChatJob).filter(
+        TravelChatJob.user_id == current_user.id,
+        TravelChatJob.city_id == city_id,
+    ).delete(synchronize_session=False)
     db.query(TravelChatMessage).filter(
         TravelChatMessage.user_id == current_user.id,
         TravelChatMessage.city_id == city_id,
@@ -1748,6 +1781,52 @@ def post_travel_chat(
         model=result["model"],
         grounded_place_ids=result["place_ids"],
     )
+
+
+@app.post("/api/travel-chat/jobs", response_model=TravelChatJobOut, status_code=status.HTTP_202_ACCEPTED)
+def post_travel_chat_job(
+    body: TravelChatRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TravelChatJobOut:
+    if not body.message.strip():
+        raise HTTPException(status_code=400, detail="메시지를 입력해 주세요.")
+    city = db.query(City.id).filter(City.id == body.city_id, City.status == "active").first()
+    if city is None:
+        raise HTTPException(status_code=404, detail="활성 도시를 찾을 수 없습니다.")
+    try:
+        job, created = create_chat_job(db, user_id=current_user.id, body=body)
+    except ChatJobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    out = chat_job_to_out(job)
+    if created:
+        # Only the ID crosses the request boundary; the worker opens and closes
+        # its own SessionLocal after this short 202 response has been sent.
+        background_tasks.add_task(_dispatch_chat_job, job.id)
+    # create_chat_job already committed. Release its refresh/read transaction so
+    # dependency teardown timing cannot hold a DB connection for the long worker.
+    db.rollback()
+    return out
+
+
+@app.get("/api/travel-chat/jobs/{job_id}", response_model=TravelChatJobOut)
+def get_travel_chat_job(
+    job_id: str,
+    city_id: int = Query(..., gt=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TravelChatJobOut:
+    if not settings.is_production_readonly:
+        fail_stale_chat_jobs(db)
+    job = db.query(TravelChatJob).filter(
+        TravelChatJob.id == job_id,
+        TravelChatJob.user_id == current_user.id,
+        TravelChatJob.city_id == city_id,
+    ).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="답변 작업을 찾을 수 없습니다.")
+    return chat_job_to_out(job)
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

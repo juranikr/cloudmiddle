@@ -106,8 +106,8 @@ resource "aws_ecs_task_definition" "api" {
   family                   = "${local.name_prefix}-api"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = var.api_cpu
-  memory                   = var.api_memory
+  cpu                      = var.agent_backend == "codex" ? max(var.api_cpu, 512) : var.api_cpu
+  memory                   = var.agent_backend == "codex" ? max(var.api_memory, 1024) : var.api_memory
   execution_role_arn       = aws_iam_role.ecs_task_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
@@ -124,6 +124,10 @@ resource "aws_ecs_task_definition" "api" {
         }
       ]
       environment = [
+        { name = "AGENT_BACKEND", value = var.agent_backend },
+        { name = "CODEX_MODEL", value = var.codex_model },
+        { name = "CODEX_TIMEOUT_SECONDS", value = tostring(var.codex_timeout_seconds) },
+        { name = "CODEX_BATCH_TIMEOUT_SECONDS", value = tostring(var.codex_batch_timeout_seconds) },
         {
           name  = "CORS_ORIGINS"
           value = var.cors_origins
@@ -155,7 +159,7 @@ resource "aws_ecs_task_definition" "api" {
           value = "false"
         }
       ]
-      secrets = [
+      secrets = concat([
         {
           name      = "DATABASE_URL"
           valueFrom = "${aws_secretsmanager_secret.app.arn}:DATABASE_URL::"
@@ -192,7 +196,12 @@ resource "aws_ecs_task_definition" "api" {
           name      = "BRAVE_SEARCH_API_KEY"
           valueFrom = "${aws_secretsmanager_secret.app.arn}:BRAVE_SEARCH_API_KEY::"
         }
-      ]
+        ], var.agent_backend == "codex" ? [
+        {
+          name      = "CODEX_API_KEY"
+          valueFrom = "${aws_secretsmanager_secret.app.arn}:OPENAI_API_KEY::"
+        }
+      ] : [])
       logConfiguration = {
         logDriver = "awslogs"
         options = {

@@ -1603,6 +1603,13 @@ def answer_travel_chat(
     message: str,
     selected_place_id: int | None = None,
 ) -> dict[str, Any]:
+    if settings.agent_backend == "codex":
+        from app.codex_travel import answer_codex_travel_chat
+
+        return answer_codex_travel_chat(
+            db, user_id=user_id, city_id=city_id, message=message,
+            selected_place_id=selected_place_id,
+        )
     city = db.query(City).filter(City.id == city_id, City.status == "active").first()
     if city is None:
         raise ValueError("활성 도시를 찾을 수 없습니다")

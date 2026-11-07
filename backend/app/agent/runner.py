@@ -4673,6 +4673,13 @@ def run_agent(
             # run floor. The finalizer still filters by city and running state.
             run_id_floor = 0
         try:
+            if settings.agent_backend == "codex":
+                from app.codex_travel import run_codex_agent
+
+                return run_codex_agent(
+                    db, city_id=city_id, max_steps=max_steps,
+                    autonomous_research=autonomous_research,
+                )
             return _run_agent_impl(
                 db,
                 city_id=city_id,

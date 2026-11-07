@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     agent_state_machine_arn: str = ""
 
     groq_api_key: str = ""
+    agent_backend: Literal["groq", "codex"] = "groq"
+    openai_api_key: str = ""
+    codex_api_key: str = ""
+    codex_model: str = "gpt-6.1-sol"
+    codex_timeout_seconds: int = 900
+    codex_batch_timeout_seconds: int = 7200
     groq_model: str = "openai/gpt-oss-120b"
     # This project's allow-list currently enables 120B; chat falls back to groq_model if overridden model is blocked.
     groq_chat_model: str = "openai/gpt-oss-120b"

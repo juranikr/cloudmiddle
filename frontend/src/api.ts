@@ -581,10 +581,46 @@ export async function sendTravelChat(
   token: string,
   body: { city_id: number; message: string; selected_place_id?: number | null },
 ): Promise<{ message: TravelChatMessage; model: string; grounded_place_ids: number[] }> {
-  const res = await request("/api/travel-chat", {
-    method: "POST",
-    headers: authHeaders(token),
-    body: JSON.stringify(body),
-  });
-  return handle(res);
+  type ChatAnswer = { message: TravelChatMessage; model: string; grounded_place_ids: number[] };
+  type ChatJob = {
+    id: string;
+    city_id: number;
+    status: "pending" | "running" | "completed" | "failed";
+    expires_at: string;
+    response: ChatAnswer | null;
+    error: string | null;
+  };
+  // Submit exactly once. A network failure must never repeat paid model calls
+  // or write tools: polling alone is safe to retry after the job is accepted.
+  let res: Response;
+  try {
+    res = await request("/api/travel-chat/jobs", {
+      method: "POST",
+      headers: authHeaders(token),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    throw new Error("작업 접수 결과를 확인하지 못했습니다. 서버에서 답변 중일 수 있으니 같은 요청을 다시 보내기 전에 대화 기록을 확인해 주세요.");
+  }
+  let job = await handle<ChatJob>(res);
+  const serverDeadline = Date.parse(job.expires_at);
+  const deadline = Math.max(Date.now() + 950_000, Number.isFinite(serverDeadline) ? serverDeadline + 20_000 : 0);
+  while (Date.now() < deadline) {
+    if (job.status === "completed" && job.response) return job.response;
+    if (job.status === "failed") throw new Error(job.error || "답변 작업이 실패했습니다. 대화 기록을 확인해 주세요.");
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+    let poll: Response;
+    try {
+      poll = await request(`/api/travel-chat/jobs/${encodeURIComponent(job.id)}?city_id=${body.city_id}`, {
+        headers: authHeaders(token),
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch {
+      continue; // Retry only the read, never the original message.
+    }
+    if ([502, 503, 504].includes(poll.status)) continue;
+    job = await handle<ChatJob>(poll);
+  }
+  throw new Error("답변 대기 시간이 지났습니다. 같은 요청을 다시 보내기 전에 대화 기록을 확인해 주세요.");
 }

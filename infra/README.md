@@ -152,9 +152,60 @@ protection을 함께 사용합니다. 이를 해제하기 전에는 cloudbali/ca
 공유 의존성을 다시 확인해야 합니다. RDS SG의 `ignore_changes = [ingress]`는
 다른 state가 관리하는 접근 규칙을 이 state가 삭제하지 않게 하는 임시 안전장치입니다.
 
-재개할 때는 `deployment_mode = "active"`로 되돌려 plan/apply하고,
-ECS service가 정상 상태가 된 뒤 `ENABLE_AWS_DEPLOY=true`와 health
-endpoint를 확인합니다.
+재개할 때는 `deployment_mode = "active"`, `agent_schedule_enabled = false`로
+설정해 웹/API부터 복구합니다. 정기 agent는 별도 수동 검증 후에만
+`agent_schedule_enabled = true`로 활성화합니다. paused에서는 이 값과 관계없이
+정기 agent가 비활성화됩니다. ECS service가 정상 상태가 된 뒤
+`ENABLE_AWS_DEPLOY=true`와 CloudFront의 `/api/health`를 확인합니다.
 
 2026-10-01 백업 자산과 검증 결과는 [COLD_STORAGE.md](./COLD_STORAGE.md)에
 기록되어 있습니다.
+
+## 6) 서버 측 Codex harness로 전환
+
+기본 `agent_backend = "groq"`는 기존 런타임을 유지합니다. Codex가 포함된
+새 컨테이너 이미지와 서버용 OpenAI API key 준비가 끝나기 전에는 바꾸지 않습니다.
+개인 Codex/ChatGPT 로그인 파일을 이미지에 복사하지 않습니다.
+
+Windows PowerShell에서 저장소 루트 기준으로 아래 helper를 직접 실행합니다.
+API key는 숨김 프롬프트로 입력하며 명령행 인자나 tfvars에 넣지 않습니다.
+
+```powershell
+.\dev\set-openai-secret.ps1
+```
+
+helper는 기존 `tourmiddle-dev/app` JSON의 다른 필드를 보존하고
+`OPENAI_API_KEY`만 갱신한 뒤 해당 버전을 다시 읽어 필드 보존을 검증합니다.
+임시 JSON은 현재 Windows 사용자만 접근 가능한 임시 디렉터리에 저장하고
+항상 정리합니다. Terraform은 secret **값**을 읽거나 관리하지 않습니다.
+
+새 이미지가 ECR에 준비되면 로컬 `terraform.tfvars`를 다음처럼 설정합니다.
+
+```hcl
+deployment_mode             = "active"
+agent_backend               = "codex"
+agent_schedule_enabled      = false
+codex_model                 = "gpt-6.1-sol"
+codex_timeout_seconds       = 900
+codex_batch_timeout_seconds = 7200
+```
+
+`codex_model`의 기본값 `gpt-6.1-sol`은 API 모델 목록에서 접근 권한을
+확인했습니다. 빈 문자열은 harness의 기본 모델을 사용합니다. API와 batch
+task는 `AGENT_BACKEND`, `CODEX_MODEL`,
+두 timeout 환경 변수를 받고, Codex 선택 시에만 Secrets Manager의
+`OPENAI_API_KEY` 필드를 컨테이너의 `CODEX_API_KEY`로 주입합니다. 기존 Groq,
+Brave 및 기타 secret 필드는 제거하지 않습니다. Codex 모드의 API와 batch는
+최소 512 CPU units / 1024 MiB를 사용합니다.
+
+`terraform fmt -check`, `terraform validate`, `terraform plan`으로 확인합니다.
+허용되는 교체는 **Tourmiddle ECS task definition의 새 revision**이며 ECS
+service, 관련 IAM Step Functions 정책/definition의 인플레이스 갱신이 뒤따를
+수 있습니다. ALB/listener/target group/VPC/cluster/RDS/bucket/secret/ECR
+repository의 삭제 또는 교체가 있으면 apply하지 않습니다. 정기 schedule은
+계속 DISABLED여야 합니다. 공유 리소스를 destroy하거나 DB dump로 덮어쓰지
+않습니다. 현재 RDS가 유지된 일반 재개에는 DB 복원이 필요 없습니다.
+
+승인된 plan만 apply한 뒤 CloudFront health와 로그인/지도 데이터를 검증하고,
+작은 단일 도시 수동 agent 실행으로 인증·모델·도구·비용을 확인합니다.
+그 후에만 정기 연구와 GitHub 자동 배포를 각각 활성화합니다.

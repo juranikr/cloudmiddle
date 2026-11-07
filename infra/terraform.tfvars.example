@@ -5,6 +5,15 @@ aws_region   = "ap-northeast-2"
 # active: 전체 실행 / paused: 공유 기반을 보존하고 tourmiddle 앱·배치만 중지
 deployment_mode = "active"
 
+# Restore the website first; explicitly enable paid research only after validation.
+agent_schedule_enabled = false
+# Switch to codex only after the new image and OPENAI_API_KEY secret field are ready.
+agent_backend = "groq"
+# API access verified for gpt-6.1-sol; empty uses the Codex harness default.
+codex_model                 = "gpt-6.1-sol"
+codex_timeout_seconds       = 900
+codex_batch_timeout_seconds = 7200
+
 github_org  = "juranikr"
 github_repo = "cloudmiddle"
 

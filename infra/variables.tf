@@ -73,6 +73,51 @@ variable "api_desired_count" {
   default     = 1
 }
 
+variable "agent_backend" {
+  type        = string
+  description = "Agent runtime: groq preserves the legacy path; codex uses the server-side Codex harness"
+  default     = "groq"
+
+  validation {
+    condition     = contains(["groq", "codex"], var.agent_backend)
+    error_message = "agent_backend must be either groq or codex."
+  }
+}
+
+variable "agent_schedule_enabled" {
+  type        = bool
+  description = "Enable paid scheduled research only after a manual agent validation; paused always disables it"
+  default     = false
+}
+
+variable "codex_model" {
+  type        = string
+  description = "Codex model with verified API access; empty uses the harness default"
+  default     = "gpt-6.1-sol"
+}
+
+variable "codex_timeout_seconds" {
+  type        = number
+  description = "Timeout for an individual Codex harness invocation"
+  default     = 900
+
+  validation {
+    condition     = var.codex_timeout_seconds > 0 && var.codex_timeout_seconds <= 3600 && floor(var.codex_timeout_seconds) == var.codex_timeout_seconds
+    error_message = "codex_timeout_seconds must be an integer between 1 and 3600."
+  }
+}
+
+variable "codex_batch_timeout_seconds" {
+  type        = number
+  description = "Overall Codex batch timeout; leave headroom below the 14400-second Step Functions task timeout"
+  default     = 7200
+
+  validation {
+    condition     = var.codex_batch_timeout_seconds > 0 && var.codex_batch_timeout_seconds <= 13500 && floor(var.codex_batch_timeout_seconds) == var.codex_batch_timeout_seconds
+    error_message = "codex_batch_timeout_seconds must be an integer between 1 and 13500."
+  }
+}
+
 variable "db_instance_class" {
   type    = string
   default = "db.t4g.micro"

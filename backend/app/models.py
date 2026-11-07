@@ -1010,3 +1010,25 @@ class TravelChatWork(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
     )
 
+
+class TravelChatJob(Base):
+    """HTTP-independent chat execution and its durable, user-scoped result."""
+
+    __tablename__ = "travel_chat_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
+    # NULL for terminal jobs: a portable DB constraint admits one active job
+    # per user/city, including concurrent POSTs across API processes.
+    active_key: Mapped[Optional[str]] = mapped_column(String(80), unique=True, nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    selected_place_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+

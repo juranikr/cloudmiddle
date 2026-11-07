@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1
 
 COPY requirements.txt requirements-postgres.txt ./
 RUN pip install --no-cache-dir -r requirements-postgres.txt
+RUN python -c "from openai_codex.client import CodexConfig, _resolve_codex_bin; import subprocess; subprocess.run([str(_resolve_codex_bin(CodexConfig())), '--version'], check=True)"
 
 COPY app ./app
 

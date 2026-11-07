@@ -321,6 +321,11 @@ def ensure_schema() -> None:
 
     with engine.begin() as conn:
         transaction_inspector = inspect(conn)
+        if "travel_chat_jobs" not in tables and {"cities", "users"}.issubset(tables):
+            from app.models import TravelChatJob
+
+            TravelChatJob.__table__.create(bind=conn, checkfirst=True)
+            tables.add("travel_chat_jobs")
         # This repository uses an idempotent bootstrap migration instead of
         # Alembic. Normal API/agent startup calls Base.metadata.create_all
         # before ensure_schema, while this explicit create also covers an
