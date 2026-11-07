@@ -82,6 +82,9 @@ def _json_list(raw: str) -> list[str]:
 
 class AdminStatusOut(BaseModel):
     admin_email: str
+    agent_backend: str = "groq"
+    agent_configured: bool = False
+    agent_model: str = ""
     groq_configured: bool
     groq_model: str
     brave_place_configured: bool = False
@@ -129,6 +132,10 @@ def admin_status(
     )
     return AdminStatusOut(
         admin_email=admin.email,
+        agent_backend=settings.agent_backend,
+        agent_configured=bool(settings.codex_api_key or settings.openai_api_key)
+            if settings.agent_backend == "codex" else bool(settings.groq_api_key),
+        agent_model=settings.codex_model if settings.agent_backend == "codex" else settings.groq_model,
         groq_configured=bool(settings.groq_api_key),
         groq_model=settings.groq_model,
         brave_place_configured=bool(

@@ -248,7 +248,7 @@ export default function AdminPage() {
 
   async function runAgent() {
     if (!token) return;
-    if (!confirm("에이전트를 지금 실행할까요? (Groq 호출·지도 변경 가능)")) return;
+    if (!confirm("에이전트를 지금 실행할까요? (유료 모델 호출·지도 변경 가능)")) return;
     setBusy(true);
     setError("");
     setInfo("실행 중… (수 분 걸릴 수 있습니다)");
@@ -459,7 +459,7 @@ export default function AdminPage() {
           <>
             <ul className="admin__stats">
               <li>
-                Groq: {status.groq_configured ? "설정됨" : "미설정"} ({status.groq_model})
+                {status.agent_backend === "codex" ? "Codex 하네스" : "Groq"}: {(status.agent_configured ?? status.groq_configured) ? "설정됨" : "미설정"} ({status.agent_model || status.groq_model})
               </li>
               <li>
                 Brave Place: {status.brave_place_configured ? "발견용 연결됨" : "미설정"}
