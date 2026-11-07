@@ -157,6 +157,34 @@ class CodexTravelIntegrationTests(unittest.TestCase):
         self.assertEqual(captured[1]["handoff"]["next_action"], "주변 간식 조사")
         self.assertEqual(self.db.query(TravelChatWork).count(), 2)
 
+    def test_commit_before_tool_checkpoint_is_reconciled_into_truthful_failure_answer(self):
+        original_observe = TravelToolBridge._observe
+        def observe(bridge, ledger, name, args, result):
+            if name == "propose_place":
+                raise RuntimeError("process lost after proposal commit before checkpoint")
+            return original_observe(bridge, ledger, name, args, result)
+        def harness(prompt, instructions, **scope):
+            bridge = self.bridge(scope["run_id"])
+            with patch("app.agent.codex_mcp.run_tool", side_effect=self.observations(bridge)), \
+                 patch.object(TravelToolBridge, "_observe", observe):
+                bridge.execute("geocode_place", {"query": "喜茶 大悦城店"})
+                bridge.execute("fetch_page", {"url": self.proposal()["source_urls"][0]})
+                bridge.execute("propose_place", self.proposal())
+            return {"text": "unreachable", "model": "test"}
+        with patch("app.codex_travel.run_codex", side_effect=harness):
+            result = answer_travel_chat(self.db, user_id=7, city_id=1, message="정확한 지점을 저장해줘")
+        self.assertEqual(self.db.query(AgentProposal).count(), 1)
+        self.assertIn("실제 저장", result["row"].content)
+        self.assertEqual(result["candidates"][0]["status"], "proposed")
+
+    def test_live_running_chat_rejects_retry_without_superseding_owner(self):
+        from app.codex_travel import _chat_work
+        first = _chat_work(self.db, user_id=7, city_id=1, message="먼저 조사해줘")
+        with self.assertRaisesRegex(RuntimeError, "처리 중"):
+            _chat_work(self.db, user_id=7, city_id=1, message="다시 조사해줘")
+        self.assertEqual(self.db.get(TravelChatWork, first.id).status, "active")
+        self.assertEqual(self.db.query(TravelChatWork).count(), 1)
+
     def test_batch_no_work_does_not_start_harness(self):
         with patch("app.codex_travel.run_codex") as harness:
             result = run_agent(self.db, city_id=1, autonomous_research=False)

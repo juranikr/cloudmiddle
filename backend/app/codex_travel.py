@@ -72,10 +72,8 @@ def _chat_work(db: Session, *, user_id: int, city_id: int, message: str) -> Trav
                               action="conversation", scope="unspecified", goal=message, state="{}")
         db.add(work)
         db.flush()
-    from app.travel_chat import _reconcile_chat_work_proposals
-    _reconcile_chat_work_proposals(db, work)
-    # Reconciliation may complete a previous write work. A new envelope retains
-    # that exact ledger while making this current turn independently executable.
+    # Do not run committing reconciliation while selecting the execution:
+    # releasing this lock before marking it running would admit mobile retries.
     work.status = "active"
     state, ledger = _ledger(work)
     if ledger.get("status") == "running":
@@ -134,6 +132,8 @@ def answer_codex_travel_chat(
     ).order_by(TravelChatMessage.id.desc()).limit(40).all()
     prior.reverse()
     work = _chat_work(db, user_id=user_id, city_id=city_id, message=message)
+    _reconcile_chat_work_proposals(db, work)
+    work.status = "active"
     if not json_object(work.state).get("candidates"):
         # Compatibility with grounded conversations predating the work ledger.
         # Only structured entities are carried; assistant prose is not evidence.
